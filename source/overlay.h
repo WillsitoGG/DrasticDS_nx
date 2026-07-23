@@ -1,0 +1,41 @@
+#ifndef DRASTIC_NX_OVERLAY_H
+#define DRASTIC_NX_OVERLAY_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#define DRASTIC_OVERLAY_WIDTH  1280
+#define DRASTIC_OVERLAY_HEIGHT 720
+
+typedef struct {
+  const uint32_t *pixels; /* 0xAARRGGBB */
+  int width;
+  int height;
+  uint64_t generation;
+  bool visible;
+} DrasticOverlayFrame;
+
+void overlay_init(void);
+void overlay_begin(void);
+void overlay_finish(void);
+void overlay_hide(void);
+void overlay_draw_hud(bool show_fps, float fps, bool fast_forward);
+const DrasticOverlayFrame *overlay_frame(void);
+
+void overlay_fill_rect(int x, int y, int width, int height, uint32_t color);
+void overlay_border_rect(int x, int y, int width, int height, int thickness,
+                         uint32_t color);
+void overlay_draw_text(int x, int y, uint32_t color, const char *text);
+void overlay_draw_text_scaled(int x, int y, int scale, uint32_t color,
+                              const char *text);
+void overlay_draw_text_clipped(int x, int y, int max_width, uint32_t color,
+                               const char *text);
+void overlay_draw_text_right(int right, int y, uint32_t color,
+                             const char *text);
+void overlay_draw_wrapped(int x, int y, int max_width, int max_lines,
+                          uint32_t color, const char *text);
+void overlay_blit_snapshot(int x, int y, int width, int height,
+                           const int32_t *pixels, int source_width,
+                           int source_height);
+
+#endif
