@@ -48,6 +48,7 @@ static const char *SYSTEM_DIR = "sdmc:/switch/drastic/system";
 static const char *USER_DIR   = "sdmc:/switch/drastic/user";
 static const char *CACHE_DIR  = "sdmc:/switch/drastic/cache";
 static const char *LSFG_DIR   = "sdmc:/switch/drastic/lsfg";
+static const char *EMU_HOST_DIR = "sdmc:/switch/drastic/.emu";
 static const char *LSFG_DLL_FILE =
     "sdmc:/switch/drastic/lsfg/Lossless.dll";
 struct KV { std::string k, v; };
@@ -371,6 +372,8 @@ enum { SCR_GRAPHICS, SCR_ENHANCE, SCR_FRAMEGEN, SCR_AUDIO, SCR_EMU,
 
 static const Opt S_graphics[] = {
   O_CHOICE("Renderer",          "Wrapper/Renderer", C_backend, "vk"),
+  O_CHOICEG("Low-latency Vulkan", "Wrapper/VulkanLowLatency", C_bool,
+            "false", "Wrapper/Renderer", "gl"),
   O_CHOICE("Screen layout",     "Wrapper/Layout", C_layout, "horizontal"),
   O_CHOICE("Swap DS screens",   "Wrapper/SwapScreens", C_bool, "false"),
   O_CHOICE("Rotation",          "Wrapper/Rotation", C_rotation, "0"),
@@ -3801,6 +3804,26 @@ static bool ensureEmu(const char *src,const char *dst) {
   return extractFromRomfs(src,dst,true)&&sameNroBuild(src,dst);
 }
 
+static void migrateLegacyEmuHosts() {
+  static const char *renderers[]={"vk","gl"};
+  for(const char *renderer:renderers){
+    const std::string filename=std::string("DrasticDS_nx_")+renderer+".nro";
+    const std::string legacy=std::string(DATA_DIR)+"/"+filename;
+    struct stat st{};
+    if(stat(legacy.c_str(),&st)!=0||!S_ISREG(st.st_mode)) continue;
+
+    const std::string source=std::string("romfs:/emu/")+filename;
+    const std::string hidden=std::string(EMU_HOST_DIR)+"/"+filename;
+    if(!ensureEmu(source.c_str(),hidden.c_str())) continue;
+
+    if(remove(legacy.c_str())==0){
+      remove((legacy+".tmp").c_str());
+      remove((legacy+".old").c_str());
+      fsdevCommitDevice("sdmc");
+    }
+  }
+}
+
 struct GLay { int cols, rows, cw, chh, gapx, gapy, x0, y0, titleH; };
 static GLay gridLayout(){
   GLay g;
@@ -4085,11 +4108,12 @@ int main(int argc, char **argv){
 
   g_griddbReady=griddb_global_init();
   if(!g_griddbReady&&R_SUCCEEDED(socketInitializeDefault())) g_storageSocketReady=true;
-  const char *directories[]={"sdmc:/switch",DATA_DIR,COVERS_DIR,CORES_DIR,GAMECFG_DIR,DEF_GAMEDIR,SYSTEM_DIR,USER_DIR,CACHE_DIR,LSFG_DIR,
+  const char *directories[]={"sdmc:/switch",DATA_DIR,EMU_HOST_DIR,COVERS_DIR,CORES_DIR,GAMECFG_DIR,DEF_GAMEDIR,SYSTEM_DIR,USER_DIR,CACHE_DIR,LSFG_DIR,
                              "sdmc:/switch/drastic/cheats","sdmc:/switch/drastic/scripts",
                              "sdmc:/switch/drastic/slot2","sdmc:/switch/drastic/microphone",
                              "sdmc:/switch/drastic/user/savestates","sdmc:/switch/drastic/user/backup"};
   for(const char *directory:directories) if(!ensureDirectory(directory)) return startupFailure("Could not create the Drastic DS data directories.");
+  migrateLegacyEmuHosts();
 
   if(!userSystemFilesPresent()){
     SDL_ShowSimpleMessageBox(
@@ -4311,8 +4335,8 @@ int main(int argc, char **argv){
     std::string coreSource="romfs:/cores/libdrastic_arm64.so";
     std::string coreDestination=std::string(CORES_DIR)+"/libdrastic_arm64.so";
     std::string emulatorSource="romfs:/emu/DrasticDS_nx_"+renderer+".nro";
-    std::string emulatorDestination=std::string(DATA_DIR)+"/DrasticDS_nx_"+renderer+".nro";
-    emulatorNro="sdmc:/switch/drastic/DrasticDS_nx_"+renderer+".nro";
+    std::string emulatorDestination=std::string(EMU_HOST_DIR)+"/DrasticDS_nx_"+renderer+".nro";
+    emulatorNro=std::string(EMU_HOST_DIR)+"/DrasticDS_nx_"+renderer+".nro";
     bool haveCore=ensureCore(coreSource.c_str(),coreDestination.c_str(),"109");
     bool haveEmulator=ensureEmu(emulatorSource.c_str(),emulatorDestination.c_str());
     bool haveResources=ensureResources();

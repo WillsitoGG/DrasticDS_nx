@@ -46,6 +46,7 @@ typedef struct {
   int rotation;
   int screen_gap;
   int integer_scale;
+  int vulkan_low_latency;
   DrasticVideoFilter video_filter;
   int show_fps;
   int volume;

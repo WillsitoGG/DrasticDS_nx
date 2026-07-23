@@ -161,6 +161,7 @@ static int g_lsfg_swapchain_compatible;
 static int g_lsfg_pipeline_prepared;
 static int g_lsfg_enabled_requested;
 static int g_lsfg_runtime_available;
+static int g_low_latency;
 
 static int vk_ok(VkResult result) { return result >= 0; }
 
@@ -430,7 +431,10 @@ static int create_swapchain(void) {
   }
   panel_width = screen_width = (int)g_extent.width;
   panel_height = screen_height = (int)g_extent.height;
-  uint32_t requested = capabilities.minImageCount + 1;
+  /* The default path keeps one image of CPU/GPU overlap. Low-latency mode
+   * deliberately requests the surface minimum so FIFO cannot accumulate an
+   * additional completed game frame ahead of the display. */
+  uint32_t requested = capabilities.minImageCount + (g_low_latency ? 0u : 1u);
   VkImageUsageFlags image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
   uint32_t sharing_families[2] = {g_queue_family,
@@ -1562,6 +1566,11 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   if (lsfg_launch_enabled && !enable_nvk_no_cbuf())
     lsfg_launch_enabled = 0;
   g_lsfg_pipeline_prepared = lsfg_launch_enabled;
+  /* LSFG owns presentation pacing and needs its larger swapchain. Keep the
+   * native low-latency path mutually exclusive for the lifetime of this
+   * renderer, including when LSFG is toggled from the in-game overlay. */
+  g_low_latency = config && config->vulkan_low_latency &&
+                  !lsfg_launch_enabled;
   __atomic_store_n(&g_lsfg_enabled_requested, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&g_lsfg_runtime_available, 0, __ATOMIC_RELEASE);
   g_lsfg_init_attempted = 0;
@@ -1579,9 +1588,9 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   const VkApplicationInfo application = {
     .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
     .pApplicationName = "DrasticDS_nx",
-    .applicationVersion = VK_MAKE_VERSION(1, 0, 1),
+    .applicationVersion = VK_MAKE_VERSION(1, 0, 2),
     .pEngineName = "Drastic Switch wrapper",
-    .engineVersion = VK_MAKE_VERSION(1, 0, 1),
+    .engineVersion = VK_MAKE_VERSION(1, 0, 2),
     .apiVersion = VK_API_VERSION_1_1,
   };
   const VkInstanceCreateInfo instance_info = {
@@ -1682,6 +1691,13 @@ static void stage_screen_pixels(uint8_t *destination,
   }
 }
 
+static void release_core_frame(DrasticCoreRenderFrame core_render,
+                               void *env, void *clazz, int *released) {
+  if (*released) return;
+  core_render(env, clazz, 0, 0, 0);
+  *released = 1;
+}
+
 void drastic_renderer_present(const DrasticRuntimeConfig *config,
                               DrasticCoreRenderFrame core_render,
                               void *env, void *clazz,
@@ -1691,11 +1707,14 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
   const int upload_screens = consume_core_frame && top && bottom;
   const int hold_high_resolution_frame = upload_screens &&
       (config->core_config & (UINT64_C(1) << 41));
+  const int defer_core_release = consume_core_frame && g_low_latency;
+  int core_frame_released = !consume_core_frame;
   /* Restore the original producer/consumer timing for ordinary frames. The
    * high-resolution path is the sole exception: its private core buffers must
    * be copied before renderFrame() lets DraStic reuse them. */
-  if (consume_core_frame && !hold_high_resolution_frame)
-    core_render(env, clazz, 0, 0, 0);
+  if (consume_core_frame && !hold_high_resolution_frame &&
+      !defer_core_release)
+    release_core_frame(core_render, env, clazz, &core_frame_released);
 
   /* Complete the LSFG -> native-present handoff before acquiring or writing
    * the first ordinary frame. Destroying the backend later, after the native
@@ -1709,7 +1728,7 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
   VkResult result = vkWaitForFences(g_device, 1, &g_fence, VK_TRUE,
                                     UINT64_MAX);
   if (!vk_ok(result)) {
-    if (hold_high_resolution_frame) core_render(env, clazz, 0, 0, 0);
+    release_core_frame(core_render, env, clazz, &core_frame_released);
     return;
   }
 
@@ -1718,27 +1737,32 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
     g_filter_valid[0] = g_filter_valid[1] = 0;
   }
   if (upload_screens) g_filter_valid[0] = g_filter_valid[1] = 0;
-  if (hold_high_resolution_frame) {
+  if (hold_high_resolution_frame && !defer_core_release) {
     stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_TOP],
                         top, config);
     stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_BOTTOM],
                         bottom, config);
-    core_render(env, clazz, 0, 0, 0);
+    release_core_frame(core_render, env, clazz, &core_frame_released);
   }
 
   uint32_t image_index = 0;
   const VkResult acquired = vkAcquireNextImageKHR(
       g_device, g_swapchain, UINT64_MAX, g_acquired, VK_NULL_HANDLE,
       &image_index);
-  if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR)
+  if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
+    release_core_frame(core_render, env, clazz, &core_frame_released);
     return;
+  }
 
-  if (upload_screens && !hold_high_resolution_frame) {
+  if (upload_screens &&
+      (!hold_high_resolution_frame || defer_core_release)) {
     stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_TOP],
                         top, config);
     stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_BOTTOM],
                         bottom, config);
   }
+  if (defer_core_release)
+    release_core_frame(core_render, env, clazz, &core_frame_released);
   const int upload_overlay = overlay && overlay->visible && overlay->pixels &&
       overlay->generation != g_overlay_generation;
   const int overlay_texture = overlay_texture_index(overlay);
@@ -1819,6 +1843,7 @@ void drastic_renderer_shutdown(void) {
   g_lsfg_device_capable = 0;
   g_lsfg_swapchain_compatible = 0;
   g_lsfg_pipeline_prepared = 0;
+  g_low_latency = 0;
   __atomic_store_n(&g_lsfg_runtime_available, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&g_lsfg_enabled_requested, 0, __ATOMIC_RELEASE);
   if (g_device) {

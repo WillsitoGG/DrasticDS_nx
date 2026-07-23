@@ -80,6 +80,7 @@ static void seed_defaults(void) {
   seed("Wrapper/Rotation", "0");
   seed("Wrapper/ScreenGap", "8");
   seed("Wrapper/IntegerScale", "false");
+  seed("Wrapper/VulkanLowLatency", "false");
   seed("Wrapper/TextureFilter", "nearest");
   seed("Wrapper/VideoFilter", "nearest");
   seed("Wrapper/LSFGEnabled", "false");

@@ -32,8 +32,9 @@ renderer and bundled application resources on demand:
 ```text
 /switch/DrasticDS.nro
 /switch/drastic/
-  DrasticDS_nx_gl.nro     <- OpenGL host, extracted when selected
-  DrasticDS_nx_vk.nro     <- Vulkan/NVK host, extracted when selected
+  .emu/                   <- hidden renderer hosts, extracted when selected
+    DrasticDS_nx_gl.nro   <- OpenGL host
+    DrasticDS_nx_vk.nro   <- Vulkan/NVK host
   cache/
   cheats/                 <- custom Action Replay files
   cores/                  <- Drastic ARM64 core, auto-extracted

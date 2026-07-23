@@ -20,6 +20,7 @@
 #include "error.h"
 #include "imports.h"
 #include "ingame_menu.h"
+#include "input_sampler.h"
 #include "jni_fake.h"
 #include "libc_shim.h"
 #include "opensles.h"
@@ -348,7 +349,6 @@ enum {
   DS_R = 512,
   DS_START = 1024,
   DS_SELECT = 2048,
-  DS_TOUCH = (int)0x80000000u,
 };
 
 typedef struct { const char *name; u64 button; } SwitchButton;
@@ -422,20 +422,6 @@ static void load_bindings(void) {
   analog_dpad_deadzone = percent * 32767 / 100;
 }
 
-static int map_buttons(u64 held, HidAnalogStickState left) {
-  int mask = 0;
-  for (unsigned index = 0; index < sizeof(bindings) / sizeof(*bindings); index++)
-    if (held & bindings[index].switch_mask) mask |= bindings[index].ds_mask;
-  if (analog_dpad_enabled) {
-    if (left.x < -analog_dpad_deadzone) mask |= DS_LEFT;
-    if (left.x > analog_dpad_deadzone) mask |= DS_RIGHT;
-    if (left.y < -analog_dpad_deadzone) mask |= DS_DOWN;
-    if (left.y > analog_dpad_deadzone) mask |= DS_UP;
-  }
-  return mask;
-}
-
-static PadState pad;
 static HidVibrationDeviceHandle vibration_player[2];
 static HidVibrationDeviceHandle vibration_handheld[2];
 static int vibration_player_ready;
@@ -490,10 +476,10 @@ static void shutdown_motion_sensors(void) {
   memset(&motion_sensors, 0, sizeof(motion_sensors));
 }
 
-static void update_motion(const DrasticRuntimeConfig *config, void *clazz) {
+static void update_motion(const DrasticRuntimeConfig *config, void *clazz,
+                          u32 styles, u32 attributes) {
   if (!config->motion || !core.updateAccelerometer || !core.updateGyroscope)
     return;
-  const u64 styles = padGetStyleSet(&pad);
   int source = -1;
   int right_joycon = 0;
   if ((styles & HidNpadStyleTag_NpadHandheld) && motion_sensors.ready[0])
@@ -501,7 +487,6 @@ static void update_motion(const DrasticRuntimeConfig *config, void *clazz) {
   else if ((styles & HidNpadStyleTag_NpadFullKey) && motion_sensors.ready[1])
     source = 1;
   else if (styles & HidNpadStyleTag_NpadJoyDual) {
-    const u64 attributes = padGetAttributes(&pad);
     if ((attributes & HidNpadAttribute_IsLeftConnected) &&
         motion_sensors.ready[2])
       source = 2;
@@ -575,18 +560,6 @@ static void update_rumble(const DrasticRuntimeConfig *config, void *clazz) {
   send_rumble(values);
 }
 
-static int touch_position(const DrasticRuntimeConfig *config, int *touching) {
-  HidTouchScreenState state = {0};
-  *touching = 0;
-  if (!hidGetTouchScreenStates(&state, 1) || state.count <= 0) return 0;
-  int x, y;
-  const float panel_x = (float)state.touches[0].x * panel_width / 1280.0f;
-  const float panel_y = (float)state.touches[0].y * panel_height / 720.0f;
-  if (!drastic_config_map_touch(config, panel_x, panel_y, &x, &y)) return 0;
-  *touching = 1;
-  return (x << 16) | y;
-}
-
 typedef struct {
   u64 menu;
   u64 fast_forward;
@@ -613,11 +586,7 @@ typedef struct {
   int state_slot;
   int stylus_speed;
   int lua_rotation_sent;
-  float stylus_x;
-  float stylus_y;
-  int stylus_visible_frames;
   u64 analog_touch_button;
-  u64 previous;
 } RuntimeControls;
 
 typedef struct {
@@ -724,10 +693,6 @@ static int combo_held(u64 held, u64 combo) {
   return combo && (held & combo) == combo;
 }
 
-static int combo_pressed(u64 held, u64 previous, u64 combo) {
-  return combo_held(held, combo) && !combo_held(previous, combo);
-}
-
 static float normalized_stick_axis(int value) {
   float result = (float)value / 32767.0f;
   if (result < -1.0f) result = -1.0f;
@@ -735,42 +700,95 @@ static float normalized_stick_axis(int value) {
   return result;
 }
 
-static int poll_input(DrasticRuntimeConfig *config, RuntimeControls *controls,
-                      void *clazz, DrasticIngameMenu *menu) {
-  padUpdate(&pad);
-  const u64 held = padGetButtons(&pad);
-  const u64 previous = controls->previous;
-  controls->previous = held;
+static void sampler_update_input(void *clazz, int buttons,
+                                 int touch_position, int autofire) {
+  core.updateInput(fake_env, clazz, buttons, touch_position, autofire);
+}
 
-  if (menu && combo_pressed(held, previous, controls->hotkeys.menu)) {
-    core.updateInput(fake_env, clazz, 0, 0, 0);
+static void configure_input_sampler(DrasticInputSamplerConfig *config,
+                                    const RuntimeControls *controls,
+                                    void *clazz) {
+  memset(config, 0, sizeof(*config));
+  config->update = sampler_update_input;
+  config->user = clazz;
+  config->binding_count = (int)(sizeof(bindings) / sizeof(*bindings));
+  for (int index = 0; index < config->binding_count; index++) {
+    config->bindings[index].switch_mask = bindings[index].switch_mask;
+    config->bindings[index].ds_mask = bindings[index].ds_mask;
+  }
+  config->analog_dpad = analog_dpad_enabled;
+  config->analog_deadzone = analog_dpad_deadzone;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_MENU] = controls->hotkeys.menu;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_FAST_FORWARD] =
+      controls->hotkeys.fast_forward;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_SWAP_SCREENS] =
+      controls->hotkeys.swap_screens;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_MICROPHONE] =
+      controls->hotkeys.microphone;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_AUTOFIRE] = controls->hotkeys.autofire;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_LID] = controls->hotkeys.lid;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_SAVE_STATE] =
+      controls->hotkeys.save_state;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_LOAD_STATE] =
+      controls->hotkeys.load_state;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_NEXT_SLOT] =
+      controls->hotkeys.next_slot;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_PREVIOUS_SLOT] =
+      controls->hotkeys.previous_slot;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_RESET] = controls->hotkeys.reset;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_QUIT] = controls->hotkeys.quit;
+  config->analog_touch_button = controls->analog_touch_button;
+  config->stylus_speed = controls->stylus_speed;
+  config->panel_width = panel_width;
+  config->panel_height = panel_height;
+}
+
+static int process_input(DrasticRuntimeConfig *config,
+                         RuntimeControls *controls, void *clazz,
+                         DrasticIngameMenu *menu,
+                         DrasticInputSampler *sampler) {
+  DrasticInputSnapshot input;
+  drastic_input_sampler_read(sampler, &input);
+  const u64 held = input.buttons;
+  const uint32_t pressed = input.hotkeys_pressed;
+  config->stylus_x = input.stylus_x;
+  config->stylus_y = input.stylus_y;
+  config->stylus_visible = input.stylus_visible;
+
+  if (menu && (pressed & DRASTIC_INPUT_HOTKEY_BIT(
+                            DRASTIC_INPUT_HOTKEY_MENU))) {
+    drastic_input_sampler_update_runtime(sampler, config, false);
     return 1;
   }
 
-  if (combo_pressed(held, previous, controls->hotkeys.save_state)) {
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(
+                    DRASTIC_INPUT_HOTKEY_SAVE_STATE)) {
     core.pauseSystem(fake_env, clazz, 1);
     core.saveState(fake_env, clazz, controls->state_slot, 1);
     core.pauseSystem(fake_env, clazz, 0);
   }
-  if (combo_pressed(held, previous, controls->hotkeys.load_state)) {
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(
+                    DRASTIC_INPUT_HOTKEY_LOAD_STATE)) {
     core.pauseSystem(fake_env, clazz, 1);
     core.loadState(fake_env, clazz, controls->state_slot);
     core.pauseSystem(fake_env, clazz, 0);
   }
-  if (combo_pressed(held, previous, controls->hotkeys.next_slot))
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(DRASTIC_INPUT_HOTKEY_NEXT_SLOT))
     controls->state_slot = (controls->state_slot + 1) % 10;
-  if (combo_pressed(held, previous, controls->hotkeys.previous_slot))
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(
+                    DRASTIC_INPUT_HOTKEY_PREVIOUS_SLOT))
     controls->state_slot = (controls->state_slot + 9) % 10;
-  if (combo_pressed(held, previous, controls->hotkeys.reset)) {
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(DRASTIC_INPUT_HOTKEY_RESET)) {
     core.pauseSystem(fake_env, clazz, 1);
     core.resetDS(fake_env, clazz);
     core.pauseSystem(fake_env, clazz, 0);
   }
-  if (combo_pressed(held, previous, controls->hotkeys.quit))
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(DRASTIC_INPUT_HOTKEY_QUIT))
     controls->exit_requested = 1;
 
   if (controls->fast_forward_toggle &&
-      combo_pressed(held, previous, controls->hotkeys.fast_forward))
+      (pressed & DRASTIC_INPUT_HOTKEY_BIT(
+                     DRASTIC_INPUT_HOTKEY_FAST_FORWARD)))
     controls->fast_forward_latched ^= 1;
   const int fast_forward = controls->fast_forward_toggle
                                ? controls->fast_forward_latched
@@ -781,7 +799,8 @@ static int poll_input(DrasticRuntimeConfig *config, RuntimeControls *controls,
     if (fast_forward) packed |= UINT64_C(1) << 29;
     core.applyConfig(fake_env, clazz, (jlong)packed);
   }
-  if (combo_pressed(held, previous, controls->hotkeys.swap_screens)) {
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(
+                    DRASTIC_INPUT_HOTKEY_SWAP_SCREENS)) {
     config->swap_screens ^= 1;
     drastic_config_calculate_layout(config, panel_width, panel_height);
   }
@@ -790,19 +809,17 @@ static int poll_input(DrasticRuntimeConfig *config, RuntimeControls *controls,
     controls->microphone_feed = microphone_feed;
     core.setWhitenoiseFeed(fake_env, clazz, microphone_feed != 0);
   }
-  if (combo_pressed(held, previous, controls->hotkeys.lid)) {
+  if (pressed & DRASTIC_INPUT_HOTKEY_BIT(DRASTIC_INPUT_HOTKEY_LID)) {
     controls->hinge_closed ^= 1;
     core.setHingeStatus(fake_env, clazz, controls->hinge_closed != 0);
   }
 
-  HidAnalogStickState left = padGetStickPos(&pad, 0);
-  HidAnalogStickState right = padGetStickPos(&pad, 1);
   if (config->lua_enabled && core.luaUpdateAxisValues)
     core.luaUpdateAxisValues(fake_env, clazz,
-                             normalized_stick_axis(left.x),
-                             -normalized_stick_axis(left.y),
-                             normalized_stick_axis(right.x),
-                             -normalized_stick_axis(right.y));
+                             normalized_stick_axis(input.left.x),
+                             -normalized_stick_axis(input.left.y),
+                             normalized_stick_axis(input.right.x),
+                             -normalized_stick_axis(input.right.y));
   if (config->lua_enabled && core.luaUpdateRotation &&
       controls->lua_rotation_sent != config->rotation) {
     static const int rotation_degrees[] = {0, 90, 180, -90};
@@ -811,62 +828,9 @@ static int poll_input(DrasticRuntimeConfig *config, RuntimeControls *controls,
     controls->lua_rotation_sent = config->rotation;
   }
 
-  int analog_touch = 0;
-  if (config->analog_stylus) {
-    const int deadzone = 3500;
-    if (abs(right.x) > deadzone || abs(right.y) > deadzone) {
-      controls->stylus_x += normalized_stick_axis(right.x) * controls->stylus_speed;
-      controls->stylus_y -= normalized_stick_axis(right.y) * controls->stylus_speed;
-      if (controls->stylus_x < 0.0f) controls->stylus_x = 0.0f;
-      if (controls->stylus_x > 255.0f) controls->stylus_x = 255.0f;
-      if (controls->stylus_y < 0.0f) controls->stylus_y = 0.0f;
-      if (controls->stylus_y > 191.0f) controls->stylus_y = 191.0f;
-      controls->stylus_visible_frames = 180;
-    }
-    analog_touch = controls->analog_touch_button &&
-                   (held & controls->analog_touch_button);
-    if (analog_touch) controls->stylus_visible_frames = 180;
-    config->stylus_x = (int)(controls->stylus_x + 0.5f);
-    config->stylus_y = (int)(controls->stylus_y + 0.5f);
-    config->stylus_visible = controls->stylus_visible_frames > 0;
-    if (controls->stylus_visible_frames > 0)
-      controls->stylus_visible_frames--;
-  } else {
-    config->stylus_visible = 0;
-  }
-
-  u64 game_held = held;
-  const u64 special_combos[] = {
-    controls->hotkeys.menu, controls->hotkeys.fast_forward,
-    controls->hotkeys.swap_screens,
-    controls->hotkeys.microphone, controls->hotkeys.autofire,
-    controls->hotkeys.lid, controls->hotkeys.save_state,
-    controls->hotkeys.load_state, controls->hotkeys.next_slot,
-    controls->hotkeys.previous_slot, controls->hotkeys.reset,
-    controls->hotkeys.quit,
-  };
-  for (unsigned index = 0;
-       index < sizeof(special_combos) / sizeof(*special_combos); index++)
-    if (combo_held(held, special_combos[index]))
-      game_held &= ~special_combos[index];
-  if (analog_touch)
-    game_held &= ~controls->analog_touch_button;
-
-  int buttons = map_buttons(game_held, left);
-  int touching = 0;
-  int position = touch_position(config, &touching);
-  if (!touching && analog_touch) {
-    touching = 1;
-    position = (config->stylus_x << 16) | config->stylus_y;
-  }
-  if (touching && !analog_touch) config->stylus_visible = 0;
-  if (touching) buttons |= DS_TOUCH;
-  const int autofire = combo_held(held, controls->hotkeys.autofire)
-                           ? buttons & (DS_A | DS_B | DS_X | DS_Y | DS_L | DS_R)
-                           : 0;
-  core.updateInput(fake_env, clazz, buttons, position, autofire);
   update_rumble(config, clazz);
-  update_motion(config, clazz);
+  update_motion(config, clazz, input.style_set, input.attributes);
+  drastic_input_sampler_update_runtime(sampler, config, true);
   return 0;
 }
 
@@ -972,7 +936,6 @@ int main(void) {
     fatal_error("Drastic does not recognize this ROM:\n%s", runtime.rom_path);
 
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-  padInitializeDefault(&pad);
   hidInitializeTouchScreen();
   vibration_player_ready = R_SUCCEEDED(hidInitializeVibrationDevices(
       vibration_player, 2, HidNpadIdType_No1, HidNpadStyleSet_NpadStandard));
@@ -997,8 +960,6 @@ int main(void) {
 
   RuntimeControls controls = {
     .state_slot = prefs_get_int("Wrapper/StateSlot", 0),
-    .stylus_x = 128.0f,
-    .stylus_y = 96.0f,
   };
   if (controls.state_slot < 0 || controls.state_slot > 9)
     controls.state_slot = 0;
@@ -1052,6 +1013,14 @@ int main(void) {
     fatal_error("Could not create the Drastic emulation thread (%d).",
                 game_thread_result);
 
+  DrasticInputSamplerConfig input_config;
+  configure_input_sampler(&input_config, &controls, clazz);
+  DrasticInputSampler *input_sampler =
+      drastic_input_sampler_create(&input_config);
+  if (!input_sampler)
+    fatal_error("Could not create the dedicated input sampler.");
+  drastic_input_sampler_update_runtime(input_sampler, &runtime, true);
+
   unsigned boot_frames = 0;
   int persisted_cheats_applied = 0;
   RuntimeHud hud = {0};
@@ -1059,10 +1028,14 @@ int main(void) {
          !__atomic_load_n(&game.finished, __ATOMIC_ACQUIRE)) {
     if (drastic_menu_is_open(menu)) {
       reset_runtime_fps_window(&hud);
-      padUpdate(&pad);
-      drastic_menu_update(menu, padGetButtons(&pad), padGetButtonsDown(&pad),
-                          padGetStickPos(&pad, 0), padGetStickPos(&pad, 1));
+      drastic_input_sampler_update_runtime(input_sampler, &runtime, false);
+      DrasticInputSnapshot input;
+      drastic_input_sampler_read(input_sampler, &input);
+      drastic_menu_update(menu, input.buttons, input.buttons_down,
+                          input.left, input.right);
       if (drastic_menu_take_exit_request(menu)) controls.exit_requested = 1;
+      drastic_input_sampler_update_runtime(
+          input_sampler, &runtime, !drastic_menu_is_open(menu));
       drastic_renderer_present(&runtime, core.renderFrame, fake_env, clazz,
                                top, bottom, overlay_frame(), false);
       continue;
@@ -1078,7 +1051,8 @@ int main(void) {
                                : 0;
     const unsigned transition_state = (unsigned)frame_info & 0xffffu;
     if (transition_state != 0) {
-      const int open_menu = poll_input(&runtime, &controls, clazz, menu);
+      const int open_menu = process_input(
+          &runtime, &controls, clazz, menu, input_sampler);
       update_runtime_hud(&hud, &runtime, &controls, 0);
       drastic_renderer_present(&runtime, core.renderFrame, fake_env, clazz,
                                top, bottom, overlay_frame(), false);
@@ -1086,10 +1060,11 @@ int main(void) {
       svcSleepThread(16 * 1000 * 1000LL);
       continue;
     }
-    /* Apply input and runtime configuration before entering Drastic's
-     * waitScreen/renderFrame handshake. Changing fast-forward between those
-     * two calls can expose a partially transitioned screen for one frame. */
-    const int open_menu = poll_input(&runtime, &controls, clazz, menu);
+    /* Handle hotkeys and runtime configuration before entering Drastic's
+     * waitScreen/renderFrame handshake. The sampler continues delivering raw
+     * gameplay input independently while this render loop is blocked. */
+    const int open_menu = process_input(
+        &runtime, &controls, clazz, menu, input_sampler);
     pthr_capture_next_cond_wait_as_frame_sync();
     core.waitScreen(fake_env, clazz);
     if (__atomic_load_n(&game.finished, __ATOMIC_ACQUIRE))
@@ -1132,6 +1107,7 @@ int main(void) {
   if (controls.exit_requested && envHasNextLoad() && runtime.launcher_path[0])
     envSetNextLoad(runtime.launcher_path, runtime.launcher_path);
 
+  drastic_input_sampler_destroy(input_sampler);
   HidVibrationValue stopped[2] = {0};
   send_rumble(stopped);
   shutdown_motion_sensors();

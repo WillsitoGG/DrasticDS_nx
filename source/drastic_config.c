@@ -158,6 +158,8 @@ void drastic_config_load(DrasticRuntimeConfig *config) {
   config->rotation = clamp_int(prefs_get_int("Wrapper/Rotation", 0), 0, 3);
   config->screen_gap = clamp_int(prefs_get_int("Wrapper/ScreenGap", 8), 0, 128);
   config->integer_scale = prefs_get_bool("Wrapper/IntegerScale", false);
+  config->vulkan_low_latency =
+      prefs_get_bool("Wrapper/VulkanLowLatency", false);
   config->video_filter = read_filter();
   config->show_fps = prefs_get_bool("Drastic/ShowFPS", false);
   config->volume = clamp_int(prefs_get_int("Wrapper/Volume", 100), 0, 100);
