@@ -36,26 +36,25 @@
 #include "prefs.h"
 
 #define MAX_SWAP_IMAGES 8
-#define TEXTURE_COUNT 11
+#define TEXTURE_COUNT 12
 #define TEXTURE_TOP 0
 #define TEXTURE_BOTTOM 1
 #define TEXTURE_OVERLAY 2
-#define TEXTURE_AREA 3
-#define TEXTURE_SEARCH 4
-#define TEXTURE_TOP_A 5
-#define TEXTURE_TOP_B 6
-#define TEXTURE_TOP_2X 7
-#define TEXTURE_BOTTOM_A 8
-#define TEXTURE_BOTTOM_B 9
-#define TEXTURE_BOTTOM_2X 10
+#define TEXTURE_OVERLAY_PORTRAIT 3
+#define TEXTURE_AREA 4
+#define TEXTURE_SEARCH 5
+#define TEXTURE_TOP_A 6
+#define TEXTURE_TOP_B 7
+#define TEXTURE_TOP_2X 8
+#define TEXTURE_BOTTOM_A 9
+#define TEXTURE_BOTTOM_B 10
+#define TEXTURE_BOTTOM_2X 11
 #define STANDARD_DESCRIPTOR_COUNT (TEXTURE_COUNT * 2)
 #define CUSTOM_DESCRIPTOR_COUNT 4
 #define DESCRIPTOR_SET_COUNT \
   (STANDARD_DESCRIPTOR_COUNT + CUSTOM_DESCRIPTOR_COUNT)
 #define MAX_DRAWS 8
 #define MAX_VERTICES (MAX_DRAWS * 6)
-#define DS_WIDTH 256
-#define DS_HEIGHT 192
 
 typedef struct {
   float x, y;
@@ -148,6 +147,8 @@ static uint32_t g_draw_count;
 static uint32_t g_vertex_count;
 static uint64_t g_overlay_generation = UINT64_MAX;
 static unsigned g_frames;
+static uint32_t g_ds_width = 256;
+static uint32_t g_ds_height = 192;
 static VkPipeline g_filter_pipelines[DRASTIC_DFX_SHADER_COUNT];
 static VkDescriptorSet g_filter_descriptors[2][2];
 static DrasticVideoFilter g_filtered_filter = DRASTIC_FILTER_COUNT;
@@ -726,32 +727,38 @@ static int create_texture_resources(void) {
       VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
   const VkImageUsageFlags filtered =
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-  if (!create_sampled_texture(&g_textures[TEXTURE_TOP], DS_WIDTH, DS_HEIGHT,
+  if (!create_sampled_texture(&g_textures[TEXTURE_TOP], g_ds_width, g_ds_height,
                               VK_FORMAT_B8G8R8A8_UNORM, uploaded) ||
-      !create_sampled_texture(&g_textures[TEXTURE_BOTTOM], DS_WIDTH, DS_HEIGHT,
+      !create_sampled_texture(&g_textures[TEXTURE_BOTTOM], g_ds_width,
+                              g_ds_height,
                               VK_FORMAT_B8G8R8A8_UNORM, uploaded) ||
       !create_sampled_texture(&g_textures[TEXTURE_OVERLAY],
                               DRASTIC_OVERLAY_WIDTH, DRASTIC_OVERLAY_HEIGHT,
+                              VK_FORMAT_B8G8R8A8_UNORM, uploaded) ||
+      !create_sampled_texture(&g_textures[TEXTURE_OVERLAY_PORTRAIT],
+                              DRASTIC_OVERLAY_HEIGHT, DRASTIC_OVERLAY_WIDTH,
                               VK_FORMAT_B8G8R8A8_UNORM, uploaded) ||
       !create_sampled_texture(&g_textures[TEXTURE_AREA], 160, 560,
                               VK_FORMAT_R8G8B8A8_UNORM, uploaded) ||
       !create_sampled_texture(&g_textures[TEXTURE_SEARCH], 64, 16,
                               VK_FORMAT_R8G8B8A8_UNORM, uploaded) ||
-      !create_sampled_texture(&g_textures[TEXTURE_TOP_A], DS_WIDTH, DS_HEIGHT,
+      !create_sampled_texture(&g_textures[TEXTURE_TOP_A], g_ds_width,
+                              g_ds_height,
                               VK_FORMAT_B8G8R8A8_UNORM, filtered) ||
-      !create_sampled_texture(&g_textures[TEXTURE_TOP_B], DS_WIDTH, DS_HEIGHT,
+      !create_sampled_texture(&g_textures[TEXTURE_TOP_B], g_ds_width,
+                              g_ds_height,
                               VK_FORMAT_B8G8R8A8_UNORM, filtered) ||
-      !create_sampled_texture(&g_textures[TEXTURE_TOP_2X], DS_WIDTH * 2,
-                              DS_HEIGHT * 2, VK_FORMAT_B8G8R8A8_UNORM,
+      !create_sampled_texture(&g_textures[TEXTURE_TOP_2X], g_ds_width * 2,
+                              g_ds_height * 2, VK_FORMAT_B8G8R8A8_UNORM,
                               filtered) ||
-      !create_sampled_texture(&g_textures[TEXTURE_BOTTOM_A], DS_WIDTH,
-                              DS_HEIGHT, VK_FORMAT_B8G8R8A8_UNORM,
+      !create_sampled_texture(&g_textures[TEXTURE_BOTTOM_A], g_ds_width,
+                              g_ds_height, VK_FORMAT_B8G8R8A8_UNORM,
                               filtered) ||
-      !create_sampled_texture(&g_textures[TEXTURE_BOTTOM_B], DS_WIDTH,
-                              DS_HEIGHT, VK_FORMAT_B8G8R8A8_UNORM,
+      !create_sampled_texture(&g_textures[TEXTURE_BOTTOM_B], g_ds_width,
+                              g_ds_height, VK_FORMAT_B8G8R8A8_UNORM,
                               filtered) ||
-      !create_sampled_texture(&g_textures[TEXTURE_BOTTOM_2X], DS_WIDTH * 2,
-                              DS_HEIGHT * 2, VK_FORMAT_B8G8R8A8_UNORM,
+      !create_sampled_texture(&g_textures[TEXTURE_BOTTOM_2X], g_ds_width * 2,
+                              g_ds_height * 2, VK_FORMAT_B8G8R8A8_UNORM,
                               filtered))
     return 0;
 
@@ -865,7 +872,7 @@ static int create_staging_buffer(void) {
   vkGetPhysicalDeviceProperties(g_physical, &properties);
   const VkDeviceSize copy_alignment =
       properties.limits.optimalBufferCopyOffsetAlignment;
-  const VkDeviceSize ds_size = (VkDeviceSize)DS_WIDTH * DS_HEIGHT * 4;
+  const VkDeviceSize ds_size = (VkDeviceSize)g_ds_width * g_ds_height * 4;
   const VkDeviceSize overlay_size =
       (VkDeviceSize)DRASTIC_OVERLAY_WIDTH * DRASTIC_OVERLAY_HEIGHT * 4;
   const VkDeviceSize area_size = (VkDeviceSize)160 * 560 * 4;
@@ -875,6 +882,8 @@ static int create_staging_buffer(void) {
                                                         copy_alignment);
   g_texture_offsets[TEXTURE_OVERLAY] = align_device_size(
       g_texture_offsets[TEXTURE_BOTTOM] + ds_size, copy_alignment);
+  g_texture_offsets[TEXTURE_OVERLAY_PORTRAIT] =
+      g_texture_offsets[TEXTURE_OVERLAY];
   g_texture_offsets[TEXTURE_AREA] = align_device_size(
       g_texture_offsets[TEXTURE_OVERLAY] + overlay_size, copy_alignment);
   g_texture_offsets[TEXTURE_SEARCH] = align_device_size(
@@ -1270,6 +1279,11 @@ static DrawParameters texture_parameters(int effect, int mode, float width,
   };
 }
 
+static int overlay_texture_index(const DrasticOverlayFrame *overlay) {
+  return overlay && overlay->height > overlay->width
+      ? TEXTURE_OVERLAY_PORTRAIT : TEXTURE_OVERLAY;
+}
+
 static void add_solid_rectangle(float x, float y, float width, float height,
                                 float red, float green, float blue) {
   DrawParameters parameters = texture_parameters(
@@ -1318,11 +1332,12 @@ static void build_draws(const DrasticRuntimeConfig *config,
   }
 
   if (overlay && overlay->visible && overlay->pixels) {
+    const int texture = overlay_texture_index(overlay);
     const DrawParameters overlay_parameters = texture_parameters(
         1, 0, (float)overlay->width, (float)overlay->height,
         (float)g_extent.width, (float)g_extent.height);
     add_rectangle(0.0f, 0.0f, (float)g_extent.width,
-                  (float)g_extent.height, 0, TEXTURE_OVERLAY,
+                  (float)g_extent.height, config->rotation, texture,
                   DRASTIC_DFX_LINEAR,
                   &overlay_parameters);
   }
@@ -1442,7 +1457,7 @@ static int record_filter_chains(VkCommandBuffer command,
 }
 
 static int record_commands(uint32_t image_index, int upload_screens,
-                           int upload_overlay,
+                           int upload_overlay, int overlay_texture,
                            const DrasticRuntimeConfig *config) {
   VkCommandBuffer command = g_commands[image_index];
   vkResetCommandBuffer(command, 0);
@@ -1458,8 +1473,8 @@ static int record_commands(uint32_t image_index, int upload_screens,
                         g_texture_offsets[TEXTURE_BOTTOM]);
   }
   if (upload_overlay)
-    record_image_upload(command, &g_textures[TEXTURE_OVERLAY],
-                        g_texture_offsets[TEXTURE_OVERLAY]);
+    record_image_upload(command, &g_textures[overlay_texture],
+                        g_texture_offsets[overlay_texture]);
   if (!g_textures[TEXTURE_AREA].initialized) {
     record_image_upload(command, &g_textures[TEXTURE_AREA],
                         g_texture_offsets[TEXTURE_AREA]);
@@ -1538,7 +1553,9 @@ static int lsfg_try_create(void) {
 }
 
 bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
-  (void)config;
+  g_ds_width = config &&
+      (config->core_config & (UINT64_C(1) << 41)) ? 512 : 256;
+  g_ds_height = g_ds_width * 3 / 4;
   int lsfg_launch_enabled =
       prefs_get_bool("Wrapper/LSFGEnabled", false) &&
       file_readable(lsfg_dll_path());
@@ -1562,9 +1579,9 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   const VkApplicationInfo application = {
     .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
     .pApplicationName = "DrasticDS_nx",
-    .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
+    .applicationVersion = VK_MAKE_VERSION(1, 0, 1),
     .pEngineName = "Drastic Switch wrapper",
-    .engineVersion = VK_MAKE_VERSION(1, 0, 0),
+    .engineVersion = VK_MAKE_VERSION(1, 0, 1),
     .apiVersion = VK_API_VERSION_1_1,
   };
   const VkInstanceCreateInfo instance_info = {
@@ -1632,16 +1649,53 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   return vk_ok(result);
 }
 
+static void stage_screen_pixels(uint8_t *destination,
+                                const uint32_t *source,
+                                const DrasticRuntimeConfig *config) {
+  const size_t pixels = (size_t)g_ds_width * g_ds_height;
+  if (!(config->core_config & (UINT64_C(1) << 41))) {
+    memcpy(destination, source, pixels * sizeof(uint32_t));
+    return;
+  }
+
+  uint32_t *output = (uint32_t *)destination;
+  if (config->core_config & (UINT64_C(1) << 23)) {
+    const uint16_t *input = (const uint16_t *)source;
+    for (size_t index = 0; index < pixels; index++) {
+      const uint32_t pixel = input[index];
+      output[index] = UINT32_C(0xff000000) |
+                      ((pixel & UINT32_C(0xf800)) << 8) |
+                      ((pixel & UINT32_C(0x07e0)) << 5) |
+                      ((pixel & UINT32_C(0x001f)) << 3);
+    }
+    return;
+  }
+
+  /* DraStic's native 32-bit buffer is R,G,B,X in byte order. Match the
+   * exported getScreenBuffers() conversion expected by our BGRA textures. */
+  for (size_t index = 0; index < pixels; index++) {
+    const uint32_t pixel = source[index];
+    output[index] = UINT32_C(0xff000000) |
+                    ((pixel & UINT32_C(0x000000ff)) << 16) |
+                    (pixel & UINT32_C(0x0000ff00)) |
+                    ((pixel & UINT32_C(0x00ff0000)) >> 16);
+  }
+}
+
 void drastic_renderer_present(const DrasticRuntimeConfig *config,
                               DrasticCoreRenderFrame core_render,
                               void *env, void *clazz,
                               const uint32_t *top, const uint32_t *bottom,
                               const DrasticOverlayFrame *overlay,
                               bool consume_core_frame) {
-  /* renderFrame() completes Drastic's producer/consumer handshake. The Vulkan
-   * build deliberately keeps GLES imports inert, then uploads the two compact
-   * CPU screen buffers into native sampled images for GPU composition. */
-  if (consume_core_frame) core_render(env, clazz, 0, 0, 0);
+  const int upload_screens = consume_core_frame && top && bottom;
+  const int hold_high_resolution_frame = upload_screens &&
+      (config->core_config & (UINT64_C(1) << 41));
+  /* Restore the original producer/consumer timing for ordinary frames. The
+   * high-resolution path is the sole exception: its private core buffers must
+   * be copied before renderFrame() lets DraStic reuse them. */
+  if (consume_core_frame && !hold_high_resolution_frame)
+    core_render(env, clazz, 0, 0, 0);
 
   /* Complete the LSFG -> native-present handoff before acquiring or writing
    * the first ordinary frame. Destroying the backend later, after the native
@@ -1655,34 +1709,44 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
   VkResult result = vkWaitForFences(g_device, 1, &g_fence, VK_TRUE,
                                     UINT64_MAX);
   if (!vk_ok(result)) {
-    return;
-  }
-  uint32_t image_index = 0;
-  const VkResult acquired = vkAcquireNextImageKHR(
-      g_device, g_swapchain, UINT64_MAX, g_acquired, VK_NULL_HANDLE,
-      &image_index);
-  if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
+    if (hold_high_resolution_frame) core_render(env, clazz, 0, 0, 0);
     return;
   }
 
-  const int upload_screens = consume_core_frame && top && bottom;
   if (g_filtered_filter != config->video_filter) {
     g_filtered_filter = config->video_filter;
     g_filter_valid[0] = g_filter_valid[1] = 0;
   }
-  if (upload_screens) {
-    g_filter_valid[0] = g_filter_valid[1] = 0;
-    const size_t bytes = (size_t)DS_WIDTH * DS_HEIGHT * sizeof(uint32_t);
-    memcpy(g_staging_mapped + g_texture_offsets[TEXTURE_TOP], top, bytes);
-    memcpy(g_staging_mapped + g_texture_offsets[TEXTURE_BOTTOM], bottom,
-           bytes);
+  if (upload_screens) g_filter_valid[0] = g_filter_valid[1] = 0;
+  if (hold_high_resolution_frame) {
+    stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_TOP],
+                        top, config);
+    stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_BOTTOM],
+                        bottom, config);
+    core_render(env, clazz, 0, 0, 0);
+  }
+
+  uint32_t image_index = 0;
+  const VkResult acquired = vkAcquireNextImageKHR(
+      g_device, g_swapchain, UINT64_MAX, g_acquired, VK_NULL_HANDLE,
+      &image_index);
+  if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR)
+    return;
+
+  if (upload_screens && !hold_high_resolution_frame) {
+    stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_TOP],
+                        top, config);
+    stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_BOTTOM],
+                        bottom, config);
   }
   const int upload_overlay = overlay && overlay->visible && overlay->pixels &&
       overlay->generation != g_overlay_generation;
+  const int overlay_texture = overlay_texture_index(overlay);
   if (upload_overlay) {
     const size_t bytes = (size_t)overlay->width * overlay->height *
                          sizeof(uint32_t);
-    memcpy(g_staging_mapped + g_texture_offsets[TEXTURE_OVERLAY],
+    if (bytes > (size_t)DRASTIC_OVERLAY_PIXELS * sizeof(uint32_t)) return;
+    memcpy(g_staging_mapped + g_texture_offsets[overlay_texture],
            overlay->pixels, bytes);
   }
   build_draws(config, overlay);
@@ -1698,7 +1762,8 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
       return;
     }
   }
-  if (!record_commands(image_index, upload_screens, upload_overlay, config)) {
+  if (!record_commands(image_index, upload_screens, upload_overlay,
+                       overlay_texture, config)) {
     return;
   }
 

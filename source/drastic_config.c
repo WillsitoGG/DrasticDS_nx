@@ -56,7 +56,7 @@ uint64_t drastic_config_build_core_config(void) {
   const int cpu_threads = clamp_int(prefs_get_int("Drastic/CpuThreads", 3), 1, 3);
   const int autofire = clamp_int(prefs_get_int("Drastic/AutoFireSpeed", 2), 0, 7);
   const int mic_level = clamp_int(prefs_get_int("Drastic/MicLevel", 1), 0, 3);
-  const int slot2 = clamp_int(prefs_get_int("Drastic/Slot2Type", 1), 0, 15);
+  const int slot2 = clamp_int(prefs_get_int("Drastic/Slot2Type", 1), 0, 5);
 
   uint64_t value = (uint64_t)frameskip;
   value |= (uint64_t)frameskip_type << 5;
@@ -136,6 +136,8 @@ void drastic_config_load(DrasticRuntimeConfig *config) {
            prefs_get_string("Drastic/RomPath", DEFAULT_ROM_PATH));
   snprintf(config->core_path, sizeof(config->core_path), "%s",
            prefs_get_string("Wrapper/CoreSo", SO_NAME));
+  snprintf(config->launcher_path, sizeof(config->launcher_path), "%s",
+           prefs_get_string("Wrapper/LauncherPath", ""));
   snprintf(config->firmware_nickname, sizeof(config->firmware_nickname), "%s",
            prefs_get_string("Drastic/FirmwareNickname", "Switch"));
   const int configured_language =

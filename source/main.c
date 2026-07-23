@@ -12,7 +12,6 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 #include "config.h"
 #include "drastic_config.h"
@@ -40,6 +39,13 @@ so_module emu_mod;
 #define DRASTIC_JIT_OFFSET 0x001de000u
 #define DRASTIC_JIT_SIZE   0x01300000u
 
+#ifdef USE_VULKAN
+/* Build 109's private screen-buffer accessor. Unlike getScreenBuffers(), this
+ * returns the full 512x384 buffers when high-resolution 3D is enabled. */
+#define DRASTIC_RAW_SCREEN_OFFSET 0x0001cd18u
+static const void *(*core_get_raw_screen)(unsigned screen);
+#endif
+
 static int configure_core_jit(so_module *mod) {
   /* Fingerprint the cache setup routine before relying on fixed offsets.
    * These are `mov w1,#0x1000000`, `mov w2,#7` at 0x961ac. */
@@ -53,6 +59,21 @@ static int configure_core_jit(so_module *mod) {
     return 0;
   return drastic_jit_install(mod);
 }
+
+#ifdef USE_VULKAN
+static int configure_core_screen_capture(so_module *mod) {
+  static const uint32_t expected[] = {
+    0xb001f888u, 0x9107e108u, 0xb9895909u, 0x52a0018au,
+  };
+  if (!mod || DRASTIC_RAW_SCREEN_OFFSET + sizeof(expected) > mod->load_size ||
+      memcmp((const char *)mod->load_base + DRASTIC_RAW_SCREEN_OFFSET,
+             expected, sizeof(expected)) != 0)
+    return 0;
+  core_get_raw_screen = (const void *(*)(unsigned))(
+      (uintptr_t)mod->load_virtbase + DRASTIC_RAW_SCREEN_OFFSET);
+  return 1;
+}
+#endif
 
 #ifdef USE_VULKAN
 u32 __nx_nv_transfermem_size = 16 * 1024 * 1024;
@@ -857,13 +878,18 @@ static int has_archive_extension(const char *path) {
 
 static void shutdown_core(void *clazz, CoreGameThread *game) {
   if (!__atomic_load_n(&game->finished, __ATOMIC_ACQUIRE)) {
+    /* Match DraSticEmuActivity.onPause() followed by its shutdown helper:
+     * pauseSystem(1), wake the render wait, quitSystem(), join(), and finally
+     * releaseSystem().  In particular, never let the menu resume the core and
+     * race straight into teardown. */
     core.pauseSystem(fake_env, clazz, 1);
-    core.quitSystem(fake_env, clazz);
     core.signalScreen(fake_env, clazz);
+    core.quitSystem(fake_env, clazz);
   }
   pthread_join(game->thread, NULL);
   core.releaseSystem(fake_env, clazz);
-  if (core.JNI_OnUnload) core.JNI_OnUnload(fake_vm, NULL);
+  if (core.JNI_OnUnload)
+    core.JNI_OnUnload(fake_vm, NULL);
 }
 
 int main(void) {
@@ -902,6 +928,12 @@ int main(void) {
   resolve_core();
   if (!configure_core_jit(&emu_mod))
     fatal_error("Unsupported Drastic ARM64 core JIT layout.");
+#ifdef USE_VULKAN
+  const bool high_resolution_3d =
+      (runtime.core_config & (UINT64_C(1) << 41)) != 0;
+  if (high_resolution_3d && !configure_core_screen_capture(&emu_mod))
+    fatal_error("Unsupported Drastic high-resolution screen layout.");
+#endif
   so_finalize(&emu_mod);
   so_flush_caches(&emu_mod);
 
@@ -931,7 +963,7 @@ int main(void) {
     fatal_error("Could not initialize the %s renderer.",
                 DRASTIC_RENDERER == DRASTIC_RENDERER_VK ? "Vulkan" : "OpenGL");
   fatal_error_set_graphics_active(1);
-  overlay_init();
+  overlay_init(runtime.rotation);
   drastic_config_calculate_layout(&runtime, panel_width, panel_height);
 
   void *rom = jni_make_string(runtime.rom_path);
@@ -949,11 +981,19 @@ int main(void) {
       HidNpadStyleSet_NpadStandard));
   initialize_motion_sensors();
 
-  void *top_array = jni_make_int_array(256 * 192);
-  void *bottom_array = jni_make_int_array(256 * 192);
-  uint32_t *top = (uint32_t *)jni_int_array_data(top_array);
-  uint32_t *bottom = (uint32_t *)jni_int_array_data(bottom_array);
-  if (!top || !bottom) fatal_error("Could not allocate DS screen buffers.");
+  const uint32_t *top = NULL;
+  const uint32_t *bottom = NULL;
+#ifdef USE_VULKAN
+  void *top_array = NULL;
+  void *bottom_array = NULL;
+  if (!high_resolution_3d) {
+    top_array = jni_make_int_array(256 * 192);
+    bottom_array = jni_make_int_array(256 * 192);
+    top = (const uint32_t *)jni_int_array_data(top_array);
+    bottom = (const uint32_t *)jni_int_array_data(bottom_array);
+    if (!top || !bottom) fatal_error("Could not allocate DS screen buffers.");
+  }
+#endif
 
   RuntimeControls controls = {
     .state_slot = prefs_get_int("Wrapper/StateSlot", 0),
@@ -1054,9 +1094,14 @@ int main(void) {
     core.waitScreen(fake_env, clazz);
     if (__atomic_load_n(&game.finished, __ATOMIC_ACQUIRE))
       break;
-    if (DRASTIC_RENDERER == DRASTIC_RENDERER_VK) {
+#ifdef USE_VULKAN
+    if (high_resolution_3d) {
+      top = (const uint32_t *)core_get_raw_screen(0);
+      bottom = (const uint32_t *)core_get_raw_screen(1);
+    } else {
       core.getScreenBuffers(fake_env, clazz, top_array, bottom_array);
     }
+#endif
     update_runtime_hud(&hud, &runtime, &controls, 1);
     drastic_renderer_present(&runtime, core.renderFrame, fake_env, clazz,
                              top, bottom, overlay_frame(), true);
@@ -1082,20 +1127,28 @@ int main(void) {
   prefs_set_int("Wrapper/StateSlot", controls.state_slot);
   prefs_save();
 
+  /* Match NetherSX2's chainload ordering: schedule the launcher while the
+   * libnx environment is still intact, before core/JIT/runtime teardown. */
+  if (controls.exit_requested && envHasNextLoad() && runtime.launcher_path[0])
+    envSetNextLoad(runtime.launcher_path, runtime.launcher_path);
+
   HidVibrationValue stopped[2] = {0};
   send_rumble(stopped);
   shutdown_motion_sensors();
   drastic_menu_destroy(menu);
   shutdown_core(clazz, &game);
+  /* Stop DraStic-owned Android service workers while their code and any EGL
+   * ownership they hold are still valid. hbloader reuses this process for the
+   * launcher, so no libdrastic thread may survive the upcoming renderer/SO
+   * teardown. */
+  pthr_shutdown();
   opensles_shutdown();
   drastic_renderer_shutdown();
   libc_finalize_core();
-  pthr_shutdown();
+  pthr_finalize();
   libc_memory_shutdown();
   so_unload(&emu_mod);
-  const bool storage_socket = switchStorageSocketReady();
   switchStorageShutdown();
-  if (storage_socket) socketExit();
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);
   return 0;

@@ -348,7 +348,12 @@ static const Choice C_threads[]  = { {"1","1"}, {"2","2"}, {"3 (recommended)","3
 static const Choice C_frameskipType[] = { {"Automatic","0"}, {"Fixed","1"}, {"Aggressive","2"}, {"Maximum","3"} };
 static const Choice C_ffSpeed[]  = { {"2x","1"}, {"3x","2"}, {"4x","3"}, {"Unlimited","0"} };
 static const Choice C_autofire[] = { {"Slow","0"}, {"Normal","2"}, {"Fast","4"}, {"Very fast","7"} };
-static const Choice C_slot2[]    = { {"Automatic","1"}, {"Disabled","0"}, {"Rumble Pak","2"}, {"Memory Expansion Pak","3"} };
+/* Native DraStic Slot-2 enum. Keep these values aligned with build 109:
+ * 0=None, 1=GBA, 2=SRAM, 3=rumble, 4/5=motion accessories. */
+static const Choice C_slot2[]    = { {"None","0"}, {"GBA Cart","1"},
+                                     {"SRAM Cart","2"}, {"Rumble Pack","3"},
+                                     {"Motion Pack (Official)","4"},
+                                     {"Motion Pack (Homebrew)","5"} };
 static const Choice C_autosave[] = { {"Off","0"}, {"1 minute","60"}, {"5 minutes","300"}, {"10 minutes","600"}, {"30 minutes","1800"} };
 static const Choice C_firmwareLanguage[] = { {g_autoFirmwareLanguage,"-1"}, {"Japanese","0"}, {"English","1"}, {"French","2"}, {"German","3"},
                                              {"Italian","4"}, {"Spanish","5"}, {"Korean","6"} };

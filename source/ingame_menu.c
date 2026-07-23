@@ -93,6 +93,12 @@ static float clamp_float(float value, float minimum, float maximum) {
   return value;
 }
 
+static int ui_width(void) { return overlay_width(); }
+
+static int ui_height(void) { return overlay_height(); }
+
+static int ui_is_portrait(void) { return ui_height() > ui_width(); }
+
 static void set_status(DrasticIngameMenu *menu, const char *status) {
   snprintf(menu->status, sizeof(menu->status), "%s", status ? status : "");
   menu->redraw = 1;
@@ -452,19 +458,23 @@ static void add_custom_cheat(DrasticIngameMenu *menu) {
 }
 
 static void draw_shell(const char *title, const char *help) {
-  overlay_fill_rect(0, 0, DRASTIC_OVERLAY_WIDTH, DRASTIC_OVERLAY_HEIGHT,
-                    COLOR_DIM);
-  overlay_fill_rect(0, 0, DRASTIC_OVERLAY_WIDTH, 76, COLOR_PANEL);
-  overlay_fill_rect(0, 74, DRASTIC_OVERLAY_WIDTH, 2, COLOR_ACCENT);
+  const int width = ui_width();
+  const int height = ui_height();
+  overlay_fill_rect(0, 0, width, height, COLOR_DIM);
+  overlay_fill_rect(0, 0, width, 76, COLOR_PANEL);
+  overlay_fill_rect(0, 74, width, 2, COLOR_ACCENT);
   overlay_draw_text_scaled(32, 18, 2, COLOR_TEXT, title);
-  overlay_fill_rect(0, 670, DRASTIC_OVERLAY_WIDTH, 50, COLOR_PANEL);
-  overlay_draw_text(28, 687, COLOR_MUTED, help);
+  overlay_fill_rect(0, height - 50, width, 50, COLOR_PANEL);
+  overlay_draw_text_clipped(28, height - 33, width - 56, COLOR_MUTED, help);
 }
 
 static void draw_status(const DrasticIngameMenu *menu) {
   if (!menu->status[0]) return;
-  overlay_fill_rect(24, 624, 1232, 36, 0xe5263444u);
-  overlay_draw_text_clipped(40, 634, 1200, COLOR_WARN, menu->status);
+  const int width = ui_width();
+  const int y = ui_height() - 96;
+  overlay_fill_rect(24, y, width - 48, 36, 0xe5263444u);
+  overlay_draw_text_clipped(40, y + 10, width - 80,
+                            COLOR_WARN, menu->status);
 }
 
 static void draw_row(int x, int y, int width, int selected,
@@ -516,9 +526,13 @@ static void render_main(DrasticIngameMenu *menu) {
     "Quit to launcher",
   };
   draw_shell("Drastic DS", "A  Select     B  Resume");
+  const int portrait = ui_is_portrait();
+  const int panel_width = portrait ? ui_width() - 48 : 792;
+  const int panel_x = (ui_width() - panel_width) / 2;
   const int panel_height = MAIN_ITEM_COUNT * 52 + 48;
-  overlay_fill_rect(244, 106, 792, panel_height, COLOR_PANEL);
-  overlay_border_rect(244, 106, 792, panel_height, 2, COLOR_PANEL_ALT);
+  overlay_fill_rect(panel_x, 106, panel_width, panel_height, COLOR_PANEL);
+  overlay_border_rect(panel_x, 106, panel_width, panel_height, 2,
+                      COLOR_PANEL_ALT);
   for (int index = 0; index < (int)(sizeof(items) / sizeof(*items)); index++)
   {
     const char *value = NULL;
@@ -529,7 +543,7 @@ static void render_main(DrasticIngameMenu *menu) {
           : "Disabled";
     }
 #endif
-    draw_row(268, 126 + index * 52, 744,
+    draw_row(panel_x + 24, 126 + index * 52, panel_width - 48,
              menu->selection[MENU_MAIN] == index, items[index], value,
              main_item_available(index));
   }
@@ -539,47 +553,99 @@ static void render_main(DrasticIngameMenu *menu) {
 static void render_states(DrasticIngameMenu *menu) {
   draw_shell("Save states",
              "A  Load     X  Save / overwrite     Y  Delete     B  Back");
-  overlay_fill_rect(40, 100, 430, 526, COLOR_PANEL);
-  for (int slot = 0; slot < 10; slot++) {
-    char label[40];
-    snprintf(label, sizeof(label), "Slot %d%s", slot,
-             slot == *menu->state_slot ? "  [active]" : "");
-    draw_row(58, 116 + slot * 48, 394,
-             slot == menu->selection[MENU_STATES], label, NULL, 1);
-  }
-  overlay_fill_rect(492, 100, 748, 526, COLOR_PANEL);
   char heading[64];
   snprintf(heading, sizeof(heading), "Slot %d preview",
            menu->selection[MENU_STATES]);
-  overlay_draw_text(520, 122, COLOR_TEXT, heading);
-  if (menu->snapshot_valid) {
-    overlay_blit_snapshot(594, 164, 256, 192, menu->snapshot_top, 256, 192);
-    overlay_blit_snapshot(878, 164, 256, 192, menu->snapshot_bottom, 256, 192);
-    overlay_draw_text(650, 372, COLOR_MUTED, "Top screen");
-    overlay_draw_text(918, 372, COLOR_MUTED, "Touch screen");
+  const int saving = menu->core.is_saving &&
+      menu->core.is_saving(menu->core.env, menu->core.clazz);
+  int saving_slot = -1;
+  if (saving && menu->core.get_saving_slot)
+    saving_slot = menu->core.get_saving_slot(menu->core.env,
+                                              menu->core.clazz);
+
+  if (ui_is_portrait()) {
+    const int width = ui_width();
+    overlay_fill_rect(24, 96, width - 48, 500, COLOR_PANEL);
+    for (int slot = 0; slot < 10; slot++) {
+      char label[40];
+      snprintf(label, sizeof(label), "Slot %d%s", slot,
+               slot == *menu->state_slot ? "  [active]" : "");
+      draw_row(42, 108 + slot * 46, width - 84,
+               slot == menu->selection[MENU_STATES], label, NULL, 1);
+    }
+    overlay_fill_rect(24, 616, width - 48, ui_height() - 732,
+                      COLOR_PANEL);
+    overlay_draw_text(48, 640, COLOR_TEXT, heading);
+    if (menu->snapshot_valid) {
+      overlay_blit_snapshot(72, 682, 256, 192,
+                            menu->snapshot_top, 256, 192);
+      overlay_blit_snapshot(392, 682, 256, 192,
+                            menu->snapshot_bottom, 256, 192);
+      overlay_draw_text(144, 890, COLOR_MUTED, "Top screen");
+      overlay_draw_text(432, 890, COLOR_MUTED, "Touch screen");
+    } else {
+      overlay_border_rect(72, 682, width - 144, 224, 2, COLOR_PANEL_ALT);
+      overlay_draw_text(264, 786, COLOR_MUTED, "No preview available");
+    }
+    if (saving) {
+      char label[64];
+      snprintf(label, sizeof(label), "Saving slot %d...", saving_slot);
+      overlay_draw_text(48, 932, COLOR_WARN, label);
+    }
+    overlay_draw_wrapped(48, 976, width - 96, 10, COLOR_MUTED,
+        "Save-state slots are per title. In-game saves remain the recommended "
+        "long-term format; states can depend on this Drastic build.");
   } else {
-    overlay_border_rect(594, 164, 540, 224, 2, COLOR_PANEL_ALT);
-    overlay_draw_text(754, 266, COLOR_MUTED, "No preview available");
+    overlay_fill_rect(40, 100, 430, 526, COLOR_PANEL);
+    for (int slot = 0; slot < 10; slot++) {
+      char label[40];
+      snprintf(label, sizeof(label), "Slot %d%s", slot,
+               slot == *menu->state_slot ? "  [active]" : "");
+      draw_row(58, 116 + slot * 48, 394,
+               slot == menu->selection[MENU_STATES], label, NULL, 1);
+    }
+    overlay_fill_rect(492, 100, 748, 526, COLOR_PANEL);
+    overlay_draw_text(520, 122, COLOR_TEXT, heading);
+    if (menu->snapshot_valid) {
+      overlay_blit_snapshot(594, 164, 256, 192,
+                            menu->snapshot_top, 256, 192);
+      overlay_blit_snapshot(878, 164, 256, 192,
+                            menu->snapshot_bottom, 256, 192);
+      overlay_draw_text(650, 372, COLOR_MUTED, "Top screen");
+      overlay_draw_text(918, 372, COLOR_MUTED, "Touch screen");
+    } else {
+      overlay_border_rect(594, 164, 540, 224, 2, COLOR_PANEL_ALT);
+      overlay_draw_text(754, 266, COLOR_MUTED, "No preview available");
+    }
+    if (saving) {
+      char label[64];
+      snprintf(label, sizeof(label), "Saving slot %d...", saving_slot);
+      overlay_draw_text(520, 430, COLOR_WARN, label);
+    }
+    overlay_draw_wrapped(520, 474, 680, 6, COLOR_MUTED,
+        "Save-state slots are per title. In-game saves remain the recommended "
+        "long-term format; states can depend on this Drastic build.");
   }
-  if (menu->core.is_saving &&
-      menu->core.is_saving(menu->core.env, menu->core.clazz)) {
-    int slot = menu->core.get_saving_slot
-        ? menu->core.get_saving_slot(menu->core.env, menu->core.clazz) : -1;
-    char saving[64];
-    snprintf(saving, sizeof(saving), "Saving slot %d...", slot);
-    overlay_draw_text(520, 430, COLOR_WARN, saving);
-  }
-  overlay_draw_wrapped(520, 474, 680, 6, COLOR_MUTED,
-      "Save-state slots are per title. In-game saves remain the recommended "
-      "long-term format; states can depend on this Drastic build.");
   draw_status(menu);
 }
 
 static void render_cheats(DrasticIngameMenu *menu) {
   draw_shell("Per-title cheats",
              "A  Add / toggle     X  Delete custom     B  Back");
-  overlay_fill_rect(28, 94, 780, 536, COLOR_PANEL);
-  overlay_fill_rect(826, 94, 426, 536, COLOR_PANEL);
+  const int portrait = ui_is_portrait();
+  const int list_x = portrait ? 24 : 28;
+  const int list_y = 94;
+  const int list_width = portrait ? ui_width() - 48 : 780;
+  const int detail_x = portrait ? 24 : 826;
+  const int detail_y = portrait ? 650 : 94;
+  const int detail_width = portrait ? ui_width() - 48 : 426;
+  const int detail_height = portrait ? ui_height() - 766 : 536;
+  const int content_x = detail_x + 24;
+  const int content_y = detail_y + 28;
+  const int content_width = detail_width - 48;
+  overlay_fill_rect(list_x, list_y, list_width, 536, COLOR_PANEL);
+  overlay_fill_rect(detail_x, detail_y, detail_width, detail_height,
+                    COLOR_PANEL);
   const int count = menu->cheat_count + 1;
   int selection = clamp_int(menu->selection[MENU_CHEATS], 0, count - 1);
   int scroll = menu->scroll[MENU_CHEATS];
@@ -590,37 +656,45 @@ static void render_cheats(DrasticIngameMenu *menu) {
   for (int row = 0; row < 11 && scroll + row < count; row++) {
     const int item = scroll + row;
     if (!item) {
-      draw_row(44, 108 + row * 46, 748, selection == item,
+      draw_row(list_x + 16, 108 + row * 46, list_width - 32,
+               selection == item,
                "+ Add custom Action Replay cheat", NULL, 1);
       continue;
     }
     MenuCheat *cheat = &menu->cheats[item - 1];
-    draw_row(44, 108 + row * 46, 748, selection == item, cheat->name,
+    draw_row(list_x + 16, 108 + row * 46, list_width - 32,
+             selection == item, cheat->name,
              cheat->enabled ? "ON" : "OFF", 1);
   }
   if (!selection) {
-    overlay_draw_text(850, 122, COLOR_ACCENT, "Custom cheat editor");
-    overlay_draw_wrapped(850, 164, 370, 14, COLOR_MUTED,
+    overlay_draw_text(content_x, content_y, COLOR_ACCENT,
+                      "Custom cheat editor");
+    overlay_draw_wrapped(content_x, content_y + 42, content_width,
+                         portrait ? 22 : 14, COLOR_MUTED,
         "Create a named Action Replay code using the Switch software "
         "keyboard. Enter hexadecimal address/value pairs separated by spaces "
         "or new lines. Custom cheats are stored by Drastic for this title.");
   } else {
     const MenuCheat *cheat = &menu->cheats[selection - 1];
-    overlay_draw_text_clipped(850, 122, 370, COLOR_TEXT, cheat->name);
-    overlay_draw_text(850, 162, cheat->enabled ? COLOR_GOOD : COLOR_MUTED,
+    overlay_draw_text_clipped(content_x, content_y, content_width,
+                              COLOR_TEXT, cheat->name);
+    overlay_draw_text(content_x, content_y + 40,
+                      cheat->enabled ? COLOR_GOOD : COLOR_MUTED,
                       cheat->enabled ? "Enabled" : "Disabled");
-    overlay_draw_text(850, 200, COLOR_ACCENT,
+    overlay_draw_text(content_x, content_y + 78, COLOR_ACCENT,
                       cheat->custom ? "Custom cheat" : "Database cheat");
     if (!cheat->custom && cheat->folder >= 0 &&
         cheat->folder < menu->folder_count &&
         menu->folders[cheat->folder][0]) {
-      overlay_draw_text(850, 238, COLOR_MUTED, "Folder:");
-      overlay_draw_text_clipped(850, 266, 370, COLOR_TEXT,
+      overlay_draw_text(content_x, content_y + 116, COLOR_MUTED, "Folder:");
+      overlay_draw_text_clipped(content_x, content_y + 144, content_width,
+                                COLOR_TEXT,
                                 menu->folders[cheat->folder]);
     }
     if (cheat->note[0]) {
-      overlay_draw_text(850, 314, COLOR_MUTED, "Note:");
-      overlay_draw_wrapped(850, 344, 370, 14, COLOR_TEXT, cheat->note);
+      overlay_draw_text(content_x, content_y + 192, COLOR_MUTED, "Note:");
+      overlay_draw_wrapped(content_x, content_y + 222, content_width,
+                           portrait ? 16 : 14, COLOR_TEXT, cheat->note);
     }
   }
   draw_status(menu);
@@ -650,11 +724,20 @@ static void render_filter_picker(DrasticIngameMenu *menu) {
 
   /* Keep the game unobstructed while previewing filters. The overlay buffer
    * is transparent outside this compact, opaque control bar. */
-  overlay_fill_rect(180, 650, 920, 52, 0xff18202cu);
-  overlay_border_rect(180, 650, 920, 52, 2, COLOR_ACCENT);
-  overlay_draw_text(204, 668, COLOR_MUTED, "B  Cancel");
-  overlay_draw_text(548, 668, COLOR_TEXT, selection);
-  overlay_draw_text_right(1076, 668, COLOR_MUTED, "A  Apply");
+  const int portrait = ui_is_portrait();
+  const int x = portrait ? 20 : 180;
+  const int y = ui_height() - 70;
+  const int width = portrait ? ui_width() - 40 : 920;
+  overlay_fill_rect(x, y, width, 52, 0xff18202cu);
+  overlay_border_rect(x, y, width, 52, 2, COLOR_ACCENT);
+  overlay_draw_text(x + 24, y + 18, COLOR_MUTED, "B  Cancel");
+  if (portrait)
+    overlay_draw_text_clipped(x + 176, y + 18, width - 336,
+                              COLOR_TEXT, selection);
+  else
+    overlay_draw_text(548, y + 18, COLOR_TEXT, selection);
+  overlay_draw_text_right(x + width - 24, y + 18,
+                          COLOR_MUTED, "A  Apply");
 }
 
 static void render_display(DrasticIngameMenu *menu) {
@@ -671,9 +754,11 @@ static void render_display(DrasticIngameMenu *menu) {
   snprintf(values[5], sizeof(values[5]), "%s", filter_label(menu->config->video_filter));
   draw_shell("Screen layout & filters",
              "Left / Right  Change     A  Select     B  Back");
-  overlay_fill_rect(156, 102, 968, 466, COLOR_PANEL);
+  const int panel_x = ui_is_portrait() ? 24 : 156;
+  const int panel_width = ui_is_portrait() ? ui_width() - 48 : 968;
+  overlay_fill_rect(panel_x, 102, panel_width, 466, COLOR_PANEL);
   for (int index = 0; index < 8; index++)
-    draw_row(180, 122 + index * 52, 920,
+    draw_row(panel_x + 24, 122 + index * 52, panel_width - 48,
              menu->selection[MENU_DISPLAY] == index, labels[index],
              index < 6 ? values[index] : NULL, 1);
   draw_status(menu);
@@ -706,9 +791,11 @@ static void render_emulation(DrasticIngameMenu *menu) {
     snprintf(values[7], sizeof(values[7]), "Off");
   draw_shell("Emulation options",
              "Left / Right  Change     A  Toggle     B  Back");
-  overlay_fill_rect(156, 98, 968, 508, COLOR_PANEL);
+  const int panel_x = ui_is_portrait() ? 24 : 156;
+  const int panel_width = ui_is_portrait() ? ui_width() - 48 : 968;
+  overlay_fill_rect(panel_x, 98, panel_width, 508, COLOR_PANEL);
   for (int index = 0; index < 9; index++)
-    draw_row(180, 114 + index * 52, 920,
+    draw_row(panel_x + 24, 114 + index * 52, panel_width - 48,
              menu->selection[MENU_EMULATION] == index, labels[index],
              index < 8 ? values[index] : NULL, 1);
   draw_status(menu);
@@ -730,28 +817,63 @@ static void render_audio_input(DrasticIngameMenu *menu) {
   snprintf(values[6], sizeof(values[6]), "%s", on_off(menu->config->analog_stylus));
   draw_shell("Audio, input & motion",
              "Left / Right  Change     A  Toggle     B  Back");
-  overlay_fill_rect(156, 106, 968, 456, COLOR_PANEL);
+  const int panel_x = ui_is_portrait() ? 24 : 156;
+  const int panel_width = ui_is_portrait() ? ui_width() - 48 : 968;
+  overlay_fill_rect(panel_x, 106, panel_width, 456, COLOR_PANEL);
   for (int index = 0; index < 8; index++)
-    draw_row(180, 124 + index * 52, 920,
+    draw_row(panel_x + 24, 124 + index * 52, panel_width - 48,
              menu->selection[MENU_AUDIO_INPUT] == index, labels[index],
              index < 7 ? values[index] : NULL, 1);
-  overlay_draw_wrapped(180, 584, 920, 3, COLOR_MUTED,
+  overlay_draw_wrapped(panel_x + 24, 584, panel_width - 48,
+                       ui_is_portrait() ? 8 : 3, COLOR_MUTED,
       "Motion forwards the active controller's accelerometer and gyroscope "
       "using Drastic's native Android sensor interface.");
   draw_status(menu);
 }
 
+static void custom_rect_for_ui(const DrasticRuntimeConfig *config,
+                               const DrasticScreenRect *rect,
+                               int *x, int *y, int *width, int *height) {
+  float ui_x = rect->x;
+  float ui_y = rect->y;
+  float ui_width = rect->width;
+  float ui_height = rect->height;
+  switch (config->rotation & 3) {
+    case 1:
+      ui_x = rect->y;
+      ui_y = 1.0f - rect->x - rect->width;
+      ui_width = rect->height;
+      ui_height = rect->width;
+      break;
+    case 2:
+      ui_x = 1.0f - rect->x - rect->width;
+      ui_y = 1.0f - rect->y - rect->height;
+      break;
+    case 3:
+      ui_x = 1.0f - rect->y - rect->height;
+      ui_y = rect->x;
+      ui_width = rect->height;
+      ui_height = rect->width;
+      break;
+    default:
+      break;
+  }
+  *x = (int)(ui_x * overlay_width() + 0.5f);
+  *y = (int)(ui_y * overlay_height() + 0.5f);
+  *width = (int)(ui_width * overlay_width() + 0.5f);
+  *height = (int)(ui_height * overlay_height() + 0.5f);
+}
+
 static void render_layout_editor(DrasticIngameMenu *menu) {
-  overlay_fill_rect(0, 0, DRASTIC_OVERLAY_WIDTH, DRASTIC_OVERLAY_HEIGHT,
-                    0x33000000u);
-  overlay_fill_rect(0, 0, DRASTIC_OVERLAY_WIDTH, 70, COLOR_PANEL);
+  const int canvas_width = ui_width();
+  const int canvas_height = ui_height();
+  overlay_fill_rect(0, 0, canvas_width, canvas_height, 0x33000000u);
+  overlay_fill_rect(0, 0, canvas_width, 70, COLOR_PANEL);
   overlay_draw_text_scaled(24, 16, 2, COLOR_TEXT, "Custom screen layout");
   for (int screen = 0; screen < 2; screen++) {
     const DrasticScreenRect *rect = &menu->config->custom_screens[screen];
-    const int x = (int)(rect->x * DRASTIC_OVERLAY_WIDTH + 0.5f);
-    const int y = (int)(rect->y * DRASTIC_OVERLAY_HEIGHT + 0.5f);
-    const int width = (int)(rect->width * DRASTIC_OVERLAY_WIDTH + 0.5f);
-    const int height = (int)(rect->height * DRASTIC_OVERLAY_HEIGHT + 0.5f);
+    int x, y, width, height;
+    custom_rect_for_ui(menu->config, rect, &x, &y, &width, &height);
     const uint32_t color = screen == menu->editor_screen
         ? COLOR_ACCENT : 0xffe7edf2u;
     overlay_border_rect(x, y, width, height, screen == menu->editor_screen ? 6 : 3,
@@ -760,10 +882,12 @@ static void render_layout_editor(DrasticIngameMenu *menu) {
     overlay_draw_text(x + 16, y + 15, color,
                       screen ? "TOUCH" : "TOP");
   }
-  overlay_fill_rect(0, 632, DRASTIC_OVERLAY_WIDTH, 88, COLOR_PANEL);
-  overlay_draw_text(24, 648, COLOR_TEXT,
+  overlay_fill_rect(0, canvas_height - 88, canvas_width, 88, COLOR_PANEL);
+  overlay_draw_text_clipped(24, canvas_height - 72, canvas_width - 48,
+      COLOR_TEXT,
       "Left stick / D-Pad: move    Right stick / ZL+D-Pad: resize");
-  overlay_draw_text(24, 680, COLOR_MUTED,
+  overlay_draw_text_clipped(24, canvas_height - 40, canvas_width - 48,
+      COLOR_MUTED,
       "X: select screen    Y: reset    A: save    B: cancel");
 }
 
@@ -861,7 +985,10 @@ static void update_main(DrasticIngameMenu *menu, u64 pressed) {
       break;
     case MAIN_QUIT:
       menu->exit_requested = 1;
-      drastic_menu_close(menu, true);
+      /* Android leaves DraStic paused while its Activity is finishing.  Do
+       * not resume the core for the small window between selecting Quit and
+       * the native shutdown sequence. */
+      drastic_menu_close(menu, false);
       break;
   }
 }
@@ -1050,6 +1177,7 @@ static void update_display(DrasticIngameMenu *menu, u64 pressed) {
     case 2:
       menu->config->rotation = (menu->config->rotation + direction + 4) % 4;
       save_int("Wrapper/Rotation", menu->config->rotation);
+      overlay_set_rotation(menu->config->rotation);
       break;
     case 3:
       menu->config->screen_gap = clamp_int(

@@ -54,6 +54,8 @@ static GLuint g_search_texture;
 static GLuint g_overlay_texture;
 static uint32_t *g_overlay_rgba;
 static uint64_t g_overlay_generation = UINT64_MAX;
+static int g_overlay_width;
+static int g_overlay_height;
 static int g_texture_width;
 static int g_texture_height;
 static DrasticVideoFilter g_filtered_filter = DRASTIC_FILTER_COUNT;
@@ -373,8 +375,10 @@ static int upload_overlay(const DrasticOverlayFrame *overlay) {
   if (!overlay || !overlay->visible || !overlay->pixels) return 1;
   if (overlay->generation == g_overlay_generation) return 1;
   const size_t count = (size_t)overlay->width * overlay->height;
+  if (count > DRASTIC_OVERLAY_PIXELS) return 0;
   if (!g_overlay_rgba) {
-    g_overlay_rgba = malloc(count * sizeof(*g_overlay_rgba));
+    g_overlay_rgba = malloc((size_t)DRASTIC_OVERLAY_PIXELS *
+                            sizeof(*g_overlay_rgba));
     if (!g_overlay_rgba) return 0;
   }
   for (size_t index = 0; index < count; index++) {
@@ -383,17 +387,27 @@ static int upload_overlay(const DrasticOverlayFrame *overlay) {
         ((pixel & 0x00ff0000u) >> 16) | ((pixel & 0x000000ffu) << 16);
   }
   glBindTexture(GL_TEXTURE_2D, g_overlay_texture);
+  if (g_overlay_width != overlay->width ||
+      g_overlay_height != overlay->height) {
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, overlay->width,
+                 overlay->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    g_overlay_width = overlay->width;
+    g_overlay_height = overlay->height;
+  }
   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, overlay->width, overlay->height,
                   GL_RGBA, GL_UNSIGNED_BYTE, g_overlay_rgba);
   g_overlay_generation = overlay->generation;
   return glGetError() == GL_NO_ERROR;
 }
 
-static void draw_overlay(void) {
-  static const Vertex vertices[6] = {
-    {-1.0f,  1.0f, 0.0f, 0.0f}, {-1.0f, -1.0f, 0.0f, 1.0f},
-    { 1.0f, -1.0f, 1.0f, 1.0f}, {-1.0f,  1.0f, 0.0f, 0.0f},
-    { 1.0f, -1.0f, 1.0f, 1.0f}, { 1.0f,  1.0f, 1.0f, 0.0f},
+static void draw_overlay(int rotation) {
+  float tlu, tlv, tru, trv, blu, blv, bru, brv;
+  uv_for_rotation(rotation, &tlu, &tlv, &tru, &trv,
+                  &blu, &blv, &bru, &brv);
+  const Vertex vertices[6] = {
+    {-1.0f,  1.0f, tlu, tlv}, {-1.0f, -1.0f, blu, blv},
+    { 1.0f, -1.0f, bru, brv}, {-1.0f,  1.0f, tlu, tlv},
+    { 1.0f, -1.0f, bru, brv}, { 1.0f,  1.0f, tru, trv},
   };
   bind_geometry(&g_overlay_program, vertices);
   glActiveTexture(GL_TEXTURE0);
@@ -491,8 +505,12 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, DRASTIC_OVERLAY_WIDTH,
-               DRASTIC_OVERLAY_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+  g_overlay_width = (config->rotation & 1) ? DRASTIC_OVERLAY_HEIGHT
+                                           : DRASTIC_OVERLAY_WIDTH;
+  g_overlay_height = (config->rotation & 1) ? DRASTIC_OVERLAY_WIDTH
+                                            : DRASTIC_OVERLAY_HEIGHT;
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_overlay_width,
+               g_overlay_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   glViewport(0, 0, panel_width, panel_height);
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -545,7 +563,8 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
   for (int index = 0; index < config->screen_count; index++)
     draw_screen(&config->screens[index], config->rotation, chain);
   draw_stylus_cursor(config);
-  if (overlay && overlay->visible && upload_overlay(overlay)) draw_overlay();
+  if (overlay && overlay->visible && upload_overlay(overlay))
+    draw_overlay(config->rotation);
   eglSwapBuffers(g_display, g_surface);
   g_frames++;
 }
@@ -580,6 +599,8 @@ void drastic_renderer_shutdown(void) {
   g_context = EGL_NO_CONTEXT;
   free(g_overlay_rgba);
   g_overlay_rgba = NULL;
+  g_overlay_width = 0;
+  g_overlay_height = 0;
   memset(g_work, 0, sizeof(g_work));
 }
 

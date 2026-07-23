@@ -39,6 +39,7 @@ typedef struct {
 typedef struct {
   char rom_path[1024];
   char core_path[256];
+  char launcher_path[1024];
   char firmware_nickname[32];
   DrasticLayoutMode layout;
   int swap_screens;

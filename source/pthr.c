@@ -18,8 +18,10 @@
 // wait shims below must service handover in short slices instead of blocking
 static __thread int tls_is_render_thread = 0;
 static __thread int tls_capture_frame_sync = 0;
+static __thread int tls_is_core_thread = 0;
 static pthread_cond_t_bionic *frame_sync_cond;
 static unsigned frame_sync_pending;
+static int core_shutdown_requested;
 
 int pthr_is_render_thread(void) {
   return tls_is_render_thread;
@@ -72,6 +74,14 @@ void pthr_ensure_fake_tls(void) {
 #define PTHR_COND_MAGIC  0x444E434Du // "CNDM"
 
 static Mutex init_lock;
+
+typedef struct BionicCondRecord {
+  pthread_cond_t_bionic *owner;
+  pthread_cond_t *real;
+  struct BionicCondRecord *next;
+} BionicCondRecord;
+
+static BionicCondRecord *bionic_cond_head;
 
 static int attr_static_init(pthread_attr_t_bionic *attr) {
   if (attr->magic != 0x42424242) {
@@ -137,15 +147,20 @@ static int cond_static_init(pthread_cond_t_bionic *cond, const pthread_condattr_
   }
 
   pthread_cond_t *real = malloc(sizeof(pthread_cond_t));
-  int ret = pthread_cond_init(real, attr);
+  BionicCondRecord *record = malloc(sizeof(*record));
+  int ret = (!real || !record) ? ENOMEM : pthread_cond_init(real, attr);
 
   if (ret == 0) {
+    record->owner = cond;
+    record->real = real;
+    record->next = bionic_cond_head;
+    bionic_cond_head = record;
     cond->real_ptr = real;
     cond->reserved = 0;
     __atomic_store_n(&cond->magic, PTHR_COND_MAGIC, __ATOMIC_RELEASE);
   } else {
     free(real);
-
+    free(record);
   }
   mutexUnlock(&init_lock);
   return ret;
@@ -268,6 +283,11 @@ typedef struct {
   void *arg;
 } ThreadStart;
 
+typedef struct CoreThreadRecord {
+  pthread_t thread;
+  struct CoreThreadRecord *next;
+} CoreThreadRecord;
+
 typedef struct DetachedThread {
   pthread_t thread;
   struct DetachedThread *next;
@@ -278,6 +298,7 @@ static pthread_cond_t thread_cond = PTHREAD_COND_INITIALIZER;
 static DetachedThread *detach_head;
 static DetachedThread *detach_tail;
 static pthread_t detach_reaper;
+static CoreThreadRecord *core_thread_head;
 static unsigned active_core_threads;
 static int detach_reaper_started;
 static int detach_reaper_stop;
@@ -299,9 +320,39 @@ static void *detach_reaper_main(void *unused) {
     }
     pthread_mutex_unlock(&thread_lock);
 
-    pthread_join(item->thread, NULL);
+    const int joined = pthread_join(item->thread, NULL);
+    if (joined == 0) {
+      pthread_mutex_lock(&thread_lock);
+      CoreThreadRecord **link = &core_thread_head;
+      while (*link) {
+        if ((*link)->thread == item->thread) {
+          CoreThreadRecord *record = *link;
+          *link = record->next;
+          free(record);
+          break;
+        }
+        link = &(*link)->next;
+      }
+      pthread_mutex_unlock(&thread_lock);
+    }
     free(item);
   }
+}
+
+static void core_thread_cleanup(void *unused) {
+  (void)unused;
+  if (!tls_is_core_thread)
+    return;
+  tls_is_core_thread = 0;
+
+  // EGL ownership is thread-local and must be released before the renderer.
+  extern void egl_gl_ownership_release(void);
+  egl_gl_ownership_release();
+
+  pthread_mutex_lock(&thread_lock);
+  active_core_threads--;
+  pthread_cond_broadcast(&thread_cond);
+  pthread_mutex_unlock(&thread_lock);
 }
 
 static void *thread_trampoline(void *p) {
@@ -310,14 +361,11 @@ static void *thread_trampoline(void *p) {
   pthr_install_fake_tls();
   // Keep emulator workers off the primary emulation and audio cores.
   assign_work_core();
-  void *ret = s.start(s.arg);
-  // EGL ownership is thread-local.
-  extern void egl_gl_ownership_release(void);
-  egl_gl_ownership_release();
-  pthread_mutex_lock(&thread_lock);
-  active_core_threads--;
-  pthread_cond_broadcast(&thread_cond);
-  pthread_mutex_unlock(&thread_lock);
+  tls_is_core_thread = 1;
+  void *ret;
+  pthread_cleanup_push(core_thread_cleanup, NULL);
+  ret = s.start(s.arg);
+  pthread_cleanup_pop(1);
   return ret;
 }
 
@@ -327,8 +375,12 @@ int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr
     return EINVAL;
   }
   ThreadStart *s = malloc(sizeof(*s));
-  if (!s)
+  CoreThreadRecord *record = malloc(sizeof(*record));
+  if (!s || !record) {
+    free(s);
+    free(record);
     return ENOMEM;
+  }
   s->start = start;
   s->arg = param;
 
@@ -356,11 +408,35 @@ int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr
     pthread_cond_broadcast(&thread_cond);
     pthread_mutex_unlock(&thread_lock);
     free(s);
+    free(record);
+  } else {
+    record->thread = *thread;
+    pthread_mutex_lock(&thread_lock);
+    record->next = core_thread_head;
+    core_thread_head = record;
+    pthread_mutex_unlock(&thread_lock);
   }
   return ret;
 }
 
-int pthread_join_soloader(pthread_t thread, void **value_ptr) { return pthread_join(thread, value_ptr); }
+int pthread_join_soloader(pthread_t thread, void **value_ptr) {
+  const int ret = pthread_join(thread, value_ptr);
+  if (ret == 0) {
+    pthread_mutex_lock(&thread_lock);
+    CoreThreadRecord **link = &core_thread_head;
+    while (*link) {
+      if ((*link)->thread == thread) {
+        CoreThreadRecord *record = *link;
+        *link = record->next;
+        free(record);
+        break;
+      }
+      link = &(*link)->next;
+    }
+    pthread_mutex_unlock(&thread_lock);
+  }
+  return ret;
+}
 
 int pthread_detach_soloader(pthread_t thread) {
   if (!thread)
@@ -392,27 +468,83 @@ int pthread_detach_soloader(pthread_t thread) {
   return 0;
 }
 
+static void wake_all_bionic_conditions(void) {
+  mutexLock(&init_lock);
+  for (BionicCondRecord *record = bionic_cond_head; record;
+       record = record->next)
+    pthread_cond_broadcast(record->real);
+  mutexUnlock(&init_lock);
+}
+
+static void destroy_remaining_bionic_conditions(void) {
+  mutexLock(&init_lock);
+  BionicCondRecord *record = bionic_cond_head;
+  bionic_cond_head = NULL;
+  __atomic_store_n(&frame_sync_pending, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&frame_sync_cond, NULL, __ATOMIC_RELEASE);
+  mutexUnlock(&init_lock);
+
+  /* Run this only after the core's C++ destructors. They get the first chance
+   * to destroy their synchronization objects normally; the records left here
+   * belong to Android-process singletons. Do not dereference owner storage at
+   * this point because a destructor may already have freed a dynamic owner. */
+  while (record) {
+    BionicCondRecord *next = record->next;
+    pthread_cond_destroy(record->real);
+    free(record->real);
+    free(record);
+    record = next;
+  }
+}
+
 void pthr_shutdown(void) {
+  /* Android tears the process down with several DraStic service workers still
+   * alive. One of them is intentionally an infinite command worker and has no
+   * engine-side quit flag. Chainloading an NRO reuses the hbloader process, so
+   * those threads must leave before libdrastic is unmapped. Ask core threads to
+   * exit only when they reach their own condition-wait boundary, and keep
+   * broadcasting during the handoff so a waiter cannot miss the first wake. */
+  __atomic_store_n(&core_shutdown_requested, 1, __ATOMIC_RELEASE);
   for (;;) {
+    wake_all_bionic_conditions();
     pthread_mutex_lock(&thread_lock);
     const unsigned active = active_core_threads;
     pthread_mutex_unlock(&thread_lock);
     if (!active)
       break;
-    svcSleepThread(1000000000ULL);
+    svcSleepThread(1000000ULL);
   }
 
   pthread_mutex_lock(&thread_lock);
-  if (!detach_reaper_started) {
-    pthread_mutex_unlock(&thread_lock);
-    return;
+  if (detach_reaper_started) {
+    detach_reaper_stop = 1;
+    pthread_cond_broadcast(&thread_cond);
   }
-  detach_reaper_stop = 1;
-  pthread_cond_broadcast(&thread_cond);
   pthread_mutex_unlock(&thread_lock);
 
-  pthread_join(detach_reaper, NULL);
-  detach_reaper_started = 0;
+  if (detach_reaper_started) {
+    pthread_join(detach_reaper, NULL);
+    detach_reaper_started = 0;
+  }
+
+  /* Core-owned joins removed their records already. Join the Android-process
+   * workers stopped above so libnx can close their handles and reclaim stacks. */
+  for (;;) {
+    pthread_mutex_lock(&thread_lock);
+    CoreThreadRecord *record = core_thread_head;
+    if (record)
+      core_thread_head = record->next;
+    pthread_mutex_unlock(&thread_lock);
+    if (!record)
+      break;
+    pthread_join(record->thread, NULL);
+    free(record);
+  }
+
+}
+
+void pthr_finalize(void) {
+  destroy_remaining_bionic_conditions();
 }
 pthread_t pthread_self_soloader(void) { return pthread_self(); }
 
@@ -557,6 +689,16 @@ int pthread_cond_destroy_soloader(pthread_cond_t_bionic *cond) {
   }
   pthread_cond_t *real = cond->real_ptr;
   cond->real_ptr = NULL;
+  BionicCondRecord **link = &bionic_cond_head;
+  while (*link) {
+    if ((*link)->owner == cond) {
+      BionicCondRecord *record = *link;
+      *link = record->next;
+      free(record);
+      break;
+    }
+    link = &(*link)->next;
+  }
   mutexUnlock(&init_lock);
   int ret = pthread_cond_destroy(real);
   free(real);
@@ -598,12 +740,25 @@ static int timespec_before(const struct timespec *a, const struct timespec *b) {
   return a->tv_nsec < b->tv_nsec;
 }
 
+static void core_thread_exit_from_wait(pthread_mutex_t *mutex) {
+  if (!tls_is_core_thread ||
+      !__atomic_load_n(&core_shutdown_requested, __ATOMIC_ACQUIRE))
+    return;
+
+  /* pthread_cond_wait returns with the associated mutex locked. Release it so
+   * another awakened worker can reach the same cooperative exit point. The
+   * trampoline cleanup registered above performs accounting and EGL release. */
+  pthread_mutex_unlock(mutex);
+  pthread_exit(NULL);
+}
+
 int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bionic *mutex) {
   if (!cond || !mutex) return EINVAL;
   cond_static_init(cond, NULL);
   mutex_static_init(mutex, NULL);
   frame_sync_capture(cond);
   const int is_frame_sync = frame_sync_match(cond);
+  core_thread_exit_from_wait(mutex->real_ptr);
   if (is_frame_sync &&
       __atomic_exchange_n(&frame_sync_pending, 0, __ATOMIC_ACQ_REL))
     return 0;
@@ -622,6 +777,7 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
     timespec_add_ns(&deadline, FRAME_SYNC_WAIT_SLICE_NS);
     const int result = pthread_cond_timedwait(cond->real_ptr,
                                               mutex->real_ptr, &deadline);
+    core_thread_exit_from_wait(mutex->real_ptr);
     if (result == 0)
       __atomic_store_n(&frame_sync_pending, 0, __ATOMIC_RELEASE);
     return result == ETIMEDOUT ? 0 : result;
@@ -629,6 +785,7 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
   extern int egl_gl_thread_holds_context(void);
   if (!tls_is_render_thread || !egl_gl_thread_holds_context()) {
     const int result = pthread_cond_wait(cond->real_ptr, mutex->real_ptr);
+    core_thread_exit_from_wait(mutex->real_ptr);
     if (is_frame_sync && result == 0)
       __atomic_store_n(&frame_sync_pending, 0, __ATOMIC_RELEASE);
     return result;
@@ -642,6 +799,7 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
   clock_gettime(CLOCK_REALTIME, &ts);
   timespec_add_ns(&ts, RENDER_WAIT_SLICE_NS);
   int r = pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr, &ts);
+  core_thread_exit_from_wait(mutex->real_ptr);
   if (is_frame_sync && r == 0)
     __atomic_store_n(&frame_sync_pending, 0, __ATOMIC_RELEASE);
   if (r == ETIMEDOUT) {
@@ -655,11 +813,15 @@ int pthread_cond_timedwait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t
   if (!cond || !mutex) return EINVAL;
   cond_static_init(cond, NULL);
   mutex_static_init(mutex, NULL);
+  core_thread_exit_from_wait(mutex->real_ptr);
   extern void egl_gl_ownership_park(void);
   egl_gl_ownership_park();
   extern int egl_gl_thread_holds_context(void);
   if (!tls_is_render_thread || !abstime || !egl_gl_thread_holds_context()) {
-    return pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr, abstime);
+    const int result = pthread_cond_timedwait(cond->real_ptr,
+                                              mutex->real_ptr, abstime);
+    core_thread_exit_from_wait(mutex->real_ptr);
+    return result;
   }
   // same single-slice spurious-wakeup scheme as pthread_cond_wait_soloader;
   // the caller's real deadline is only ever reported once it actually passes
@@ -669,6 +831,7 @@ int pthread_cond_timedwait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t
   const int final_slice = !timespec_before(&ts, abstime);
   int r = pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr,
                                  final_slice ? abstime : &ts);
+  core_thread_exit_from_wait(mutex->real_ptr);
   if (r == ETIMEDOUT && !final_slice) {
     return 0; // spurious wakeup before the caller's deadline
   }

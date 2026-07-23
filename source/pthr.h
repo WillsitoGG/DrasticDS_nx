@@ -49,6 +49,7 @@ pthread_t pthread_self_soloader(void);
 int pthread_once_soloader(volatile int *once_control, void (*init_routine)(void));
 int pthread_getschedparam_soloader(pthread_t thread, int *policy, struct sched_param *param);
 void pthr_shutdown(void);
+void pthr_finalize(void);
 
 int pthread_mutexattr_init_soloader(pthread_mutexattr_t *attr);
 int pthread_mutexattr_settype_soloader(pthread_mutexattr_t *attr, int type);

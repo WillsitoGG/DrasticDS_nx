@@ -7,7 +7,7 @@
 
 #include "overlay.h"
 
-static uint32_t g_pixels[DRASTIC_OVERLAY_WIDTH * DRASTIC_OVERLAY_HEIGHT];
+static uint32_t g_pixels[DRASTIC_OVERLAY_PIXELS];
 static DrasticOverlayFrame g_frame = {
   .pixels = g_pixels,
   .width = DRASTIC_OVERLAY_WIDTH,
@@ -26,15 +26,37 @@ static int clamp_int(int value, int minimum, int maximum) {
   return value;
 }
 
-void overlay_init(void) {
+void overlay_init(int rotation) {
   PrintConsole *console = consoleGetDefault();
   if (console && console->font.gfx && console->font.tileWidth &&
       console->font.tileHeight) {
     g_font = console->font;
     g_font_ready = 1;
   }
+  g_frame.width = (rotation & 1) ? DRASTIC_OVERLAY_HEIGHT
+                                 : DRASTIC_OVERLAY_WIDTH;
+  g_frame.height = (rotation & 1) ? DRASTIC_OVERLAY_WIDTH
+                                  : DRASTIC_OVERLAY_HEIGHT;
   memset(g_pixels, 0, sizeof(g_pixels));
 }
+
+void overlay_set_rotation(int rotation) {
+  const int width = (rotation & 1) ? DRASTIC_OVERLAY_HEIGHT
+                                   : DRASTIC_OVERLAY_WIDTH;
+  const int height = (rotation & 1) ? DRASTIC_OVERLAY_WIDTH
+                                    : DRASTIC_OVERLAY_HEIGHT;
+  if (g_frame.width == width && g_frame.height == height) return;
+  g_frame.width = width;
+  g_frame.height = height;
+  memset(g_pixels, 0, sizeof(g_pixels));
+  g_frame.visible = false;
+  g_frame.generation++;
+  g_hud_generation = UINT64_MAX;
+}
+
+int overlay_width(void) { return g_frame.width; }
+
+int overlay_height(void) { return g_frame.height; }
 
 void overlay_begin(void) {
   memset(g_pixels, 0, sizeof(g_pixels));
@@ -85,7 +107,7 @@ void overlay_draw_hud(bool show_fps, float fps, bool fast_forward) {
   const uint32_t background = 0xf018202cu;
   const uint32_t border = 0xff2bc3d9u;
   const uint32_t text = 0xfff1f5f9u;
-  const int right = DRASTIC_OVERLAY_WIDTH - HUD_MARGIN;
+  const int right = g_frame.width - HUD_MARGIN;
   int top = HUD_MARGIN;
 
   overlay_begin();
@@ -143,12 +165,12 @@ static uint32_t composite_argb(uint32_t destination, uint32_t source) {
 
 void overlay_fill_rect(int x, int y, int width, int height, uint32_t color) {
   if (width <= 0 || height <= 0) return;
-  const int left = clamp_int(x, 0, DRASTIC_OVERLAY_WIDTH);
-  const int top = clamp_int(y, 0, DRASTIC_OVERLAY_HEIGHT);
-  const int right = clamp_int(x + width, 0, DRASTIC_OVERLAY_WIDTH);
-  const int bottom = clamp_int(y + height, 0, DRASTIC_OVERLAY_HEIGHT);
+  const int left = clamp_int(x, 0, g_frame.width);
+  const int top = clamp_int(y, 0, g_frame.height);
+  const int right = clamp_int(x + width, 0, g_frame.width);
+  const int bottom = clamp_int(y + height, 0, g_frame.height);
   for (int row = top; row < bottom; row++) {
-    uint32_t *destination = g_pixels + (size_t)row * DRASTIC_OVERLAY_WIDTH;
+    uint32_t *destination = g_pixels + (size_t)row * g_frame.width;
     for (int column = left; column < right; column++)
       destination[column] = composite_argb(destination[column], color);
   }
@@ -317,13 +339,13 @@ void overlay_blit_snapshot(int x, int y, int width, int height,
   }
   for (int destination_y = 0; destination_y < height; destination_y++) {
     const int output_y = y + destination_y;
-    if (output_y < 0 || output_y >= DRASTIC_OVERLAY_HEIGHT) continue;
+    if (output_y < 0 || output_y >= g_frame.height) continue;
     const int source_y = destination_y * source_height / height;
     uint32_t *destination = g_pixels +
-        (size_t)output_y * DRASTIC_OVERLAY_WIDTH;
+        (size_t)output_y * g_frame.width;
     for (int destination_x = 0; destination_x < width; destination_x++) {
       const int output_x = x + destination_x;
-      if (output_x < 0 || output_x >= DRASTIC_OVERLAY_WIDTH) continue;
+      if (output_x < 0 || output_x >= g_frame.width) continue;
       const int source_x = destination_x * source_width / width;
       uint32_t pixel = (uint32_t)pixels[source_y * source_width + source_x];
       if (!argb_pixels) pixel = rgb565_to_argb((uint16_t)pixel);

@@ -6,6 +6,8 @@
 
 #define DRASTIC_OVERLAY_WIDTH  1280
 #define DRASTIC_OVERLAY_HEIGHT 720
+#define DRASTIC_OVERLAY_PIXELS \
+  (DRASTIC_OVERLAY_WIDTH * DRASTIC_OVERLAY_HEIGHT)
 
 typedef struct {
   const uint32_t *pixels; /* 0xAARRGGBB */
@@ -15,7 +17,10 @@ typedef struct {
   bool visible;
 } DrasticOverlayFrame;
 
-void overlay_init(void);
+void overlay_init(int rotation);
+void overlay_set_rotation(int rotation);
+int overlay_width(void);
+int overlay_height(void);
 void overlay_begin(void);
 void overlay_finish(void);
 void overlay_hide(void);
