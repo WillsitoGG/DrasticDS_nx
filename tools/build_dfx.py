@@ -248,7 +248,7 @@ def run(command: list[str]) -> None:
 def compile_vulkan(glslang: Path, output: Path, name: str,
                    vertex: str, fragment: str, samplers: list[str]) -> None:
     locations = varying_locations(vertex)
-    vk_vertex = vulkan_stage(vertex, "vertex", [], locations)
+    vk_vertex = vulkan_stage(vertex, "vertex", samplers, locations)
     vk_fragment = vulkan_stage(fragment, "fragment", samplers, locations)
     vertex_path = output / f"dfx_{name}.vert"
     fragment_path = output / f"dfx_{name}.frag"

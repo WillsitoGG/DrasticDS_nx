@@ -267,14 +267,94 @@ void overlay_draw_text_clipped(int x, int y, int max_width, uint32_t color,
   overlay_draw_text(x, y, color, buffer);
 }
 
-void overlay_draw_text_right(int right, int y, uint32_t color,
-                             const char *text) {
-  if (!text || !g_font_ready) return;
+static int text_character_count(const char *text) {
   int characters = 0;
+  if (!text) return 0;
   for (const unsigned char *cursor = (const unsigned char *)text; *cursor;
        cursor++)
     if ((*cursor & 0xc0) != 0x80) characters++;
-  overlay_draw_text(right - characters * g_font.tileWidth, y, color, text);
+  return characters;
+}
+
+static uint64_t overlay_time_ms(void) {
+  const uint64_t frequency = armGetSystemTickFreq();
+  const uint64_t ticks = armGetSystemTick();
+  if (!frequency) return 0;
+  return (ticks / frequency) * 1000u +
+         ((ticks % frequency) * 1000u) / frequency;
+}
+
+static int marquee_offset(int overflow) {
+  if (overflow <= 0) return 0;
+  const uint64_t pause_ms = 800;
+  const uint64_t travel_ms = 3600;
+  const uint64_t cycle_ms = pause_ms * 2 + travel_ms * 2;
+  const uint64_t phase = overlay_time_ms() % cycle_ms;
+  if (phase < pause_ms) return 0;
+  if (phase < pause_ms + travel_ms)
+    return (int)(((phase - pause_ms) * (uint64_t)overflow) / travel_ms);
+  if (phase < pause_ms * 2 + travel_ms) return overflow;
+  return overflow - (int)(((phase - pause_ms * 2 - travel_ms) *
+                            (uint64_t)overflow) / travel_ms);
+}
+
+static void draw_character_clipped(int x, int y, uint32_t color,
+                                   unsigned character, int clip_left,
+                                   int clip_right) {
+  if (!g_font_ready || x >= clip_right || x + g_font.tileWidth <= clip_left)
+    return;
+  if (character > 255) character = '?';
+  for (int source_y = 0; source_y < g_font.tileHeight; source_y++) {
+    for (int source_x = 0; source_x < g_font.tileWidth; source_x++) {
+      const int destination_x = x + source_x;
+      if (destination_x < clip_left || destination_x >= clip_right ||
+          !glyph_set(character, source_x, source_y))
+        continue;
+      overlay_fill_rect(destination_x, y + source_y, 1, 1, color);
+    }
+  }
+}
+
+void overlay_draw_text_scrolling(int x, int y, int max_width,
+                                 uint32_t color, const char *text) {
+  if (!text || !*text || max_width <= 0 || !g_font_ready) return;
+  const int text_width = text_character_count(text) * g_font.tileWidth;
+  if (text_width <= max_width) {
+    overlay_draw_text(x, y, color, text);
+    return;
+  }
+
+  int pen_x = x - marquee_offset(text_width - max_width);
+  const int clip_right = x + max_width;
+  for (const unsigned char *cursor = (const unsigned char *)text; *cursor;
+       cursor++) {
+    unsigned character = *cursor;
+    if (character >= 0x80) {
+      character = '?';
+      while ((cursor[1] & 0xc0) == 0x80) cursor++;
+    }
+    draw_character_clipped(pen_x, y, color, character, x, clip_right);
+    pen_x += g_font.tileWidth;
+    if (pen_x >= clip_right) break;
+  }
+}
+
+void overlay_draw_text_scrolling_right(int right, int y, int max_width,
+                                       uint32_t color, const char *text) {
+  if (!text || !*text || max_width <= 0 || !g_font_ready) return;
+  const int text_width = text_character_count(text) * g_font.tileWidth;
+  if (text_width <= max_width) {
+    overlay_draw_text(right - text_width, y, color, text);
+    return;
+  }
+  overlay_draw_text_scrolling(right - max_width, y, max_width, color, text);
+}
+
+void overlay_draw_text_right(int right, int y, uint32_t color,
+                             const char *text) {
+  if (!text || !g_font_ready) return;
+  overlay_draw_text(right - text_character_count(text) * g_font.tileWidth,
+                    y, color, text);
 }
 
 void overlay_draw_wrapped(int x, int y, int max_width, int max_lines,

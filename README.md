@@ -12,8 +12,8 @@ environment natively.
 
 Everything ships as a **single `DrasticDS.nro`**: it bundles the build-supplied
 Drastic core, game database and cheat table, both renderer backends (OpenGL +
-Vulkan/NVK), and an SDL cover-art launcher. Nintendo DS BIOS and firmware are
-never packed into the NRO.
+Vulkan/NVK), 17 ready-to-use custom shaders, and an SDL cover-art launcher.
+Nintendo DS BIOS and firmware are never packed into the NRO.
 
 ### How to install
 
@@ -45,6 +45,8 @@ renderer and bundled application resources on demand:
   lsfg/                   <- optional user-supplied Lossless.dll
   microphone/             <- optional microphone samples
   scripts/                <- Lua scripts
+  shaders/                <- custom DraStic .dfx/.dsd post-FX shaders
+    Bundled/              <- auto-installed OpenGL sources + Vulkan packs
   slot2/                  <- Slot-2 data
   system/
     nds_bios_arm7.bin     <- your ARM7 BIOS dump (you supply)
@@ -98,6 +100,32 @@ Drastic's original Android post-FX programs on both renderers. OpenGL executes
 the generated GLES programs directly. Vulkan executes SPIR-V generated from
 the same `.dfx`/`.dsd`.
 
+### Custom shaders
+
+The original DraStic Android `.dfx` format is supported by both renderers,
+including multi-pass chains, headers/includes, framebuffer targets, output
+scaling, named samplers, and raw lookup textures. Copy a shader's complete
+folder tree to `/switch/drastic/shaders/`, then choose **Custom shader** under
+**Settings > Graphics** or from the dedicated in-game custom-shader preview.
+
+The NRO already contains 17 presets from jdgleaver's `drastic_ds_shaders`
+collection: LCD1x, Sharp Bilinear, zFast LCD, NDS/DS Lite/DSi colour variants,
+Natural Vision, and their combinations.
+
+OpenGL compiles `.dfx`/`.dsd` sources directly when selected. Vulkan has no
+runtime GLSL compiler, so each custom shader needs an adjacent SPIR-V pack.
+With `glslangValidator` installed, generate it on a PC from this repository:
+
+```sh
+python3 tools/compile_custom_shader.py "/path/to/My Shader.dfx"
+```
+
+The command validates the OpenGL program and creates
+`My Shader.dfx.nxvk/` beside the manifest. Copy that directory along with the
+`.dfx`, `.dsd`, include, and `.raw` files while preserving relative paths. A
+whole shader directory can be passed instead of one file to compile every
+`.dfx` recursively.
+
 ### How to build
 
 Install the devkitPro Switch toolchain and portlibs:
@@ -149,5 +177,8 @@ condone piracy.
 
 Unless noted otherwise, the wrapper source is under the MIT License (see
 `LICENSE`). The vendored LSFG-VK subset under `third_party/lsfg-vk` is
-GPL-3.0-or-later. `Lossless.dll` remains proprietary and must be supplied by
-the user.
+GPL-3.0-or-later. The shader sources under
+`third_party/drastic-ds-shaders` are GPL-2.0-or-later, with additional
+public-domain notices retained where applicable; their source and GPL text are
+packed beside the generated Vulkan programs. `Lossless.dll` remains
+proprietary and must be supplied by the user.

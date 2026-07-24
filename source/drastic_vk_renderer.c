@@ -4,6 +4,7 @@
 #include <vulkan/vulkan.h>
 
 #include <stddef.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,7 @@
 #include "dfx_smaa_weight_frag_bin.h"
 #include "dfx_smaa_weight_vert_bin.h"
 #include "drastic_dfx.h"
+#include "drastic_custom_shader.h"
 #include "drastic_renderer.h"
 #include "drastic_smaa_area_rgb_bin.h"
 #include "drastic_smaa_search_rgb_bin.h"
@@ -36,6 +38,7 @@
 #include "prefs.h"
 
 #define MAX_SWAP_IMAGES 8
+#define RENDER_FRAME_SLOTS 3
 #define TEXTURE_COUNT 12
 #define TEXTURE_TOP 0
 #define TEXTURE_BOTTOM 1
@@ -103,6 +106,33 @@ typedef struct {
   DrawParameters parameters;
 } DrawBatch;
 
+typedef struct {
+  DrasticCustomShader shader;
+  SampledTexture textures[2][DRASTIC_CUSTOM_SHADER_MAX_TEXTURES];
+  VkSampler samplers[DRASTIC_CUSTOM_SHADER_MAX_TEXTURES];
+  VkDescriptorSetLayout descriptor_layout;
+  VkDescriptorPool descriptor_pool;
+  VkPipelineLayout pipeline_layout;
+  VkPipeline pipelines[DRASTIC_CUSTOM_SHADER_MAX_PASSES];
+  VkDescriptorSet descriptors[2][DRASTIC_CUSTOM_SHADER_MAX_PASSES];
+  int valid;
+} VkCustomState;
+
+typedef struct {
+  uint32_t first_vertex;
+  int screen;
+  float target_width;
+  float target_height;
+} CustomFinalDraw;
+
+typedef struct {
+  VkCommandBuffer command;
+  VkSemaphore acquired;
+  VkSemaphore rendered;
+  VkFence fence;
+  int pending;
+} RenderFrameSlot;
+
 static VkInstance g_instance;
 static VkPhysicalDevice g_physical;
 static VkDevice g_device;
@@ -110,16 +140,16 @@ static VkSurfaceKHR g_surface;
 static VkSwapchainKHR g_swapchain;
 static VkQueue g_queue;
 static uint32_t g_queue_family;
-static VkQueue g_transfer_queue;
-static uint32_t g_transfer_queue_family = VK_QUEUE_FAMILY_IGNORED;
 static VkFormat g_format;
 static VkColorSpaceKHR g_color_space;
 static VkExtent2D g_extent;
 static VkImage g_swap_images[MAX_SWAP_IMAGES];
 static VkImageView g_swap_views[MAX_SWAP_IMAGES];
 static VkFramebuffer g_framebuffers[MAX_SWAP_IMAGES];
-static VkCommandBuffer g_commands[MAX_SWAP_IMAGES];
 static uint32_t g_image_count;
+static RenderFrameSlot g_frame_slots[RENDER_FRAME_SLOTS];
+static uint32_t g_frame_slot_count = 1;
+static uint32_t g_frame_slot_cursor;
 static VkCommandPool g_command_pool;
 static VkRenderPass g_render_pass;
 static VkRenderPass g_filter_render_pass;
@@ -128,15 +158,14 @@ static VkDescriptorPool g_descriptor_pool;
 static VkPipelineLayout g_pipeline_layout;
 static VkPipeline g_pipeline;
 static VkSampler g_samplers[2];
-static VkSemaphore g_acquired;
-static VkSemaphore g_rendered;
-static VkFence g_fence;
 
 static SampledTexture g_textures[TEXTURE_COUNT];
 static VkBuffer g_staging_buffer;
 static VkDeviceMemory g_staging_memory;
 static uint8_t *g_staging_mapped;
 static VkDeviceSize g_staging_size;
+static VkDeviceSize g_staging_stride;
+static VkDeviceSize g_staging_base;
 static VkDeviceSize g_texture_offsets[TEXTURE_COUNT];
 static VkDeviceSize g_vertex_offset;
 static VkDeviceSize g_filter_vertex_offset;
@@ -153,6 +182,10 @@ static VkPipeline g_filter_pipelines[DRASTIC_DFX_SHADER_COUNT];
 static VkDescriptorSet g_filter_descriptors[2][2];
 static DrasticVideoFilter g_filtered_filter = DRASTIC_FILTER_COUNT;
 static int g_filter_valid[2];
+static VkCustomState g_custom;
+static CustomFinalDraw g_custom_draws[3];
+static uint32_t g_custom_draw_count;
+static char g_renderer_error[512];
 
 static LsfgNxRuntime *g_lsfg_runtime;
 static int g_lsfg_init_attempted;
@@ -164,6 +197,14 @@ static int g_lsfg_runtime_available;
 static int g_low_latency;
 
 static int vk_ok(VkResult result) { return result >= 0; }
+
+static void set_renderer_error(const char *format, ...) {
+  va_list arguments;
+  va_start(arguments, format);
+  vsnprintf(g_renderer_error, sizeof(g_renderer_error), format, arguments);
+  va_end(arguments);
+  g_renderer_error[sizeof(g_renderer_error) - 1] = '\0';
+}
 
 static int lsfg_requested(void) {
   return __atomic_load_n(&g_lsfg_enabled_requested, __ATOMIC_ACQUIRE);
@@ -304,18 +345,6 @@ static int choose_physical_device(void) {
       if ((families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) {
         g_physical = devices[device_index];
         g_queue_family = family;
-        g_transfer_queue_family = VK_QUEUE_FAMILY_IGNORED;
-        if (g_lsfg_pipeline_prepared) {
-          for (uint32_t transfer = 0; transfer < family_count; transfer++) {
-            const VkQueueFlags flags = families[transfer].queueFlags;
-            if (families[transfer].queueCount &&
-                (flags & VK_QUEUE_TRANSFER_BIT) &&
-                !(flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
-              g_transfer_queue_family = transfer;
-              break;
-            }
-          }
-        }
         return 1;
       }
     }
@@ -325,23 +354,12 @@ static int choose_physical_device(void) {
 
 static int create_device(void) {
   const float priority = 1.0f;
-  VkDeviceQueueCreateInfo queue_infos[2] = {{
+  const VkDeviceQueueCreateInfo queue_info = {
     .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
     .queueFamilyIndex = g_queue_family,
     .queueCount = 1,
     .pQueuePriorities = &priority,
-  }};
-  uint32_t queue_count = 1;
-  if (g_lsfg_pipeline_prepared &&
-      g_transfer_queue_family != VK_QUEUE_FAMILY_IGNORED &&
-      g_transfer_queue_family != g_queue_family) {
-    queue_infos[queue_count++] = (VkDeviceQueueCreateInfo){
-      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-      .queueFamilyIndex = g_transfer_queue_family,
-      .queueCount = 1,
-      .pQueuePriorities = &priority,
-    };
-  }
+  };
 
   const char *extensions[2] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
   uint32_t extension_count = 1;
@@ -360,8 +378,8 @@ static int create_device(void) {
   const VkDeviceCreateInfo create_info = {
     .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
     .pNext = g_lsfg_pipeline_prepared ? &timeline_feature : NULL,
-    .queueCreateInfoCount = queue_count,
-    .pQueueCreateInfos = queue_infos,
+    .queueCreateInfoCount = 1,
+    .pQueueCreateInfos = &queue_info,
     .enabledExtensionCount = extension_count,
     .ppEnabledExtensionNames = extensions,
   };
@@ -369,16 +387,6 @@ static int create_device(void) {
     return 0;
   vkGetDeviceQueue(g_device, g_queue_family, 0, &g_queue);
   if (!g_queue) return 0;
-
-  g_transfer_queue = g_queue;
-  if (g_lsfg_pipeline_prepared &&
-      g_transfer_queue_family != VK_QUEUE_FAMILY_IGNORED &&
-      g_transfer_queue_family != g_queue_family) {
-    vkGetDeviceQueue(g_device, g_transfer_queue_family, 0, &g_transfer_queue);
-    if (!g_transfer_queue) return 0;
-  } else {
-    g_transfer_queue_family = g_queue_family;
-  }
   g_lsfg_device_capable = g_lsfg_pipeline_prepared;
   return 1;
 }
@@ -436,10 +444,6 @@ static int create_swapchain(void) {
    * additional completed game frame ahead of the display. */
   uint32_t requested = capabilities.minImageCount + (g_low_latency ? 0u : 1u);
   VkImageUsageFlags image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-  VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
-  uint32_t sharing_families[2] = {g_queue_family,
-                                  g_transfer_queue_family};
-  uint32_t sharing_count = 0;
 
   g_lsfg_swapchain_compatible = 0;
   __atomic_store_n(&g_lsfg_runtime_available, 0, __ATOMIC_RELEASE);
@@ -469,10 +473,6 @@ static int create_swapchain(void) {
     /* Preserve NetherSX2's no-pacing headroom request. The surface maximum
      * still wins, and LSFG validates that at least three images were exposed. */
     requested += 2;
-    if (g_transfer_queue_family != g_queue_family) {
-      sharing_mode = VK_SHARING_MODE_CONCURRENT;
-      sharing_count = 2;
-    }
     g_lsfg_swapchain_compatible = 1;
   }
   if (capabilities.maxImageCount && requested > capabilities.maxImageCount)
@@ -486,9 +486,9 @@ static int create_swapchain(void) {
     .imageExtent = g_extent,
     .imageArrayLayers = 1,
     .imageUsage = image_usage,
-    .imageSharingMode = sharing_mode,
-    .queueFamilyIndexCount = sharing_count,
-    .pQueueFamilyIndices = sharing_count ? sharing_families : NULL,
+    .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    .queueFamilyIndexCount = 0,
+    .pQueueFamilyIndices = NULL,
     .preTransform = capabilities.currentTransform,
     .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
     .presentMode = VK_PRESENT_MODE_FIFO_KHR,
@@ -524,9 +524,14 @@ static int create_command_resources(void) {
     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
     .commandPool = g_command_pool,
     .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-    .commandBufferCount = g_image_count,
+    .commandBufferCount = g_frame_slot_count,
   };
-  return vk_ok(vkAllocateCommandBuffers(g_device, &command_info, g_commands));
+  VkCommandBuffer commands[RENDER_FRAME_SLOTS] = {0};
+  if (!vk_ok(vkAllocateCommandBuffers(g_device, &command_info, commands)))
+    return 0;
+  for (uint32_t index = 0; index < g_frame_slot_count; index++)
+    g_frame_slots[index].command = commands[index];
+  return 1;
 }
 
 static int create_render_targets(void) {
@@ -896,7 +901,13 @@ static int create_staging_buffer(void) {
       g_texture_offsets[TEXTURE_SEARCH] + search_size, 16);
   g_filter_vertex_offset = align_device_size(
       g_vertex_offset + sizeof(Vertex) * MAX_VERTICES, 16);
-  g_staging_size = g_filter_vertex_offset + sizeof(Vertex) * 6;
+  const VkDeviceSize frame_size =
+      g_filter_vertex_offset + sizeof(Vertex) * 6;
+  VkDeviceSize stride_alignment = copy_alignment;
+  if (properties.limits.nonCoherentAtomSize > stride_alignment)
+    stride_alignment = properties.limits.nonCoherentAtomSize;
+  g_staging_stride = align_device_size(frame_size, stride_alignment);
+  g_staging_size = g_staging_stride * g_frame_slot_count;
   const VkBufferCreateInfo buffer_info = {
     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
     .size = g_staging_size,
@@ -927,27 +938,32 @@ static int create_staging_buffer(void) {
       !vk_ok(vkMapMemory(g_device, g_staging_memory, 0, VK_WHOLE_SIZE, 0,
                          (void **)&g_staging_mapped)))
     return 0;
-  uint8_t *area = g_staging_mapped + g_texture_offsets[TEXTURE_AREA];
-  for (size_t pixel = 0; pixel < (size_t)160 * 560; pixel++) {
-    area[pixel * 4 + 0] = drastic_smaa_area_rgb_bin[pixel * 3 + 0];
-    area[pixel * 4 + 1] = drastic_smaa_area_rgb_bin[pixel * 3 + 1];
-    area[pixel * 4 + 2] = drastic_smaa_area_rgb_bin[pixel * 3 + 2];
-    area[pixel * 4 + 3] = 255;
-  }
-  uint8_t *search = g_staging_mapped + g_texture_offsets[TEXTURE_SEARCH];
-  for (size_t pixel = 0; pixel < (size_t)64 * 16; pixel++) {
-    search[pixel * 4 + 0] = drastic_smaa_search_rgb_bin[pixel * 3 + 0];
-    search[pixel * 4 + 1] = drastic_smaa_search_rgb_bin[pixel * 3 + 1];
-    search[pixel * 4 + 2] = drastic_smaa_search_rgb_bin[pixel * 3 + 2];
-    search[pixel * 4 + 3] = 255;
-  }
   const Vertex filter_vertices[6] = {
     {-1.0f, -1.0f, 0.0f, 0.0f}, {-1.0f,  1.0f, 0.0f, 1.0f},
     { 1.0f,  1.0f, 1.0f, 1.0f}, {-1.0f, -1.0f, 0.0f, 0.0f},
     { 1.0f,  1.0f, 1.0f, 1.0f}, { 1.0f, -1.0f, 1.0f, 0.0f},
   };
-  memcpy(g_staging_mapped + g_filter_vertex_offset, filter_vertices,
-         sizeof(filter_vertices));
+  for (uint32_t slot = 0; slot < g_frame_slot_count; slot++) {
+    const VkDeviceSize base = (VkDeviceSize)slot * g_staging_stride;
+    uint8_t *area = g_staging_mapped + base +
+                    g_texture_offsets[TEXTURE_AREA];
+    for (size_t pixel = 0; pixel < (size_t)160 * 560; pixel++) {
+      area[pixel * 4 + 0] = drastic_smaa_area_rgb_bin[pixel * 3 + 0];
+      area[pixel * 4 + 1] = drastic_smaa_area_rgb_bin[pixel * 3 + 1];
+      area[pixel * 4 + 2] = drastic_smaa_area_rgb_bin[pixel * 3 + 2];
+      area[pixel * 4 + 3] = 255;
+    }
+    uint8_t *search = g_staging_mapped + base +
+                      g_texture_offsets[TEXTURE_SEARCH];
+    for (size_t pixel = 0; pixel < (size_t)64 * 16; pixel++) {
+      search[pixel * 4 + 0] = drastic_smaa_search_rgb_bin[pixel * 3 + 0];
+      search[pixel * 4 + 1] = drastic_smaa_search_rgb_bin[pixel * 3 + 1];
+      search[pixel * 4 + 2] = drastic_smaa_search_rgb_bin[pixel * 3 + 2];
+      search[pixel * 4 + 3] = 255;
+    }
+    memcpy(g_staging_mapped + base + g_filter_vertex_offset,
+           filter_vertices, sizeof(filter_vertices));
+  }
   return 1;
 }
 
@@ -1219,6 +1235,487 @@ static int create_filter_pipelines(void) {
 
 #undef CREATE_DFX_PIPELINE
 
+static SampledTexture *custom_sampled_texture(VkCustomState *state,
+                                              int screen,
+                                              int texture_index) {
+  const DrasticCustomTexture *texture =
+      &state->shader.textures[texture_index];
+  if (texture->kind == DRASTIC_CUSTOM_TEXTURE_FRAMEBUFFER)
+    return &g_textures[screen ? TEXTURE_BOTTOM : TEXTURE_TOP];
+  if (texture->kind == DRASTIC_CUSTOM_TEXTURE_RAW)
+    return &state->textures[0][texture_index];
+  return &state->textures[screen][texture_index];
+}
+
+static void destroy_sampled_texture(SampledTexture *texture) {
+  if (!texture || !g_device) return;
+  if (texture->framebuffer)
+    vkDestroyFramebuffer(g_device, texture->framebuffer, NULL);
+  if (texture->view) vkDestroyImageView(g_device, texture->view, NULL);
+  if (texture->image) vkDestroyImage(g_device, texture->image, NULL);
+  if (texture->memory) vkFreeMemory(g_device, texture->memory, NULL);
+  memset(texture, 0, sizeof(*texture));
+}
+
+static void destroy_custom_state(VkCustomState *state) {
+  if (!state) return;
+  if (g_device) {
+    for (int pass = 0; pass < DRASTIC_CUSTOM_SHADER_MAX_PASSES; pass++)
+      if (state->pipelines[pass])
+        vkDestroyPipeline(g_device, state->pipelines[pass], NULL);
+    if (state->pipeline_layout)
+      vkDestroyPipelineLayout(g_device, state->pipeline_layout, NULL);
+    if (state->descriptor_pool)
+      vkDestroyDescriptorPool(g_device, state->descriptor_pool, NULL);
+    if (state->descriptor_layout)
+      vkDestroyDescriptorSetLayout(g_device, state->descriptor_layout, NULL);
+    for (int index = 0; index < DRASTIC_CUSTOM_SHADER_MAX_TEXTURES; index++)
+      if (state->samplers[index])
+        vkDestroySampler(g_device, state->samplers[index], NULL);
+    for (int screen = 0; screen < 2; screen++)
+      for (int index = 0; index < DRASTIC_CUSTOM_SHADER_MAX_TEXTURES; index++)
+        destroy_sampled_texture(&state->textures[screen][index]);
+  }
+  drastic_custom_shader_destroy(&state->shader);
+  memset(state, 0, sizeof(*state));
+}
+
+static uint8_t *custom_rgba_pixels(const DrasticCustomTexture *texture) {
+  const size_t count = (size_t)texture->width * texture->height;
+  uint8_t *rgba = malloc(count * 4);
+  if (!rgba) return NULL;
+  for (size_t pixel = 0; pixel < count; pixel++) {
+    const uint8_t *source = texture->pixels + pixel * texture->channels;
+    uint8_t *target = rgba + pixel * 4;
+    switch (texture->format) {
+      case DRASTIC_CUSTOM_FORMAT_ALPHA:
+        target[0] = target[1] = target[2] = 255; target[3] = source[0]; break;
+      case DRASTIC_CUSTOM_FORMAT_LUMINANCE:
+        target[0] = target[1] = target[2] = source[0]; target[3] = 255; break;
+      case DRASTIC_CUSTOM_FORMAT_LUMINANCE_ALPHA:
+        target[0] = target[1] = target[2] = source[0]; target[3] = source[1]; break;
+      case DRASTIC_CUSTOM_FORMAT_RGB:
+        target[0] = source[0]; target[1] = source[1];
+        target[2] = source[2]; target[3] = 255; break;
+      case DRASTIC_CUSTOM_FORMAT_RGBA:
+        memcpy(target, source, 4); break;
+      case DRASTIC_CUSTOM_FORMAT_RED:
+        target[0] = source[0]; target[1] = target[2] = 0; target[3] = 255; break;
+      case DRASTIC_CUSTOM_FORMAT_RG:
+        target[0] = source[0]; target[1] = source[1];
+        target[2] = 0; target[3] = 255; break;
+    }
+  }
+  return rgba;
+}
+
+static int upload_custom_texture(SampledTexture *texture,
+                                 const uint8_t *pixels, size_t size) {
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VkCommandBuffer command = VK_NULL_HANDLE;
+  int coherent = 0;
+  const VkBufferCreateInfo buffer_info = {
+    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    .size = size,
+    .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+  };
+  if (!vk_ok(vkCreateBuffer(g_device, &buffer_info, NULL, &buffer)))
+    goto failure;
+  VkMemoryRequirements requirements;
+  vkGetBufferMemoryRequirements(g_device, buffer, &requirements);
+  const uint32_t type = find_memory_type(
+      requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+          VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &coherent);
+  if (type == UINT32_MAX) goto failure;
+  const VkMemoryAllocateInfo allocation = {
+    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+    .allocationSize = requirements.size,
+    .memoryTypeIndex = type,
+  };
+  if (!vk_ok(vkAllocateMemory(g_device, &allocation, NULL, &memory)) ||
+      !vk_ok(vkBindBufferMemory(g_device, buffer, memory, 0))) goto failure;
+  void *mapped = NULL;
+  if (!vk_ok(vkMapMemory(g_device, memory, 0, size, 0, &mapped)))
+    goto failure;
+  memcpy(mapped, pixels, size);
+  if (!coherent) {
+    const VkMappedMemoryRange range = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = memory,
+      .offset = 0,
+      .size = VK_WHOLE_SIZE,
+    };
+    if (!vk_ok(vkFlushMappedMemoryRanges(g_device, 1, &range))) {
+      vkUnmapMemory(g_device, memory);
+      goto failure;
+    }
+  }
+  vkUnmapMemory(g_device, memory);
+  const VkCommandBufferAllocateInfo command_info = {
+    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+    .commandPool = g_command_pool,
+    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+    .commandBufferCount = 1,
+  };
+  if (!vk_ok(vkAllocateCommandBuffers(g_device, &command_info, &command)))
+    goto failure;
+  const VkCommandBufferBeginInfo begin = {
+    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+  };
+  if (!vk_ok(vkBeginCommandBuffer(command, &begin))) goto failure;
+  const VkImageMemoryBarrier to_transfer = {
+    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .image = texture->image,
+    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+  };
+  vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                       0, NULL, 0, NULL, 1, &to_transfer);
+  const VkBufferImageCopy copy = {
+    .bufferOffset = 0,
+    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+    .imageExtent = {texture->width, texture->height, 1},
+  };
+  vkCmdCopyBufferToImage(command, buffer, texture->image,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  VkImageMemoryBarrier to_shader = to_transfer;
+  to_shader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_shader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  to_shader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  to_shader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                       0, NULL, 0, NULL, 1, &to_shader);
+  if (!vk_ok(vkEndCommandBuffer(command))) goto failure;
+  const VkSubmitInfo submit = {
+    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+    .commandBufferCount = 1,
+    .pCommandBuffers = &command,
+  };
+  if (!vk_ok(vkQueueSubmit(g_queue, 1, &submit, VK_NULL_HANDLE)) ||
+      !vk_ok(vkQueueWaitIdle(g_queue))) goto failure;
+  texture->initialized = 1;
+  vkFreeCommandBuffers(g_device, g_command_pool, 1, &command);
+  vkDestroyBuffer(g_device, buffer, NULL);
+  vkFreeMemory(g_device, memory, NULL);
+  return 1;
+
+failure:
+  if (command)
+    vkFreeCommandBuffers(g_device, g_command_pool, 1, &command);
+  if (buffer) vkDestroyBuffer(g_device, buffer, NULL);
+  if (memory) vkFreeMemory(g_device, memory, NULL);
+  return 0;
+}
+
+static int create_custom_pipeline(VkCustomState *state, int pass_index) {
+  const DrasticCustomPass *pass = &state->shader.passes[pass_index];
+  VkShaderModule vertex = create_shader_module(
+      pass->vertex_spirv, (uint32_t)pass->vertex_spirv_size);
+  VkShaderModule fragment = create_shader_module(
+      pass->fragment_spirv, (uint32_t)pass->fragment_spirv_size);
+  if (!vertex || !fragment) {
+    if (vertex) vkDestroyShaderModule(g_device, vertex, NULL);
+    if (fragment) vkDestroyShaderModule(g_device, fragment, NULL);
+    set_renderer_error("%s pass %d has invalid Vulkan modules",
+                       state->shader.relative_path, pass_index + 1);
+    return 0;
+  }
+  const VkPipelineShaderStageCreateInfo stages[2] = {
+    {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+     VK_SHADER_STAGE_VERTEX_BIT, vertex, "main", NULL},
+    {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+     VK_SHADER_STAGE_FRAGMENT_BIT, fragment, "main", NULL},
+  };
+  const VkVertexInputBindingDescription vertex_binding = {
+    .binding = 0, .stride = sizeof(Vertex),
+    .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+  };
+  const VkVertexInputAttributeDescription attributes[2] = {
+    {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, x)},
+    {1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, u)},
+  };
+  const VkPipelineVertexInputStateCreateInfo vertex_input = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+    .vertexBindingDescriptionCount = 1,
+    .pVertexBindingDescriptions = &vertex_binding,
+    .vertexAttributeDescriptionCount = 2,
+    .pVertexAttributeDescriptions = attributes,
+  };
+  const VkPipelineInputAssemblyStateCreateInfo input_assembly = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+    .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+  };
+  const VkPipelineViewportStateCreateInfo viewport_state = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+    .viewportCount = 1, .scissorCount = 1,
+  };
+  const VkPipelineRasterizationStateCreateInfo rasterization = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+    .polygonMode = VK_POLYGON_MODE_FILL,
+    .cullMode = VK_CULL_MODE_NONE,
+    .frontFace = VK_FRONT_FACE_CLOCKWISE,
+    .lineWidth = 1.0f,
+  };
+  const VkPipelineMultisampleStateCreateInfo multisample = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+  };
+  const VkPipelineColorBlendAttachmentState blend_attachment = {
+    .blendEnable = VK_FALSE,
+    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+  };
+  const VkPipelineColorBlendStateCreateInfo blend = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+    .attachmentCount = 1, .pAttachments = &blend_attachment,
+  };
+  const VkDynamicState dynamic_states[2] = {
+    VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+  };
+  const VkPipelineDynamicStateCreateInfo dynamic_state = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+    .dynamicStateCount = 2, .pDynamicStates = dynamic_states,
+  };
+  const VkGraphicsPipelineCreateInfo pipeline_info = {
+    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+    .stageCount = 2, .pStages = stages,
+    .pVertexInputState = &vertex_input,
+    .pInputAssemblyState = &input_assembly,
+    .pViewportState = &viewport_state,
+    .pRasterizationState = &rasterization,
+    .pMultisampleState = &multisample,
+    .pColorBlendState = &blend,
+    .pDynamicState = &dynamic_state,
+    .layout = state->pipeline_layout,
+    .renderPass = pass_index + 1 == state->shader.pass_count
+        ? g_render_pass : g_filter_render_pass,
+    .subpass = 0,
+  };
+  const VkResult result = vkCreateGraphicsPipelines(
+      g_device, VK_NULL_HANDLE, 1, &pipeline_info, NULL,
+      &state->pipelines[pass_index]);
+  vkDestroyShaderModule(g_device, vertex, NULL);
+  vkDestroyShaderModule(g_device, fragment, NULL);
+  if (!vk_ok(result))
+    set_renderer_error("%s pass %d pipeline creation failed (%d)",
+                       state->shader.relative_path, pass_index + 1,
+                       (int)result);
+  return vk_ok(result);
+}
+
+static int create_custom_descriptors(VkCustomState *state) {
+  VkDescriptorSetLayoutBinding bindings[DRASTIC_CUSTOM_SHADER_MAX_SAMPLERS];
+  for (int binding = 0; binding < DRASTIC_CUSTOM_SHADER_MAX_SAMPLERS;
+       binding++) {
+    bindings[binding] = (VkDescriptorSetLayoutBinding){
+      .binding = (uint32_t)binding,
+      .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
+  }
+  const VkDescriptorSetLayoutCreateInfo layout_info = {
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+    .bindingCount = DRASTIC_CUSTOM_SHADER_MAX_SAMPLERS,
+    .pBindings = bindings,
+  };
+  if (!vk_ok(vkCreateDescriptorSetLayout(
+          g_device, &layout_info, NULL, &state->descriptor_layout))) return 0;
+  const uint32_t set_count = (uint32_t)state->shader.pass_count * 2;
+  const VkDescriptorPoolSize pool_size = {
+    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+    .descriptorCount = set_count * DRASTIC_CUSTOM_SHADER_MAX_SAMPLERS,
+  };
+  const VkDescriptorPoolCreateInfo pool_info = {
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+    .maxSets = set_count,
+    .poolSizeCount = 1,
+    .pPoolSizes = &pool_size,
+  };
+  if (!vk_ok(vkCreateDescriptorPool(
+          g_device, &pool_info, NULL, &state->descriptor_pool))) return 0;
+  VkDescriptorSetLayout layouts[DRASTIC_CUSTOM_SHADER_MAX_PASSES * 2];
+  VkDescriptorSet sets[DRASTIC_CUSTOM_SHADER_MAX_PASSES * 2];
+  for (uint32_t index = 0; index < set_count; index++)
+    layouts[index] = state->descriptor_layout;
+  const VkDescriptorSetAllocateInfo allocation = {
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+    .descriptorPool = state->descriptor_pool,
+    .descriptorSetCount = set_count,
+    .pSetLayouts = layouts,
+  };
+  if (!vk_ok(vkAllocateDescriptorSets(g_device, &allocation, sets))) return 0;
+  for (int screen = 0; screen < 2; screen++) {
+    for (int pass_index = 0; pass_index < state->shader.pass_count;
+         pass_index++) {
+      const DrasticCustomPass *pass = &state->shader.passes[pass_index];
+      const VkDescriptorSet set = sets[screen * state->shader.pass_count +
+                                       pass_index];
+      state->descriptors[screen][pass_index] = set;
+      VkDescriptorImageInfo images[DRASTIC_CUSTOM_SHADER_MAX_SAMPLERS];
+      VkWriteDescriptorSet writes[DRASTIC_CUSTOM_SHADER_MAX_SAMPLERS];
+      for (int binding = 0; binding < DRASTIC_CUSTOM_SHADER_MAX_SAMPLERS;
+           binding++) {
+        const int sampler_index = binding < pass->sampler_count ? binding : 0;
+        const int texture_index = pass->sampler_textures[sampler_index];
+        SampledTexture *texture = custom_sampled_texture(
+            state, screen, texture_index);
+        images[binding] = (VkDescriptorImageInfo){
+          .sampler = state->samplers[texture_index],
+          .imageView = texture->view,
+          .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        writes[binding] = (VkWriteDescriptorSet){
+          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+          .dstSet = set,
+          .dstBinding = (uint32_t)binding,
+          .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          .pImageInfo = &images[binding],
+        };
+      }
+      vkUpdateDescriptorSets(g_device, DRASTIC_CUSTOM_SHADER_MAX_SAMPLERS,
+                             writes, 0, NULL);
+    }
+  }
+  const VkPushConstantRange push_range = {
+    .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    .offset = 0, .size = sizeof(DfxParameters),
+  };
+  const VkPipelineLayoutCreateInfo pipeline_layout = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+    .setLayoutCount = 1,
+    .pSetLayouts = &state->descriptor_layout,
+    .pushConstantRangeCount = 1,
+    .pPushConstantRanges = &push_range,
+  };
+  return vk_ok(vkCreatePipelineLayout(g_device, &pipeline_layout, NULL,
+                                       &state->pipeline_layout));
+}
+
+static int build_custom_state(VkCustomState *state) {
+  const VkImageUsageFlags filtered =
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  const VkImageUsageFlags uploaded =
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  for (int index = 0; index < state->shader.texture_count; index++) {
+    const DrasticCustomTexture *spec = &state->shader.textures[index];
+    const VkSamplerCreateInfo sampler_info = {
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter = spec->mag_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+      .minFilter = spec->min_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+      .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+      .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .maxLod = 0.0f,
+    };
+    if (!vk_ok(vkCreateSampler(g_device, &sampler_info, NULL,
+                                &state->samplers[index]))) {
+      set_renderer_error("%s texture %d sampler creation failed",
+                         state->shader.relative_path, index);
+      return 0;
+    }
+    if (spec->kind == DRASTIC_CUSTOM_TEXTURE_RAW) {
+      SampledTexture *texture = &state->textures[0][index];
+      if (!create_sampled_texture(texture, (uint32_t)spec->width,
+                                  (uint32_t)spec->height,
+                                  VK_FORMAT_R8G8B8A8_UNORM, uploaded))
+        return 0;
+      uint8_t *rgba = custom_rgba_pixels(spec);
+      const int uploaded_ok = rgba && upload_custom_texture(
+          texture, rgba, (size_t)spec->width * spec->height * 4);
+      free(rgba);
+      if (!uploaded_ok) {
+        set_renderer_error("%s texture %d upload failed",
+                           state->shader.relative_path, index);
+        return 0;
+      }
+    } else if (spec->kind == DRASTIC_CUSTOM_TEXTURE_TARGET &&
+               spec->output_scale) {
+      const uint32_t width = g_ds_width * (uint32_t)spec->output_scale;
+      const uint32_t height = g_ds_height * (uint32_t)spec->output_scale;
+      if (width > 4096 || height > 4096) {
+        set_renderer_error("%s texture %d exceeds the GPU size limit",
+                           state->shader.relative_path, index);
+        return 0;
+      }
+      for (int screen = 0; screen < 2; screen++) {
+        SampledTexture *texture = &state->textures[screen][index];
+        if (!create_sampled_texture(texture, width, height,
+                                    VK_FORMAT_B8G8R8A8_UNORM, filtered))
+          return 0;
+        const VkImageView view = texture->view;
+        const VkFramebufferCreateInfo framebuffer_info = {
+          .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+          .renderPass = g_filter_render_pass,
+          .attachmentCount = 1,
+          .pAttachments = &view,
+          .width = width, .height = height, .layers = 1,
+        };
+        if (!vk_ok(vkCreateFramebuffer(g_device, &framebuffer_info, NULL,
+                                        &texture->framebuffer))) return 0;
+      }
+    }
+  }
+  if (!create_custom_descriptors(state)) {
+    set_renderer_error("%s descriptor creation failed",
+                       state->shader.relative_path);
+    return 0;
+  }
+  for (int pass = 0; pass < state->shader.pass_count; pass++)
+    if (!create_custom_pipeline(state, pass)) return 0;
+  state->valid = 1;
+  return 1;
+}
+
+bool drastic_renderer_set_custom_shader(const char *relative_path,
+                                        char *error, size_t error_size) {
+  if (g_custom.valid && relative_path &&
+      !strcmp(g_custom.shader.relative_path, relative_path)) {
+    if (error && error_size) error[0] = '\0';
+    return true;
+  }
+  VkCustomState next;
+  memset(&next, 0, sizeof(next));
+  g_renderer_error[0] = '\0';
+  if (!drastic_custom_shader_load(
+          relative_path, DRASTIC_CUSTOM_SHADER_LOAD_PIXELS |
+                             DRASTIC_CUSTOM_SHADER_LOAD_SPIRV,
+          &next.shader, g_renderer_error, sizeof(g_renderer_error))) {
+    if (error && error_size)
+      snprintf(error, error_size, "%s", g_renderer_error);
+    return false;
+  }
+  if (g_device) vkDeviceWaitIdle(g_device);
+  if (!build_custom_state(&next)) {
+    if (!g_renderer_error[0])
+      set_renderer_error("Could not create the custom Vulkan shader");
+    destroy_custom_state(&next);
+    if (error && error_size)
+      snprintf(error, error_size, "%s", g_renderer_error);
+    return false;
+  }
+  destroy_custom_state(&g_custom);
+  g_custom = next;
+  g_filter_valid[0] = g_filter_valid[1] = 0;
+  g_renderer_error[0] = '\0';
+  if (error && error_size) error[0] = '\0';
+  return true;
+}
+
+const char *drastic_renderer_last_error(void) { return g_renderer_error; }
+
 static void uv_for_rotation(int rotation, float uv[8]) {
   static const float corners[4][8] = {
     {0, 0, 1, 0, 0, 1, 1, 1},
@@ -1257,10 +1754,38 @@ static void add_rectangle(float x, float y, float width, float height,
   if (width <= 0.0f || height <= 0.0f) return;
   DrawBatch *batch = begin_batch(texture, sampler, parameters);
   if (!batch) return;
-  Vertex *vertices = (Vertex *)(g_staging_mapped + g_vertex_offset) +
+  Vertex *vertices = (Vertex *)(g_staging_mapped + g_staging_base +
+                                g_vertex_offset) +
                      batch->first_vertex;
   float uv[8];
   uv_for_rotation(rotation, uv);
+  set_vertex(&vertices[0], x, y, uv[0], uv[1]);
+  set_vertex(&vertices[1], x, y + height, uv[4], uv[5]);
+  set_vertex(&vertices[2], x + width, y + height, uv[6], uv[7]);
+  set_vertex(&vertices[3], x, y, uv[0], uv[1]);
+  set_vertex(&vertices[4], x + width, y + height, uv[6], uv[7]);
+  set_vertex(&vertices[5], x + width, y, uv[2], uv[3]);
+}
+
+static void add_custom_rectangle(const DrasticScreenRect *rectangle,
+                                 int rotation) {
+  if (g_custom_draw_count >= 3 || g_vertex_count + 6 > MAX_VERTICES ||
+      rectangle->width <= 0.0f || rectangle->height <= 0.0f) return;
+  CustomFinalDraw *draw = &g_custom_draws[g_custom_draw_count++];
+  draw->first_vertex = g_vertex_count;
+  draw->screen = rectangle->screen ? 1 : 0;
+  draw->target_width = rectangle->width;
+  draw->target_height = rectangle->height;
+  Vertex *vertices = (Vertex *)(g_staging_mapped + g_staging_base +
+                                g_vertex_offset) +
+                     g_vertex_count;
+  g_vertex_count += 6;
+  float uv[8];
+  uv_for_rotation(rotation, uv);
+  const float x = rectangle->x;
+  const float y = rectangle->y;
+  const float width = rectangle->width;
+  const float height = rectangle->height;
   set_vertex(&vertices[0], x, y, uv[0], uv[1]);
   set_vertex(&vertices[1], x, y + height, uv[4], uv[5]);
   set_vertex(&vertices[2], x + width, y + height, uv[6], uv[7]);
@@ -1300,22 +1825,29 @@ static void add_solid_rectangle(float x, float y, float width, float height,
 }
 
 static void build_draws(const DrasticRuntimeConfig *config,
-                        const DrasticOverlayFrame *overlay) {
+                         const DrasticOverlayFrame *overlay) {
   g_draw_count = 0;
   g_vertex_count = 0;
-  const DrasticDfxChain *chain = drastic_dfx_chain(config->video_filter);
-  for (int index = 0; index < config->screen_count; index++) {
-    const DrasticScreenRect *rectangle = &config->screens[index];
-    const int screen_index = rectangle->screen ? 1 : 0;
-    const int texture = texture_for_role(screen_index, chain->final_texture);
-    const DrawParameters screen = texture_parameters(
-        final_effect(chain), 2, (float)g_textures[texture].width,
-        (float)g_textures[texture].height, rectangle->width,
-        rectangle->height);
-    add_rectangle(rectangle->x, rectangle->y, rectangle->width,
-                  rectangle->height, config->rotation,
-                  texture, chain->final_sampler,
-                  &screen);
+  g_custom_draw_count = 0;
+  if (config->video_filter == DRASTIC_FILTER_CUSTOM) {
+    for (int index = 0; index < config->screen_count; index++)
+      add_custom_rectangle(&config->screens[index], config->rotation);
+  } else {
+    const DrasticDfxChain *chain = drastic_dfx_chain(config->video_filter);
+    for (int index = 0; index < config->screen_count; index++) {
+      const DrasticScreenRect *rectangle = &config->screens[index];
+      const int screen_index = rectangle->screen ? 1 : 0;
+      const int texture = texture_for_role(screen_index,
+                                           chain->final_texture);
+      const DrawParameters screen = texture_parameters(
+          final_effect(chain), 2, (float)g_textures[texture].width,
+          (float)g_textures[texture].height, rectangle->width,
+          rectangle->height);
+      add_rectangle(rectangle->x, rectangle->y, rectangle->width,
+                    rectangle->height, config->rotation,
+                    texture, chain->final_sampler,
+                    &screen);
+    }
   }
 
   float cursor_x, cursor_y;
@@ -1387,11 +1919,83 @@ static void record_image_upload(VkCommandBuffer command,
   texture->initialized = 1;
 }
 
+static int record_custom_filter_chains(
+    VkCommandBuffer command, const DrasticRuntimeConfig *config) {
+  if (!g_custom.valid) return 0;
+  if (g_custom.shader.pass_count <= 1) return 1;
+  const VkDeviceSize vertex_offset =
+      g_staging_base + g_filter_vertex_offset;
+  vkCmdBindVertexBuffers(command, 0, 1, &g_staging_buffer, &vertex_offset);
+  const VkClearValue clear = {.color = {{0.0f, 0.0f, 0.0f, 0.0f}}};
+  int needed[2] = {0, 0};
+  for (int index = 0; index < config->screen_count; index++)
+    needed[config->screens[index].screen ? 1 : 0] = 1;
+  for (int screen = 0; screen < 2; screen++) {
+    if (!needed[screen] || g_filter_valid[screen]) continue;
+    for (int pass_index = 0;
+         pass_index + 1 < g_custom.shader.pass_count; pass_index++) {
+      const DrasticCustomPass *pass = &g_custom.shader.passes[pass_index];
+      SampledTexture *output = custom_sampled_texture(
+          &g_custom, screen, pass->output_texture);
+      SampledTexture *input = custom_sampled_texture(
+          &g_custom, screen, pass->sampler_textures[0]);
+      if (!output || !output->framebuffer || !input ||
+          !g_custom.pipelines[pass_index]) return 0;
+      const VkExtent2D extent = {output->width, output->height};
+      const VkRenderPassBeginInfo render_begin = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = g_filter_render_pass,
+        .framebuffer = output->framebuffer,
+        .renderArea = {{0, 0}, extent},
+        .clearValueCount = 1,
+        .pClearValues = &clear,
+      };
+      vkCmdBeginRenderPass(command, &render_begin,
+                           VK_SUBPASS_CONTENTS_INLINE);
+      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        g_custom.pipelines[pass_index]);
+      const VkViewport viewport = {
+        .x = 0.0f, .y = 0.0f,
+        .width = (float)extent.width, .height = (float)extent.height,
+        .minDepth = 0.0f, .maxDepth = 1.0f,
+      };
+      const VkRect2D scissor = {{0, 0}, extent};
+      vkCmdSetViewport(command, 0, 1, &viewport);
+      vkCmdSetScissor(command, 0, 1, &scissor);
+      const VkDescriptorSet descriptor =
+          g_custom.descriptors[screen][pass_index];
+      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              g_custom.pipeline_layout, 0, 1, &descriptor,
+                              0, NULL);
+      const DfxParameters parameters = {
+        .texture_size = {
+          1.0f / (float)input->width, 1.0f / (float)input->height,
+          (float)input->width, (float)input->height,
+        },
+        .target_size = {(float)output->width, (float)output->height},
+        .time = (float)g_frames / 60.0f,
+      };
+      vkCmdPushConstants(command, g_custom.pipeline_layout,
+                         VK_SHADER_STAGE_VERTEX_BIT |
+                             VK_SHADER_STAGE_FRAGMENT_BIT,
+                         0, sizeof(parameters), &parameters);
+      vkCmdDraw(command, 6, 1, 0, 0);
+      vkCmdEndRenderPass(command);
+      output->initialized = 1;
+    }
+    g_filter_valid[screen] = 1;
+  }
+  return 1;
+}
+
 static int record_filter_chains(VkCommandBuffer command,
-                                const DrasticRuntimeConfig *config) {
+                                 const DrasticRuntimeConfig *config) {
+  if (config->video_filter == DRASTIC_FILTER_CUSTOM)
+    return record_custom_filter_chains(command, config);
   const DrasticDfxChain *chain = drastic_dfx_chain(config->video_filter);
   if (!chain->pass_count) return 1;
-  const VkDeviceSize vertex_offset = g_filter_vertex_offset;
+  const VkDeviceSize vertex_offset =
+      g_staging_base + g_filter_vertex_offset;
   vkCmdBindVertexBuffers(command, 0, 1, &g_staging_buffer, &vertex_offset);
   const VkClearValue clear = {.color = {{0.0f, 0.0f, 0.0f, 0.0f}}};
   int needed[2] = {0, 0};
@@ -1460,10 +2064,54 @@ static int record_filter_chains(VkCommandBuffer command,
   return 1;
 }
 
-static int record_commands(uint32_t image_index, int upload_screens,
+static int record_custom_final_draws(VkCommandBuffer command) {
+  if (!g_custom.valid || !g_custom.shader.pass_count) return 0;
+  const int pass_index = g_custom.shader.pass_count - 1;
+  const DrasticCustomPass *pass = &g_custom.shader.passes[pass_index];
+  if (!g_custom.pipelines[pass_index]) return 0;
+  vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    g_custom.pipelines[pass_index]);
+  const VkDeviceSize vertex_offset = g_staging_base + g_vertex_offset;
+  vkCmdBindVertexBuffers(command, 0, 1, &g_staging_buffer, &vertex_offset);
+  const VkViewport viewport = {
+    .x = 0.0f, .y = 0.0f,
+    .width = (float)g_extent.width, .height = (float)g_extent.height,
+    .minDepth = 0.0f, .maxDepth = 1.0f,
+  };
+  const VkRect2D scissor = {{0, 0}, g_extent};
+  vkCmdSetViewport(command, 0, 1, &viewport);
+  vkCmdSetScissor(command, 0, 1, &scissor);
+  for (uint32_t index = 0; index < g_custom_draw_count; index++) {
+    const CustomFinalDraw *draw = &g_custom_draws[index];
+    SampledTexture *input = custom_sampled_texture(
+        &g_custom, draw->screen, pass->sampler_textures[0]);
+    if (!input) return 0;
+    const VkDescriptorSet descriptor =
+        g_custom.descriptors[draw->screen][pass_index];
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            g_custom.pipeline_layout, 0, 1, &descriptor,
+                            0, NULL);
+    const DfxParameters parameters = {
+      .texture_size = {
+        1.0f / (float)input->width, 1.0f / (float)input->height,
+        (float)input->width, (float)input->height,
+      },
+      .target_size = {draw->target_width, draw->target_height},
+      .time = (float)g_frames / 60.0f,
+    };
+    vkCmdPushConstants(command, g_custom.pipeline_layout,
+                       VK_SHADER_STAGE_VERTEX_BIT |
+                           VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(parameters), &parameters);
+    vkCmdDraw(command, 6, 1, draw->first_vertex, 0);
+  }
+  return 1;
+}
+
+static int record_commands(VkCommandBuffer command, uint32_t image_index,
+                           int upload_screens,
                            int upload_overlay, int overlay_texture,
                            const DrasticRuntimeConfig *config) {
-  VkCommandBuffer command = g_commands[image_index];
   vkResetCommandBuffer(command, 0);
   const VkCommandBufferBeginInfo begin = {
     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -1472,18 +2120,18 @@ static int record_commands(uint32_t image_index, int upload_screens,
   if (!vk_ok(vkBeginCommandBuffer(command, &begin))) return 0;
   if (upload_screens) {
     record_image_upload(command, &g_textures[TEXTURE_TOP],
-                        g_texture_offsets[TEXTURE_TOP]);
+                        g_staging_base + g_texture_offsets[TEXTURE_TOP]);
     record_image_upload(command, &g_textures[TEXTURE_BOTTOM],
-                        g_texture_offsets[TEXTURE_BOTTOM]);
+                        g_staging_base + g_texture_offsets[TEXTURE_BOTTOM]);
   }
   if (upload_overlay)
     record_image_upload(command, &g_textures[overlay_texture],
-                        g_texture_offsets[overlay_texture]);
+                        g_staging_base + g_texture_offsets[overlay_texture]);
   if (!g_textures[TEXTURE_AREA].initialized) {
     record_image_upload(command, &g_textures[TEXTURE_AREA],
-                        g_texture_offsets[TEXTURE_AREA]);
+                        g_staging_base + g_texture_offsets[TEXTURE_AREA]);
     record_image_upload(command, &g_textures[TEXTURE_SEARCH],
-                        g_texture_offsets[TEXTURE_SEARCH]);
+                        g_staging_base + g_texture_offsets[TEXTURE_SEARCH]);
   }
   if (!record_filter_chains(command, config)) return 0;
 
@@ -1497,8 +2145,13 @@ static int record_commands(uint32_t image_index, int upload_screens,
     .pClearValues = &clear,
   };
   vkCmdBeginRenderPass(command, &render_begin, VK_SUBPASS_CONTENTS_INLINE);
+  if (config->video_filter == DRASTIC_FILTER_CUSTOM &&
+      !record_custom_final_draws(command)) {
+    vkCmdEndRenderPass(command);
+    return 0;
+  }
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
-  const VkDeviceSize vertex_offset = g_vertex_offset;
+  const VkDeviceSize vertex_offset = g_staging_base + g_vertex_offset;
   vkCmdBindVertexBuffers(command, 0, 1, &g_staging_buffer, &vertex_offset);
   int bound_texture = -1;
   int bound_sampler = -1;
@@ -1540,9 +2193,6 @@ static int lsfg_try_create(void) {
     .device = g_device,
     .queue = g_queue,
     .queue_family_index = g_queue_family,
-    .transfer_queue = g_transfer_queue ? g_transfer_queue : g_queue,
-    .transfer_queue_family_index = g_transfer_queue ?
-        g_transfer_queue_family : g_queue_family,
     .get_instance_proc_addr = vkGetInstanceProcAddr,
     .swapchain = g_swapchain,
     .extent = g_extent,
@@ -1557,6 +2207,7 @@ static int lsfg_try_create(void) {
 }
 
 bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
+  g_renderer_error[0] = '\0';
   g_ds_width = config &&
       (config->core_config & (UINT64_C(1) << 41)) ? 512 : 256;
   g_ds_height = g_ds_width * 3 / 4;
@@ -1566,6 +2217,9 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   if (lsfg_launch_enabled && !enable_nvk_no_cbuf())
     lsfg_launch_enabled = 0;
   g_lsfg_pipeline_prepared = lsfg_launch_enabled;
+  g_frame_slot_count = lsfg_launch_enabled ? RENDER_FRAME_SLOTS : 1;
+  g_frame_slot_cursor = 0;
+  memset(g_frame_slots, 0, sizeof(g_frame_slots));
   /* LSFG owns presentation pacing and needs its larger swapchain. Keep the
    * native low-latency path mutually exclusive for the lifetime of this
    * renderer, including when LSFG is toggled from the in-game overlay. */
@@ -1576,8 +2230,6 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   g_lsfg_init_attempted = 0;
   g_lsfg_device_capable = 0;
   g_lsfg_swapchain_compatible = 0;
-  g_transfer_queue = VK_NULL_HANDLE;
-  g_transfer_queue_family = VK_QUEUE_FAMILY_IGNORED;
   g_filtered_filter = DRASTIC_FILTER_COUNT;
   g_filter_valid[0] = g_filter_valid[1] = 0;
   g_frames = 0;
@@ -1588,9 +2240,9 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   const VkApplicationInfo application = {
     .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
     .pApplicationName = "DrasticDS_nx",
-    .applicationVersion = VK_MAKE_VERSION(1, 0, 2),
+    .applicationVersion = VK_MAKE_VERSION(1, 0, 3),
     .pEngineName = "Drastic Switch wrapper",
-    .engineVersion = VK_MAKE_VERSION(1, 0, 2),
+    .engineVersion = VK_MAKE_VERSION(1, 0, 3),
     .apiVersion = VK_API_VERSION_1_1,
   };
   const VkInstanceCreateInfo instance_info = {
@@ -1641,21 +2293,28 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   if (!create_filter_pipelines()) {
     return false;
   }
+  if (config && config->video_filter == DRASTIC_FILTER_CUSTOM &&
+      !drastic_renderer_set_custom_shader(config->custom_shader, NULL, 0)) {
+    return false;
+  }
   const VkSemaphoreCreateInfo semaphore_info = {
     .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
   };
-  if (!vk_ok(vkCreateSemaphore(g_device, &semaphore_info, NULL,
-                                &g_acquired)) ||
-      !vk_ok(vkCreateSemaphore(g_device, &semaphore_info, NULL,
-                                &g_rendered))) {
-    return false;
-  }
   const VkFenceCreateInfo fence_info = {
     .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
     .flags = VK_FENCE_CREATE_SIGNALED_BIT,
   };
-  result = vkCreateFence(g_device, &fence_info, NULL, &g_fence);
-  return vk_ok(result);
+  for (uint32_t index = 0; index < g_frame_slot_count; index++) {
+    RenderFrameSlot *slot = &g_frame_slots[index];
+    if (!vk_ok(vkCreateSemaphore(g_device, &semaphore_info, NULL,
+                                  &slot->acquired)) ||
+        !vk_ok(vkCreateSemaphore(g_device, &semaphore_info, NULL,
+                                  &slot->rendered)) ||
+        !vk_ok(vkCreateFence(g_device, &fence_info, NULL,
+                             &slot->fence)))
+      return false;
+  }
+  return true;
 }
 
 static void stage_screen_pixels(uint8_t *destination,
@@ -1698,12 +2357,42 @@ static void release_core_frame(DrasticCoreRenderFrame core_render,
   *released = 1;
 }
 
+static int wait_frame_slot(uint32_t slot_index) {
+  RenderFrameSlot *slot = &g_frame_slots[slot_index];
+  if (!slot->pending) return 1;
+
+  VkFence completion = slot->fence;
+  if (g_frame_slot_count > 1) {
+    /* LSFG consumes slot->rendered after this renderer submission. A fence on
+     * the following source frame is later in the same queue, so it covers the
+     * complete LSFG tail as well as this slot's command/staging resources. */
+    RenderFrameSlot *guard =
+        &g_frame_slots[(slot_index + 1) % g_frame_slot_count];
+    if (guard->pending) {
+      completion = guard->fence;
+    } else {
+      const VkResult idle = vkQueueWaitIdle(g_queue);
+      if (!vk_ok(idle)) return 0;
+      slot->pending = 0;
+      return 1;
+    }
+  }
+
+  if (!vk_ok(vkWaitForFences(g_device, 1, &completion, VK_TRUE,
+                              UINT64_MAX)))
+    return 0;
+  slot->pending = 0;
+  return 1;
+}
+
 void drastic_renderer_present(const DrasticRuntimeConfig *config,
                               DrasticCoreRenderFrame core_render,
                               void *env, void *clazz,
                               const uint32_t *top, const uint32_t *bottom,
                               const DrasticOverlayFrame *overlay,
                               bool consume_core_frame) {
+  if (config->video_filter == DRASTIC_FILTER_CUSTOM && !g_custom.valid)
+    return;
   const int upload_screens = consume_core_frame && top && bottom;
   const int hold_high_resolution_frame = upload_screens &&
       (config->core_config & (UINT64_C(1) << 41));
@@ -1725,12 +2414,14 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
     g_lsfg_init_attempted = 0;
   }
 
-  VkResult result = vkWaitForFences(g_device, 1, &g_fence, VK_TRUE,
-                                    UINT64_MAX);
-  if (!vk_ok(result)) {
+  const uint32_t slot_index = g_frame_slot_cursor;
+  RenderFrameSlot *frame = &g_frame_slots[slot_index];
+  if (!wait_frame_slot(slot_index)) {
     release_core_frame(core_render, env, clazz, &core_frame_released);
     return;
   }
+  g_staging_base = (VkDeviceSize)slot_index * g_staging_stride;
+  VkResult result;
 
   if (g_filtered_filter != config->video_filter) {
     g_filtered_filter = config->video_filter;
@@ -1738,16 +2429,18 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
   }
   if (upload_screens) g_filter_valid[0] = g_filter_valid[1] = 0;
   if (hold_high_resolution_frame && !defer_core_release) {
-    stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_TOP],
+    stage_screen_pixels(g_staging_mapped + g_staging_base +
+                            g_texture_offsets[TEXTURE_TOP],
                         top, config);
-    stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_BOTTOM],
+    stage_screen_pixels(g_staging_mapped + g_staging_base +
+                            g_texture_offsets[TEXTURE_BOTTOM],
                         bottom, config);
     release_core_frame(core_render, env, clazz, &core_frame_released);
   }
 
   uint32_t image_index = 0;
   const VkResult acquired = vkAcquireNextImageKHR(
-      g_device, g_swapchain, UINT64_MAX, g_acquired, VK_NULL_HANDLE,
+      g_device, g_swapchain, UINT64_MAX, frame->acquired, VK_NULL_HANDLE,
       &image_index);
   if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
     release_core_frame(core_render, env, clazz, &core_frame_released);
@@ -1756,9 +2449,11 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
 
   if (upload_screens &&
       (!hold_high_resolution_frame || defer_core_release)) {
-    stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_TOP],
+    stage_screen_pixels(g_staging_mapped + g_staging_base +
+                            g_texture_offsets[TEXTURE_TOP],
                         top, config);
-    stage_screen_pixels(g_staging_mapped + g_texture_offsets[TEXTURE_BOTTOM],
+    stage_screen_pixels(g_staging_mapped + g_staging_base +
+                            g_texture_offsets[TEXTURE_BOTTOM],
                         bottom, config);
   }
   if (defer_core_release)
@@ -1770,7 +2465,8 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
     const size_t bytes = (size_t)overlay->width * overlay->height *
                          sizeof(uint32_t);
     if (bytes > (size_t)DRASTIC_OVERLAY_PIXELS * sizeof(uint32_t)) return;
-    memcpy(g_staging_mapped + g_texture_offsets[overlay_texture],
+    memcpy(g_staging_mapped + g_staging_base +
+               g_texture_offsets[overlay_texture],
            overlay->pixels, bytes);
   }
   build_draws(config, overlay);
@@ -1778,41 +2474,44 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
     const VkMappedMemoryRange range = {
       .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
       .memory = g_staging_memory,
-      .offset = 0,
-      .size = VK_WHOLE_SIZE,
+      .offset = g_staging_base,
+      .size = g_staging_stride,
     };
     result = vkFlushMappedMemoryRanges(g_device, 1, &range);
     if (!vk_ok(result)) {
       return;
     }
   }
-  if (!record_commands(image_index, upload_screens, upload_overlay,
+  if (!record_commands(frame->command, image_index, upload_screens,
+                       upload_overlay,
                        overlay_texture, config)) {
     return;
   }
 
-  vkResetFences(g_device, 1, &g_fence);
+  if (!vk_ok(vkResetFences(g_device, 1, &frame->fence))) return;
   const VkPipelineStageFlags wait_stage =
       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
   const VkSubmitInfo submit = {
     .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
     .waitSemaphoreCount = 1,
-    .pWaitSemaphores = &g_acquired,
+    .pWaitSemaphores = &frame->acquired,
     .pWaitDstStageMask = &wait_stage,
     .commandBufferCount = 1,
-    .pCommandBuffers = &g_commands[image_index],
+    .pCommandBuffers = &frame->command,
     .signalSemaphoreCount = 1,
-    .pSignalSemaphores = &g_rendered,
+    .pSignalSemaphores = &frame->rendered,
   };
-  result = vkQueueSubmit(g_queue, 1, &submit, g_fence);
+  result = vkQueueSubmit(g_queue, 1, &submit, frame->fence);
   if (!vk_ok(result)) {
     return;
   }
+  frame->pending = 1;
+  g_frame_slot_cursor = (slot_index + 1) % g_frame_slot_count;
   if (upload_overlay) g_overlay_generation = overlay->generation;
   const VkPresentInfoKHR present = {
     .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
     .waitSemaphoreCount = 1,
-    .pWaitSemaphores = &g_rendered,
+    .pWaitSemaphores = &frame->rendered,
     .swapchainCount = 1,
     .pSwapchains = &g_swapchain,
     .pImageIndices = &image_index,
@@ -1847,9 +2546,15 @@ void drastic_renderer_shutdown(void) {
   __atomic_store_n(&g_lsfg_runtime_available, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&g_lsfg_enabled_requested, 0, __ATOMIC_RELEASE);
   if (g_device) {
-    if (g_fence) vkDestroyFence(g_device, g_fence, NULL);
-    if (g_acquired) vkDestroySemaphore(g_device, g_acquired, NULL);
-    if (g_rendered) vkDestroySemaphore(g_device, g_rendered, NULL);
+    destroy_custom_state(&g_custom);
+    for (uint32_t index = 0; index < g_frame_slot_count; index++) {
+      RenderFrameSlot *slot = &g_frame_slots[index];
+      if (slot->fence) vkDestroyFence(g_device, slot->fence, NULL);
+      if (slot->acquired)
+        vkDestroySemaphore(g_device, slot->acquired, NULL);
+      if (slot->rendered)
+        vkDestroySemaphore(g_device, slot->rendered, NULL);
+    }
     if (g_pipeline) vkDestroyPipeline(g_device, g_pipeline, NULL);
     for (int shader = 0; shader < DRASTIC_DFX_SHADER_COUNT; shader++)
       if (g_filter_pipelines[shader])
@@ -1902,9 +2607,13 @@ void drastic_renderer_shutdown(void) {
   g_instance = VK_NULL_HANDLE;
   g_device = VK_NULL_HANDLE;
   g_queue = VK_NULL_HANDLE;
-  g_transfer_queue = VK_NULL_HANDLE;
-  g_transfer_queue_family = VK_QUEUE_FAMILY_IGNORED;
+  memset(g_frame_slots, 0, sizeof(g_frame_slots));
+  g_frame_slot_count = 1;
+  g_frame_slot_cursor = 0;
   g_staging_mapped = NULL;
+  g_staging_size = 0;
+  g_staging_stride = 0;
+  g_staging_base = 0;
 }
 
 unsigned drastic_renderer_frame_count(void) { return g_frames; }

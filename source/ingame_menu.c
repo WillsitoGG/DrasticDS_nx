@@ -66,6 +66,13 @@ struct DrasticIngameMenu {
   int persisted_cheats_applied;
   char status[192];
   DrasticVideoFilter filter_backup;
+  char filter_backup_shader[DRASTIC_CUSTOM_SHADER_PATH_MAX];
+  DrasticCustomShaderEntry custom_shaders[128];
+  int custom_shader_count;
+  int filter_picker_index;
+  int filter_picker_custom;
+  int filter_picker_valid;
+  u64 marquee_tick;
   DrasticLayoutMode editor_old_layout;
   DrasticScreenRect editor_backup[2];
   int editor_screen;
@@ -491,6 +498,16 @@ static void draw_row(int x, int y, int width, int selected,
                             enabled ? COLOR_ACCENT : COLOR_MUTED, value);
 }
 
+static void draw_row_scrolling_value(int x, int y, int width, int selected,
+                                     const char *label, const char *value,
+                                     int enabled) {
+  draw_row(x, y, width, selected, label, NULL, enabled);
+  const int value_width = width / 2 - 24;
+  overlay_draw_text_scrolling_right(
+      x + width - 16, y + 14, value_width,
+      enabled ? COLOR_ACCENT : COLOR_MUTED, value);
+}
+
 enum MainMenuItem {
   MAIN_RESUME,
   MAIN_STATES,
@@ -712,55 +729,94 @@ static const char *layout_label(DrasticLayoutMode layout) {
 static const char *filter_label(DrasticVideoFilter filter) {
   static const char *labels[DRASTIC_FILTER_COUNT] = {
     "Nearest", "Linear", "Quilez", "Scanline", "Scale2x", "HQ2x", "FXAA",
-    "FXAA HQ", "SMAA"
+    "FXAA HQ", "SMAA", "Custom"
   };
   return (unsigned)filter < DRASTIC_FILTER_COUNT ? labels[filter] : labels[0];
 }
 
+static const char *custom_shader_name(const DrasticIngameMenu *menu,
+                                      const char *relative_path) {
+  for (int index = 0; index < menu->custom_shader_count; index++)
+    if (!strcmp(menu->custom_shaders[index].relative_path, relative_path))
+      return menu->custom_shaders[index].name;
+  const char *slash = relative_path ? strrchr(relative_path, '/') : NULL;
+  return relative_path && relative_path[0] ? (slash ? slash + 1 : relative_path)
+                                           : "Not selected";
+}
+
+static const char *filter_picker_label(const DrasticIngameMenu *menu) {
+  if (!menu->filter_picker_custom)
+    return menu->filter_picker_index >= 0 &&
+           menu->filter_picker_index < DRASTIC_FILTER_CUSTOM
+        ? filter_label((DrasticVideoFilter)menu->filter_picker_index)
+        : "Nearest";
+  return menu->filter_picker_index >= 0 &&
+         menu->filter_picker_index < menu->custom_shader_count
+      ? menu->custom_shaders[menu->filter_picker_index].name
+      : "Not selected";
+}
+
 static void render_filter_picker(DrasticIngameMenu *menu) {
-  char selection[64];
-  snprintf(selection, sizeof(selection), "Filter   <  %-8s  >",
-           filter_label(menu->config->video_filter));
+  char selection[160];
+  snprintf(selection, sizeof(selection), "%s   <  %s  >",
+           menu->filter_picker_custom ? "Custom shader" : "Filter",
+           filter_picker_label(menu));
 
   /* Keep the game unobstructed while previewing filters. The overlay buffer
    * is transparent outside this compact, opaque control bar. */
   const int portrait = ui_is_portrait();
   const int x = portrait ? 20 : 180;
-  const int y = ui_height() - 70;
+  const int show_error = menu->status[0] != '\0';
+  const int y = ui_height() - (show_error ? 98 : 70);
   const int width = portrait ? ui_width() - 40 : 920;
-  overlay_fill_rect(x, y, width, 52, 0xff18202cu);
-  overlay_border_rect(x, y, width, 52, 2, COLOR_ACCENT);
+  const int height = show_error ? 80 : 52;
+  overlay_fill_rect(x, y, width, height, 0xff18202cu);
+  overlay_border_rect(x, y, width, height, 2, COLOR_ACCENT);
   overlay_draw_text(x + 24, y + 18, COLOR_MUTED, "B  Cancel");
-  if (portrait)
-    overlay_draw_text_clipped(x + 176, y + 18, width - 336,
+  const int selection_x = x + (portrait ? 176 : 190);
+  const int selection_width = width - (portrait ? 336 : 380);
+  overlay_draw_text_scrolling(selection_x, y + 18, selection_width,
                               COLOR_TEXT, selection);
-  else
-    overlay_draw_text(548, y + 18, COLOR_TEXT, selection);
   overlay_draw_text_right(x + width - 24, y + 18,
                           COLOR_MUTED, "A  Apply");
+  if (show_error)
+    overlay_draw_text_clipped(x + 24, y + 50, width - 48,
+                              COLOR_WARN, menu->status);
 }
 
 static void render_display(DrasticIngameMenu *menu) {
   static const char *labels[] = {
     "Screen layout", "Swap DS screens", "Rotation", "Screen gap",
-    "Integer scaling", "Drastic filter chain", "Custom layout editor", "Back"
+    "Integer scaling", "Drastic filter", "Custom shader",
+    "Custom layout editor", "Back"
   };
-  char values[8][48] = {{0}};
+  char values[9][112] = {{0}};
   snprintf(values[0], sizeof(values[0]), "%s", layout_label(menu->config->layout));
   snprintf(values[1], sizeof(values[1]), "%s", menu->config->swap_screens ? "On" : "Off");
   snprintf(values[2], sizeof(values[2]), "%d degrees", (menu->config->rotation & 3) * 90);
   snprintf(values[3], sizeof(values[3]), "%d px", menu->config->screen_gap);
   snprintf(values[4], sizeof(values[4]), "%s", menu->config->integer_scale ? "On" : "Off");
-  snprintf(values[5], sizeof(values[5]), "%s", filter_label(menu->config->video_filter));
+  snprintf(values[5], sizeof(values[5]), "%s",
+           filter_label(menu->config->video_filter));
+  snprintf(values[6], sizeof(values[6]), "%s",
+           custom_shader_name(menu, menu->config->custom_shader));
   draw_shell("Screen layout & filters",
              "Left / Right  Change     A  Select     B  Back");
   const int panel_x = ui_is_portrait() ? 24 : 156;
   const int panel_width = ui_is_portrait() ? ui_width() - 48 : 968;
-  overlay_fill_rect(panel_x, 102, panel_width, 466, COLOR_PANEL);
-  for (int index = 0; index < 8; index++)
-    draw_row(panel_x + 24, 122 + index * 52, panel_width - 48,
-             menu->selection[MENU_DISPLAY] == index, labels[index],
-             index < 6 ? values[index] : NULL, 1);
+  overlay_fill_rect(panel_x, 102, panel_width, 518, COLOR_PANEL);
+  for (int index = 0; index < 9; index++) {
+    const int row_x = panel_x + 24;
+    const int row_y = 122 + index * 52;
+    const int row_width = panel_width - 48;
+    const int selected = menu->selection[MENU_DISPLAY] == index;
+    if (index == 6)
+      draw_row_scrolling_value(row_x, row_y, row_width, selected,
+                               labels[index], values[index], 1);
+    else
+      draw_row(row_x, row_y, row_width, selected, labels[index],
+               index < 7 ? values[index] : NULL, 1);
+  }
   draw_status(menu);
 }
 
@@ -911,6 +967,7 @@ static void render_menu(DrasticIngameMenu *menu) {
 static void select_page(DrasticIngameMenu *menu, enum MenuPage page) {
   menu->page = page;
   menu->status[0] = '\0';
+  menu->marquee_tick = 0;
   menu->redraw = 1;
   if (page == MENU_STATES) {
     menu->confirm_delete_slot = -1;
@@ -1106,22 +1163,134 @@ static int change_direction(u64 pressed) {
   return 0;
 }
 
-static void preview_filter(DrasticIngameMenu *menu, int direction) {
-  menu->config->video_filter = (DrasticVideoFilter)(
-      ((int)menu->config->video_filter + direction +
-       DRASTIC_FILTER_COUNT) % DRASTIC_FILTER_COUNT);
+static void refresh_custom_shaders(DrasticIngameMenu *menu) {
+  menu->custom_shader_count = (int)drastic_custom_shader_scan(
+      menu->custom_shaders,
+      sizeof(menu->custom_shaders) / sizeof(menu->custom_shaders[0]));
+}
+
+static int configured_custom_shader_index(const DrasticIngameMenu *menu) {
+  for (int index = 0; index < menu->custom_shader_count; index++) {
+    if (!strcmp(menu->custom_shaders[index].relative_path,
+                menu->config->custom_shader))
+      return index;
+  }
+  return -1;
+}
+
+static int select_builtin_filter_candidate(DrasticIngameMenu *menu,
+                                           int candidate) {
+  if (candidate < 0 || candidate >= DRASTIC_FILTER_CUSTOM) return 0;
+  menu->config->video_filter = (DrasticVideoFilter)candidate;
+  menu->filter_picker_index = candidate;
+  menu->filter_picker_valid = 1;
+  menu->status[0] = '\0';
   menu->redraw = 1;
+  return 1;
+}
+
+static int select_custom_shader_candidate(DrasticIngameMenu *menu,
+                                          int candidate) {
+  if (candidate < 0 || candidate >= menu->custom_shader_count) return 0;
+  menu->filter_picker_index = candidate;
+  menu->filter_picker_valid = 0;
+  char error[192];
+  if (!drastic_renderer_set_custom_shader(
+          menu->custom_shaders[candidate].relative_path,
+          error, sizeof(error))) {
+    set_status(menu, error);
+    return 0;
+  }
+  menu->config->video_filter = DRASTIC_FILTER_CUSTOM;
+  snprintf(menu->config->custom_shader, sizeof(menu->config->custom_shader),
+           "%s", menu->custom_shaders[candidate].relative_path);
+  menu->filter_picker_valid = 1;
+  menu->status[0] = '\0';
+  menu->redraw = 1;
+  return 1;
+}
+
+static void preview_filter(DrasticIngameMenu *menu, int direction) {
+  const int count = menu->filter_picker_custom
+      ? menu->custom_shader_count : DRASTIC_FILTER_CUSTOM;
+  if (count <= 0) return;
+  const int candidate = (menu->filter_picker_index + direction + count) % count;
+  if (menu->filter_picker_custom)
+    select_custom_shader_candidate(menu, candidate);
+  else
+    select_builtin_filter_candidate(menu, candidate);
+}
+
+static int restore_filter_backup(DrasticIngameMenu *menu) {
+  if (menu->filter_backup == DRASTIC_FILTER_CUSTOM) {
+    char error[192];
+    if (!drastic_renderer_set_custom_shader(
+            menu->filter_backup_shader, error, sizeof(error))) {
+      set_status(menu, error);
+      return 0;
+    }
+  }
+  menu->config->video_filter = menu->filter_backup;
+  snprintf(menu->config->custom_shader, sizeof(menu->config->custom_shader),
+           "%s", menu->filter_backup_shader);
+  menu->redraw = 1;
+  return 1;
+}
+
+static void begin_filter_picker(DrasticIngameMenu *menu, int custom,
+                                int direction) {
+  if (custom) {
+    refresh_custom_shaders(menu);
+    if (!menu->custom_shader_count) {
+      set_status(menu, "No custom shaders were found");
+      return;
+    }
+  }
+
+  menu->filter_backup = menu->config->video_filter;
+  snprintf(menu->filter_backup_shader, sizeof(menu->filter_backup_shader),
+           "%s", menu->config->custom_shader);
+  menu->filter_picker_custom = custom;
+  menu->filter_picker_valid = 0;
+  menu->status[0] = '\0';
+
+  const int count = custom ? menu->custom_shader_count
+                           : DRASTIC_FILTER_CUSTOM;
+  int current = custom ? configured_custom_shader_index(menu)
+                       : (menu->config->video_filter < DRASTIC_FILTER_CUSTOM
+                           ? (int)menu->config->video_filter : -1);
+  int candidate;
+  if (current < 0)
+    candidate = direction < 0 ? count - 1 : 0;
+  else
+    candidate = (current + direction + count) % count;
+
+  select_page(menu, MENU_FILTER_PICKER);
+  if (custom)
+    select_custom_shader_candidate(menu, candidate);
+  else
+    select_builtin_filter_candidate(menu, candidate);
 }
 
 static void update_filter_picker(DrasticIngameMenu *menu, u64 pressed) {
   if (pressed & HidNpadButton_B) {
-    menu->config->video_filter = menu->filter_backup;
+    if (!restore_filter_backup(menu)) return;
+    menu->status[0] = '\0';
     select_page(menu, MENU_DISPLAY);
     return;
   }
   if (pressed & HidNpadButton_A) {
+    if (!menu->filter_picker_valid) {
+      set_status(menu, menu->filter_picker_custom
+          ? "This custom shader could not be loaded"
+          : "This filter could not be selected");
+      return;
+    }
     save_string("Wrapper/VideoFilter",
                 drastic_config_filter_name(menu->config->video_filter));
+    if (menu->filter_picker_custom)
+      save_string("Wrapper/CustomShader", menu->config->custom_shader);
+    menu->status[0] = '\0';
     select_page(menu, MENU_DISPLAY);
     return;
   }
@@ -1132,17 +1301,17 @@ static void update_filter_picker(DrasticIngameMenu *menu, u64 pressed) {
 }
 
 static void update_display(DrasticIngameMenu *menu, u64 pressed) {
-  navigate_list(menu, 8, pressed);
+  navigate_list(menu, 9, pressed);
   if (pressed & HidNpadButton_B) {
     select_page(menu, MENU_MAIN);
     return;
   }
   const int selection = menu->selection[MENU_DISPLAY];
-  if (selection == 7 && (pressed & HidNpadButton_A)) {
+  if (selection == 8 && (pressed & HidNpadButton_A)) {
     select_page(menu, MENU_MAIN);
     return;
   }
-  if (selection == 6 && (pressed & HidNpadButton_A)) {
+  if (selection == 7 && (pressed & HidNpadButton_A)) {
     menu->editor_old_layout = menu->config->layout;
     memcpy(menu->editor_backup, menu->config->custom_screens,
            sizeof(menu->editor_backup));
@@ -1152,14 +1321,12 @@ static void update_display(DrasticIngameMenu *menu, u64 pressed) {
     select_page(menu, MENU_LAYOUT_EDITOR);
     return;
   }
-  if (selection == 5 &&
+  if ((selection == 5 || selection == 6) &&
       (pressed & (HidNpadButton_Left | HidNpadButton_Right |
                   HidNpadButton_A))) {
-    menu->filter_backup = menu->config->video_filter;
     const int direction = (pressed & HidNpadButton_Left) ? -1 :
                           (pressed & HidNpadButton_Right) ? 1 : 0;
-    select_page(menu, MENU_FILTER_PICKER);
-    if (direction) preview_filter(menu, direction);
+    begin_filter_picker(menu, selection == 6, direction);
     return;
   }
   const int direction = change_direction(pressed);
@@ -1416,6 +1583,7 @@ DrasticIngameMenu *drastic_menu_create(DrasticRuntimeConfig *config,
   menu->snapshot_bottom_array = jni_make_int_array(256 * 192);
   menu->snapshot_top = jni_int_array_data(menu->snapshot_top_array);
   menu->snapshot_bottom = jni_int_array_data(menu->snapshot_bottom_array);
+  refresh_custom_shaders(menu);
   return menu;
 }
 
@@ -1450,6 +1618,22 @@ bool drastic_menu_is_open(const DrasticIngameMenu *menu) {
   return menu && menu->open;
 }
 
+static void update_marquee(DrasticIngameMenu *menu) {
+  const int active = menu->page == MENU_DISPLAY ||
+      (menu->page == MENU_FILTER_PICKER && menu->filter_picker_custom);
+  if (!active) {
+    menu->marquee_tick = 0;
+    return;
+  }
+  const u64 frequency = armGetSystemTickFreq();
+  const u64 now = armGetSystemTick();
+  const u64 interval = frequency / 30u;
+  if (!menu->marquee_tick || now - menu->marquee_tick >= interval) {
+    menu->marquee_tick = now;
+    menu->redraw = 1;
+  }
+}
+
 void drastic_menu_update(DrasticIngameMenu *menu, u64 held, u64 pressed,
                          HidAnalogStickState left,
                          HidAnalogStickState right) {
@@ -1471,6 +1655,7 @@ void drastic_menu_update(DrasticIngameMenu *menu, u64 held, u64 pressed,
       update_layout_editor(menu, held, pressed, left, right); break;
     default: update_main(menu, pressed); break;
   }
+  update_marquee(menu);
   if (menu->open && menu->redraw) render_menu(menu);
 }
 

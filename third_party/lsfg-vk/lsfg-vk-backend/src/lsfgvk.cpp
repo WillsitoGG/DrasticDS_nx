@@ -115,6 +115,9 @@ namespace lsfgvk::backend {
         /// (see lsfg-vk documentation)
         void scheduleFrames();
 
+        /// Record all frame-generation passes into a caller-owned command buffer.
+        void recordFrame(const vk::CommandBuffer& cmdbuf);
+
         [[nodiscard]] VkImage sourceImage(size_t index) const {
             return index ? this->sourceImages.second.handle() : this->sourceImages.first.handle();
         }
@@ -811,6 +814,43 @@ void Context::scheduleFrames() {
 
     this->idx += this->destImages.size();
     this->fidx++;
+}
+
+void Context::recordFrame(const vk::CommandBuffer& cmdbuf) {
+    this->mipmaps.render(ctx.vk, cmdbuf, this->fidx);
+    for (size_t i = 0; i < 7; ++i) {
+        this->alpha0.at(6 - i).render(ctx.vk, cmdbuf);
+        this->alpha1.at(6 - i).render(ctx.vk, cmdbuf, this->fidx);
+    }
+    this->beta0.render(ctx.vk, cmdbuf, this->fidx);
+    this->beta1.render(ctx.vk, cmdbuf);
+
+    for (size_t i = 0; i < this->destImages.size(); ++i) {
+        const auto& pass = this->passes.at(i);
+        for (size_t j = 0; j < 7; ++j) {
+            pass.gamma0.at(j).render(ctx.vk, cmdbuf, this->fidx);
+            pass.gamma1.at(j).render(ctx.vk, cmdbuf);
+
+            if (j < 4) continue;
+            pass.delta0.at(j - 4).render(ctx.vk, cmdbuf, this->fidx);
+            pass.delta1.at(j - 4).render(ctx.vk, cmdbuf);
+        }
+        pass.generate->render(ctx.vk, cmdbuf, this->fidx);
+    }
+
+    // Keep the public timeline sequence coherent if this context is later
+    // reused through scheduleFrames(). The embedded path needs no timeline.
+    this->idx += 1 + this->destImages.size();
+    this->fidx++;
+}
+
+void Instance::recordFrame(Context& context,
+        const vk::CommandBuffer& commandBuffer) {
+    try {
+        context.recordFrame(commandBuffer);
+    } catch (const std::exception& e) {
+        throw backend::error("Unable to record frame-generation passes", e);
+    }
 }
 
 void Instance::closeContext(const Context& context) {

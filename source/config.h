@@ -17,6 +17,7 @@
 #define GAMES_DIR       DATA_ROOT "/games"
 #define CHEATS_DIR      DATA_ROOT "/cheats"
 #define SCRIPTS_DIR     DATA_ROOT "/scripts"
+#define SHADERS_DIR     DATA_ROOT "/shaders"
 #define SLOT2_DIR       DATA_ROOT "/slot2"
 #define MICROPHONE_DIR  DATA_ROOT "/microphone"
 #define SAVESTATES_DIR  USER_DIR "/savestates"

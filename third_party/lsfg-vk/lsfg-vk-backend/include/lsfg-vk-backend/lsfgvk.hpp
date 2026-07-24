@@ -15,7 +15,7 @@
 
 #include <vulkan/vulkan_core.h>
 
-namespace vk { class Vulkan; }
+namespace vk { class CommandBuffer; class Vulkan; }
 
 namespace lsfgvk::backend {
 
@@ -148,6 +148,11 @@ namespace lsfgvk::backend {
         /// @throws backend::error on failure
         ///
         void scheduleFrames(Context& context);
+
+        /// Record capture-dependent frame-generation passes into an already recording command
+        /// buffer. Same-queue embedders use this to avoid the backend's intermediate submissions
+        /// and CPU fence wait while retaining scheduleFrames() for the external-memory API.
+        void recordFrame(Context& context, const vk::CommandBuffer& commandBuffer);
 
         ///
         /// Close a frame generation context

@@ -3,10 +3,13 @@
 #include <switch.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "config.h"
+#include "drastic_custom_shader.h"
 #include "drastic_dfx.h"
 #include "drastic_dfx_gl_generated.h"
 #include "drastic_renderer.h"
@@ -31,7 +34,7 @@ typedef struct {
   GLint texture_size;
   GLint target_size;
   GLint time;
-  GLint samplers[3];
+  GLint samplers[DRASTIC_CUSTOM_SHADER_MAX_SAMPLERS];
 } GlProgram;
 
 typedef struct {
@@ -40,6 +43,13 @@ typedef struct {
   int width;
   int height;
 } GlTarget;
+
+typedef struct {
+  DrasticCustomShader shader;
+  GlProgram programs[DRASTIC_CUSTOM_SHADER_MAX_PASSES];
+  GlTarget textures[2][DRASTIC_CUSTOM_SHADER_MAX_TEXTURES];
+  int valid;
+} GlCustomState;
 
 static EGLDisplay g_display = EGL_NO_DISPLAY;
 static EGLSurface g_surface = EGL_NO_SURFACE;
@@ -61,6 +71,8 @@ static int g_texture_height;
 static DrasticVideoFilter g_filtered_filter = DRASTIC_FILTER_COUNT;
 static int g_filter_valid[2];
 static unsigned g_frames;
+static GlCustomState g_custom;
+static char g_renderer_error[512];
 
 static const char *const g_vertex_sources[DRASTIC_DFX_SHADER_COUNT] = {
   dfx_copy_vertex_source,
@@ -136,7 +148,8 @@ static GLuint compile_shader(GLenum type, const char *source) {
 
 static int create_program(GlProgram *program, const char *vertex_source,
                           const char *fragment_source,
-                          const char *const sampler_names[3]) {
+                          const char *const *sampler_names,
+                          int sampler_count) {
   GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_source);
   GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
   if (!vertex || !fragment) {
@@ -152,7 +165,11 @@ static int create_program(GlProgram *program, const char *vertex_source,
   glDeleteShader(fragment);
   GLint linked = GL_FALSE;
   glGetProgramiv(program->id, GL_LINK_STATUS, &linked);
-  if (!linked) return 0;
+  if (!linked) {
+    glDeleteProgram(program->id);
+    program->id = 0;
+    return 0;
+  }
   program->position = glGetAttribLocation(program->id,
                                            "a_vertex_coordinate");
   program->texcoord = glGetAttribLocation(program->id,
@@ -162,22 +179,102 @@ static int create_program(GlProgram *program, const char *vertex_source,
   program->target_size = glGetUniformLocation(program->id,
                                                "u_target_size");
   program->time = glGetUniformLocation(program->id, "u_time");
-  for (int index = 0; index < 3; index++) {
-    program->samplers[index] = sampler_names && sampler_names[index]
+  for (int index = 0; index < DRASTIC_CUSTOM_SHADER_MAX_SAMPLERS; index++) {
+    program->samplers[index] = sampler_names && index < sampler_count &&
+        sampler_names[index]
         ? glGetUniformLocation(program->id, sampler_names[index]) : -1;
   }
-  return program->position >= 0 && program->texcoord >= 0;
+  if (program->position >= 0 && program->texcoord >= 0) return 1;
+  glDeleteProgram(program->id);
+  program->id = 0;
+  return 0;
 }
 
 static int create_programs(void) {
   for (int shader = 0; shader < DRASTIC_DFX_SHADER_COUNT; shader++) {
     if (!create_program(&g_programs[shader], g_vertex_sources[shader],
                         g_fragment_sources[shader],
-                        g_sampler_names[shader])) return 0;
+                        g_sampler_names[shader], 3)) return 0;
   }
   const char *overlay_samplers[3] = {"u_texture", NULL, NULL};
   return create_program(&g_overlay_program, overlay_vertex_source,
-                        overlay_fragment_source, overlay_samplers);
+                        overlay_fragment_source, overlay_samplers, 1);
+}
+
+static void set_renderer_error(const char *format, ...) {
+  va_list arguments;
+  va_start(arguments, format);
+  vsnprintf(g_renderer_error, sizeof(g_renderer_error), format, arguments);
+  va_end(arguments);
+  g_renderer_error[sizeof(g_renderer_error) - 1] = '\0';
+}
+
+static GLuint compile_custom_stage(GLenum type, const char *source,
+                                   const char *path, int pass_index) {
+  GLuint shader = glCreateShader(type);
+  glShaderSource(shader, 1, &source, NULL);
+  glCompileShader(shader);
+  GLint compiled = GL_FALSE;
+  glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+  if (compiled) return shader;
+  char log[320] = {0};
+  GLsizei length = 0;
+  glGetShaderInfoLog(shader, sizeof(log), &length, log);
+  set_renderer_error("%s pass %d %s shader: %s", path, pass_index + 1,
+                     type == GL_VERTEX_SHADER ? "vertex" : "fragment",
+                     length ? log : "compilation failed");
+  glDeleteShader(shader);
+  return 0;
+}
+
+static int create_custom_program(GlProgram *program,
+                                 const DrasticCustomPass *pass,
+                                 const char *path, int pass_index) {
+  GLuint vertex = compile_custom_stage(GL_VERTEX_SHADER,
+      pass->vertex_source, path, pass_index);
+  GLuint fragment = compile_custom_stage(GL_FRAGMENT_SHADER,
+      pass->fragment_source, path, pass_index);
+  if (!vertex || !fragment) {
+    if (vertex) glDeleteShader(vertex);
+    if (fragment) glDeleteShader(fragment);
+    return 0;
+  }
+  program->id = glCreateProgram();
+  glAttachShader(program->id, vertex);
+  glAttachShader(program->id, fragment);
+  glLinkProgram(program->id);
+  glDeleteShader(vertex);
+  glDeleteShader(fragment);
+  GLint linked = GL_FALSE;
+  glGetProgramiv(program->id, GL_LINK_STATUS, &linked);
+  if (!linked) {
+    char log[320] = {0};
+    GLsizei length = 0;
+    glGetProgramInfoLog(program->id, sizeof(log), &length, log);
+    set_renderer_error("%s pass %d link: %s", path, pass_index + 1,
+                       length ? log : "link failed");
+    glDeleteProgram(program->id);
+    program->id = 0;
+    return 0;
+  }
+  program->position = glGetAttribLocation(program->id,
+                                           "a_vertex_coordinate");
+  program->texcoord = glGetAttribLocation(program->id,
+                                           "a_texture_coordinate");
+  program->texture_size = glGetUniformLocation(program->id,
+                                                "u_texture_size");
+  program->target_size = glGetUniformLocation(program->id,
+                                               "u_target_size");
+  program->time = glGetUniformLocation(program->id, "u_time");
+  for (int index = 0; index < DRASTIC_CUSTOM_SHADER_MAX_SAMPLERS; index++)
+    program->samplers[index] = index < pass->sampler_count
+        ? glGetUniformLocation(program->id, pass->sampler_names[index]) : -1;
+  if (program->position >= 0 && program->texcoord >= 0) return 1;
+  set_renderer_error("%s pass %d is missing the DraStic vertex attributes",
+                     path, pass_index + 1);
+  glDeleteProgram(program->id);
+  program->id = 0;
+  return 0;
 }
 
 static void set_texture_filter(GLuint texture, DrasticDfxSampler sampler) {
@@ -249,6 +346,127 @@ static int create_lookup_texture(GLuint *texture, int width, int height,
   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
   return glGetError() == GL_NO_ERROR;
 }
+
+static GLenum custom_gl_format(DrasticCustomPixelFormat format) {
+  switch (format) {
+    case DRASTIC_CUSTOM_FORMAT_ALPHA: return GL_ALPHA;
+    case DRASTIC_CUSTOM_FORMAT_LUMINANCE: return GL_LUMINANCE;
+    case DRASTIC_CUSTOM_FORMAT_LUMINANCE_ALPHA: return GL_LUMINANCE_ALPHA;
+    case DRASTIC_CUSTOM_FORMAT_RGB: return GL_RGB;
+    case DRASTIC_CUSTOM_FORMAT_RGBA: return GL_RGBA;
+    case DRASTIC_CUSTOM_FORMAT_RED: return (GLenum)0x1903; /* GL_RED_EXT */
+    case DRASTIC_CUSTOM_FORMAT_RG: return (GLenum)0x8227; /* GL_RG_EXT */
+  }
+  return 0;
+}
+
+static void destroy_custom_state(GlCustomState *state) {
+  if (!state) return;
+  for (int pass = 0; pass < DRASTIC_CUSTOM_SHADER_MAX_PASSES; pass++)
+    if (state->programs[pass].id)
+      glDeleteProgram(state->programs[pass].id);
+  for (int screen = 0; screen < 2; screen++) {
+    for (int index = 0; index < DRASTIC_CUSTOM_SHADER_MAX_TEXTURES; index++) {
+      GlTarget *texture = &state->textures[screen][index];
+      if (texture->framebuffer)
+        glDeleteFramebuffers(1, &texture->framebuffer);
+      if (texture->texture)
+        glDeleteTextures(1, &texture->texture);
+    }
+  }
+  drastic_custom_shader_destroy(&state->shader);
+  memset(state, 0, sizeof(*state));
+}
+
+static int create_custom_raw_texture(GlTarget *target,
+                                     const DrasticCustomTexture *source) {
+  const GLenum format = custom_gl_format(source->format);
+  if (!format || !source->pixels) return 0;
+  target->width = source->width;
+  target->height = source->height;
+  glGenTextures(1, &target->texture);
+  glBindTexture(GL_TEXTURE_2D, target->texture);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                  source->min_linear ? GL_LINEAR : GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                  source->mag_linear ? GL_LINEAR : GL_NEAREST);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexImage2D(GL_TEXTURE_2D, 0, format, source->width, source->height, 0,
+               format, GL_UNSIGNED_BYTE, source->pixels);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  return glGetError() == GL_NO_ERROR;
+}
+
+static int build_custom_state(GlCustomState *state) {
+  for (int pass = 0; pass < state->shader.pass_count; pass++)
+    if (!create_custom_program(&state->programs[pass],
+                               &state->shader.passes[pass],
+                               state->shader.relative_path, pass)) return 0;
+
+  for (int index = 0; index < state->shader.texture_count; index++) {
+    const DrasticCustomTexture *texture = &state->shader.textures[index];
+    if (texture->kind == DRASTIC_CUSTOM_TEXTURE_RAW) {
+      if (!create_custom_raw_texture(&state->textures[0][index], texture)) {
+        set_renderer_error("%s texture %d could not be uploaded",
+                           state->shader.relative_path, index);
+        return 0;
+      }
+    } else if (texture->kind == DRASTIC_CUSTOM_TEXTURE_TARGET &&
+               texture->output_scale) {
+      const int width = g_texture_width * texture->output_scale;
+      const int height = g_texture_height * texture->output_scale;
+      if (width > 4096 || height > 4096) {
+        set_renderer_error("%s texture %d exceeds the GPU size limit",
+                           state->shader.relative_path, index);
+        return 0;
+      }
+      for (int screen = 0; screen < 2; screen++) {
+        if (!create_target(&state->textures[screen][index], width, height)) {
+          set_renderer_error("%s texture %d framebuffer is incomplete",
+                             state->shader.relative_path, index);
+          return 0;
+        }
+      }
+    }
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  state->valid = 1;
+  return 1;
+}
+
+bool drastic_renderer_set_custom_shader(const char *relative_path,
+                                        char *error, size_t error_size) {
+  if (g_custom.valid && relative_path &&
+      !strcmp(g_custom.shader.relative_path, relative_path)) {
+    if (error && error_size) error[0] = '\0';
+    return true;
+  }
+  GlCustomState next;
+  memset(&next, 0, sizeof(next));
+  g_renderer_error[0] = '\0';
+  if (!drastic_custom_shader_load(
+          relative_path, DRASTIC_CUSTOM_SHADER_LOAD_SOURCES |
+                             DRASTIC_CUSTOM_SHADER_LOAD_PIXELS,
+          &next.shader, g_renderer_error, sizeof(g_renderer_error)) ||
+      !build_custom_state(&next)) {
+    if (!g_renderer_error[0])
+      set_renderer_error("Could not load the custom shader");
+    destroy_custom_state(&next);
+    if (error && error_size)
+      snprintf(error, error_size, "%s", g_renderer_error);
+    return false;
+  }
+  destroy_custom_state(&g_custom);
+  g_custom = next;
+  g_filter_valid[0] = g_filter_valid[1] = 0;
+  g_renderer_error[0] = '\0';
+  if (error && error_size) error[0] = '\0';
+  return true;
+}
+
+const char *drastic_renderer_last_error(void) { return g_renderer_error; }
 
 static GlTarget *work_target(int screen, DrasticDfxTextureRole role) {
   switch (role) {
@@ -323,6 +541,89 @@ static int render_filter_chain(int screen, const DrasticDfxChain *chain) {
   return 1;
 }
 
+static GlTarget *custom_texture_target(int screen, int texture_index) {
+  if (texture_index < 0 || texture_index >= g_custom.shader.texture_count)
+    return NULL;
+  const DrasticCustomTexture *texture =
+      &g_custom.shader.textures[texture_index];
+  if (texture->kind == DRASTIC_CUSTOM_TEXTURE_RAW)
+    return &g_custom.textures[0][texture_index];
+  if (texture->kind == DRASTIC_CUSTOM_TEXTURE_TARGET)
+    return &g_custom.textures[screen][texture_index];
+  return NULL;
+}
+
+static GLuint custom_texture_id(int screen, int texture_index) {
+  const DrasticCustomTexture *texture =
+      &g_custom.shader.textures[texture_index];
+  if (texture->kind == DRASTIC_CUSTOM_TEXTURE_FRAMEBUFFER)
+    return g_textures[screen];
+  GlTarget *target = custom_texture_target(screen, texture_index);
+  return target ? target->texture : 0;
+}
+
+static void custom_texture_dimensions(int screen, int texture_index,
+                                      int *width, int *height) {
+  const DrasticCustomTexture *texture =
+      &g_custom.shader.textures[texture_index];
+  if (texture->kind == DRASTIC_CUSTOM_TEXTURE_FRAMEBUFFER) {
+    *width = g_texture_width;
+    *height = g_texture_height;
+    return;
+  }
+  GlTarget *target = custom_texture_target(screen, texture_index);
+  *width = target ? target->width : 1;
+  *height = target ? target->height : 1;
+}
+
+static void bind_custom_texture(int screen, int texture_index, int unit) {
+  const DrasticCustomTexture *texture =
+      &g_custom.shader.textures[texture_index];
+  glActiveTexture((GLenum)(GL_TEXTURE0 + unit));
+  glBindTexture(GL_TEXTURE_2D, custom_texture_id(screen, texture_index));
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                  texture->min_linear ? GL_LINEAR : GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                  texture->mag_linear ? GL_LINEAR : GL_NEAREST);
+}
+
+static int render_custom_intermediate(int screen, int pass_index) {
+  const DrasticCustomPass *pass = &g_custom.shader.passes[pass_index];
+  GlTarget *output = custom_texture_target(screen, pass->output_texture);
+  if (!output || !output->framebuffer || !pass->sampler_count) return 0;
+  int input_width, input_height;
+  custom_texture_dimensions(screen, pass->sampler_textures[0],
+                            &input_width, &input_height);
+  static const Vertex vertices[6] = {
+    {-1.0f, -1.0f, 0.0f, 0.0f}, {-1.0f,  1.0f, 0.0f, 1.0f},
+    { 1.0f,  1.0f, 1.0f, 1.0f}, {-1.0f, -1.0f, 0.0f, 0.0f},
+    { 1.0f,  1.0f, 1.0f, 1.0f}, { 1.0f, -1.0f, 1.0f, 0.0f},
+  };
+  const GlProgram *program = &g_custom.programs[pass_index];
+  glBindFramebuffer(GL_FRAMEBUFFER, output->framebuffer);
+  glViewport(0, 0, output->width, output->height);
+  glDisable(GL_BLEND);
+  glDisable(GL_SCISSOR_TEST);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  glClear(GL_COLOR_BUFFER_BIT);
+  bind_geometry(program, vertices);
+  set_program_parameters(program, input_width, input_height,
+                         output->width, output->height);
+  for (int sampler = 0; sampler < pass->sampler_count; sampler++) {
+    bind_custom_texture(screen, pass->sampler_textures[sampler], sampler);
+    if (program->samplers[sampler] >= 0)
+      glUniform1i(program->samplers[sampler], sampler);
+  }
+  glDrawArrays(GL_TRIANGLES, 0, 6);
+  return glGetError() == GL_NO_ERROR;
+}
+
+static int render_custom_chain(int screen) {
+  for (int pass = 0; pass + 1 < g_custom.shader.pass_count; pass++)
+    if (!render_custom_intermediate(screen, pass)) return 0;
+  return 1;
+}
+
 static void uv_for_rotation(int rotation, float *tl_u, float *tl_v,
                             float *tr_u, float *tr_v,
                             float *bl_u, float *bl_v,
@@ -350,6 +651,27 @@ static void make_rect_vertices(const DrasticScreenRect *rect, int rotation,
   vertices[3]=(Vertex){left,top,tlu,tlv};
   vertices[4]=(Vertex){right,bottom,bru,brv};
   vertices[5]=(Vertex){right,top,tru,trv};
+}
+
+static void draw_custom_screen(const DrasticScreenRect *rect, int rotation) {
+  const int screen = rect->screen ? 1 : 0;
+  const int pass_index = g_custom.shader.pass_count - 1;
+  const DrasticCustomPass *pass = &g_custom.shader.passes[pass_index];
+  const GlProgram *program = &g_custom.programs[pass_index];
+  int input_width, input_height;
+  custom_texture_dimensions(screen, pass->sampler_textures[0],
+                            &input_width, &input_height);
+  Vertex vertices[6];
+  make_rect_vertices(rect, rotation, vertices);
+  bind_geometry(program, vertices);
+  set_program_parameters(program, input_width, input_height,
+                         (int)rect->width, (int)rect->height);
+  for (int sampler = 0; sampler < pass->sampler_count; sampler++) {
+    bind_custom_texture(screen, pass->sampler_textures[sampler], sampler);
+    if (program->samplers[sampler] >= 0)
+      glUniform1i(program->samplers[sampler], sampler);
+  }
+  glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
 static void draw_screen(const DrasticScreenRect *rect, int rotation,
@@ -447,6 +769,7 @@ static void draw_stylus_cursor(const DrasticRuntimeConfig *config) {
 }
 
 bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
+  g_renderer_error[0] = '\0';
   g_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
   if (g_display == EGL_NO_DISPLAY || !eglInitialize(g_display, NULL, NULL))
     return false;
@@ -472,6 +795,14 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
                                context_attributes);
   if (g_context == EGL_NO_CONTEXT ||
       !eglMakeCurrent(g_display, g_surface, g_surface, g_context)) return false;
+  EGLint surface_width = 0;
+  EGLint surface_height = 0;
+  if (eglQuerySurface(g_display, g_surface, EGL_WIDTH, &surface_width) &&
+      eglQuerySurface(g_display, g_surface, EGL_HEIGHT, &surface_height) &&
+      surface_width > 0 && surface_height > 0) {
+    panel_width = screen_width = surface_width;
+    panel_height = screen_height = surface_height;
+  }
   eglSwapInterval(g_display, 1);
   if (!create_programs()) return false;
   glGenBuffers(1, &g_vbo);
@@ -517,6 +848,9 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   g_filtered_filter = DRASTIC_FILTER_COUNT;
   g_filter_valid[0] = g_filter_valid[1] = 0;
   g_frames = 0;
+  if (config->video_filter == DRASTIC_FILTER_CUSTOM &&
+      !drastic_renderer_set_custom_shader(config->custom_shader, NULL, 0))
+    return false;
   return glGetError() == GL_NO_ERROR;
 }
 
@@ -535,18 +869,23 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
     g_filter_valid[0] = g_filter_valid[1] = 0;
   }
 
-  const DrasticDfxChain *chain = drastic_dfx_chain(config->video_filter);
+  const int custom = config->video_filter == DRASTIC_FILTER_CUSTOM;
+  if (custom && !g_custom.valid) return;
+  const DrasticDfxChain *chain = custom ? NULL :
+      drastic_dfx_chain(config->video_filter);
   if (g_filtered_filter != config->video_filter) {
     g_filtered_filter = config->video_filter;
     g_filter_valid[0] = g_filter_valid[1] = 0;
   }
-  if (chain->pass_count) {
+  if (custom || chain->pass_count) {
     int needed[2] = {0, 0};
     for (int index = 0; index < config->screen_count; index++)
       needed[config->screens[index].screen ? 1 : 0] = 1;
     for (int screen = 0; screen < 2; screen++)
       if (needed[screen] && !g_filter_valid[screen]) {
-        if (!render_filter_chain(screen, chain)) return;
+        if (custom) {
+          if (!render_custom_chain(screen)) return;
+        } else if (!render_filter_chain(screen, chain)) return;
         g_filter_valid[screen] = 1;
       }
   }
@@ -560,8 +899,12 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
   glViewport(0, 0, panel_width, panel_height);
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT);
-  for (int index = 0; index < config->screen_count; index++)
-    draw_screen(&config->screens[index], config->rotation, chain);
+  for (int index = 0; index < config->screen_count; index++) {
+    if (custom)
+      draw_custom_screen(&config->screens[index], config->rotation);
+    else
+      draw_screen(&config->screens[index], config->rotation, chain);
+  }
   draw_stylus_cursor(config);
   if (overlay && overlay->visible && upload_overlay(overlay))
     draw_overlay(config->rotation);
@@ -573,6 +916,7 @@ void drastic_renderer_shutdown(void) {
   if (g_display == EGL_NO_DISPLAY) return;
   if (g_context != EGL_NO_CONTEXT) {
     eglMakeCurrent(g_display, g_surface, g_surface, g_context);
+    destroy_custom_state(&g_custom);
     glDeleteTextures(SCREEN_TEXTURE_COUNT, g_textures);
     for (int screen = 0; screen < SCREEN_TEXTURE_COUNT; screen++) {
       for (int work = 0; work < WORK_TEXTURE_COUNT; work++) {

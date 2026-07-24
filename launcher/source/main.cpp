@@ -47,6 +47,9 @@ static const char *DEF_GAMEDIR= "sdmc:/switch/drastic/games";
 static const char *SYSTEM_DIR = "sdmc:/switch/drastic/system";
 static const char *USER_DIR   = "sdmc:/switch/drastic/user";
 static const char *CACHE_DIR  = "sdmc:/switch/drastic/cache";
+static const char *SHADERS_DIR= "sdmc:/switch/drastic/shaders";
+static const char *BUNDLED_SHADERS_DIR=
+    "sdmc:/switch/drastic/shaders/Bundled";
 static const char *LSFG_DIR   = "sdmc:/switch/drastic/lsfg";
 static const char *EMU_HOST_DIR = "sdmc:/switch/drastic/.emu";
 static const char *LSFG_DLL_FILE =
@@ -272,7 +275,7 @@ static const char *iniGet(const char *key, const char *def) {
 static void iniSet(const char *key, const char *val) { storeSet(*g_active, key, val); }
 
 enum OType { OT_CHOICE, OT_RANGE, OT_SCALED_RANGE, OT_SUBMENU, OT_TEXT,
-             OT_HOTKEY, OT_STATUS };
+             OT_HOTKEY, OT_STATUS, OT_SHADER };
 struct Choice { const char *label, *val; };
 struct Opt {
   const char *label;
@@ -298,6 +301,7 @@ struct Opt {
 #define O_TEXTG(l,k,d,gk,go)   { l, k, OT_TEXT, nullptr,0, 0,0,0, d, 0, gk, go, 1, nullptr }
 #define O_HOTKEY(l,k,d)        { l, k, OT_HOTKEY, nullptr,0, 0,0,0, d, 0, nullptr, nullptr, 1, nullptr }
 #define O_STATUS(l)            { l, nullptr, OT_STATUS, nullptr,0, 0,0,0, nullptr, 0, nullptr, nullptr, 1, nullptr }
+#define O_SHADER(l,k,d)        { l, k, OT_SHADER, nullptr,0, 0,0,0, d, 0, nullptr, nullptr, 1, nullptr }
 
 static char g_autoFirmwareLanguage[32] = "Auto (English)";
 
@@ -339,10 +343,11 @@ static const Choice C_layout[]   = { {"Vertical","vertical"}, {"Horizontal","hor
                                      {"Hybrid (top large)","hybrid_top"}, {"Hybrid (touch large)","hybrid_bottom"},
                                      {"Custom (in-game editor)","custom"} };
 static const Choice C_rotation[] = { {"0 degrees","0"}, {"90 degrees","1"}, {"180 degrees","2"}, {"270 degrees","3"} };
-static const Choice C_filter[]   = { {"Nearest","nearest"}, {"Linear","linear"},
+  static const Choice C_filter[]   = { {"Nearest","nearest"}, {"Linear","linear"},
                                      {"Quilez smooth","quilez"}, {"Scanline","scanline"},
                                      {"Scale2x","scale2x"}, {"HQ2x","hq2x"}, {"FXAA","fxaa"},
-                                     {"FXAA high quality","fxaa_hq"}, {"SMAA","smaa"} };
+                                     {"FXAA high quality","fxaa_hq"}, {"SMAA","smaa"},
+                                     {"Custom shader","custom"} };
 static const Choice C_latency[]  = { {"Low","0"}, {"Balanced","1"}, {"High compatibility","2"}, {"Maximum","3"} };
 static const Choice C_micLevel[] = { {"Low","0"}, {"Normal","1"}, {"High","2"}, {"Maximum","3"} };
 static const Choice C_threads[]  = { {"1","1"}, {"2","2"}, {"3 (recommended)","3"} };
@@ -379,7 +384,8 @@ static const Opt S_graphics[] = {
   O_CHOICE("Rotation",          "Wrapper/Rotation", C_rotation, "0"),
   O_RANGE ("Screen gap",        "Wrapper/ScreenGap", 0, 128, 2, "8"),
   O_CHOICE("Integer scaling",   "Wrapper/IntegerScale", C_bool, "false"),
-  O_CHOICE("Drastic filter chain", "Wrapper/VideoFilter", C_filter, "nearest"),
+  O_CHOICE("Drastic filter",       "Wrapper/VideoFilter", C_filter, "nearest"),
+  O_SHADER("Custom shader...",     "Wrapper/CustomShader", ""),
   O_CHOICE("Show FPS",          "Drastic/ShowFPS", C_bool, "false"),
   O_SUB   ("3D and display options...", SCR_ENHANCE),
 };
@@ -498,7 +504,8 @@ static void commitAll() {
     for (int i = 0; i < g_screens[s].n; i++) {
       const Opt &o = g_screens[s].opts[i];
       if (o.key && (o.type == OT_CHOICE || o.type == OT_RANGE || o.type == OT_SCALED_RANGE ||
-                    o.type == OT_TEXT || o.type == OT_HOTKEY)) {
+                    o.type == OT_TEXT || o.type == OT_HOTKEY ||
+                    o.type == OT_SHADER)) {
         std::string v = iniGet(o.key, o.def);
         iniSet(o.key, v.c_str());
       }
@@ -2552,6 +2559,143 @@ static void runFileManager() {
   runFileBrowser({},BrowserMode::Manage);
 }
 
+struct CustomShaderInfo {
+  std::string name;
+  std::string relative;
+  int passes=0;
+  bool vulkanReady=false;
+};
+
+static bool readSmallTextFile(const std::string &path,std::string &text) {
+  FILE *file=fopen(path.c_str(),"rb");
+  if(!file) return false;
+  if(fseek(file,0,SEEK_END)!=0){ fclose(file); return false; }
+  long size=ftell(file);
+  if(size<0||size>2*1024*1024||fseek(file,0,SEEK_SET)!=0){ fclose(file); return false; }
+  text.resize((size_t)size);
+  bool ok=!size||fread(text.data(),1,(size_t)size,file)==(size_t)size;
+  fclose(file);
+  if(!ok||text.find('\0')!=std::string::npos){ text.clear(); return false; }
+  return true;
+}
+
+static bool spirvFileReady(const std::string &path) {
+  FILE *file=fopen(path.c_str(),"rb");
+  if(!file) return false;
+  unsigned char magic[4]={};
+  bool ok=fread(magic,1,sizeof(magic),file)==sizeof(magic)&&
+      magic[0]==0x03&&magic[1]==0x02&&magic[2]==0x23&&magic[3]==0x07;
+  fclose(file);
+  return ok;
+}
+
+static bool parseCustomShaderInfo(const std::string &absolute,
+                                  const std::string &relative,
+                                  CustomShaderInfo &info) {
+  std::string text;
+  if(!readSmallTextFile(absolute,text)) return false;
+  size_t options=text.find("<options>");
+  size_t optionsEnd=options==std::string::npos?std::string::npos:
+      text.find("</options>",options+9);
+  if(optionsEnd==std::string::npos) return false;
+  std::string body=text.substr(options+9,optionsEnd-options-9);
+  size_t cursor=0;
+  while(cursor<=body.size()){
+    size_t end=body.find('\n',cursor);
+    std::string line=trim(body.substr(cursor,end==std::string::npos?
+        std::string::npos:end-cursor));
+    size_t comment=line.find("//"); if(comment!=std::string::npos) line.erase(comment);
+    size_t equals=line.find('=');
+    if(equals!=std::string::npos&&trim(line.substr(0,equals))=="name")
+      info.name=trim(line.substr(equals+1));
+    if(end==std::string::npos) break;
+    cursor=end+1;
+  }
+  if(info.name.empty()||info.name.size()>95) return false;
+  cursor=0;
+  while((cursor=text.find("<pass>",cursor))!=std::string::npos){ info.passes++; cursor+=6; }
+  if(info.passes<1||info.passes>16) return false;
+  info.relative=relative;
+  info.vulkanReady=true;
+  const std::string pack=absolute+".nxvk/pass";
+  for(int pass=0;pass<info.passes;pass++){
+    const std::string base=pack+std::to_string(pass);
+    if(!spirvFileReady(base+".vert.spv")||!spirvFileReady(base+".frag.spv")){
+      info.vulkanReady=false;
+      break;
+    }
+  }
+  return true;
+}
+
+static void scanCustomShaderDirectory(const std::string &absolute,
+                                      const std::string &relative,int depth,
+                                      std::vector<CustomShaderInfo> &shaders) {
+  if(depth>8||shaders.size()>=512) return;
+  DIR *directory=opendir(absolute.c_str()); if(!directory) return;
+  while(dirent *entry=readdir(directory)){
+    if(!strcmp(entry->d_name,".")||!strcmp(entry->d_name,"..")) continue;
+    std::string name=entry->d_name;
+    std::string childAbsolute=absolute+"/"+name;
+    std::string childRelative=relative.empty()?name:relative+"/"+name;
+    struct stat status{}; if(stat(childAbsolute.c_str(),&status)!=0) continue;
+    if(S_ISDIR(status.st_mode)){
+      if(name.size()>=5&&!strcasecmp(name.c_str()+name.size()-5,".nxvk")) continue;
+      scanCustomShaderDirectory(childAbsolute,childRelative,depth+1,shaders);
+    }else if(S_ISREG(status.st_mode)&&name.size()>=4&&
+             !strcasecmp(name.c_str()+name.size()-4,".dfx")){
+      CustomShaderInfo shader;
+      if(parseCustomShaderInfo(childAbsolute,childRelative,shader))
+        shaders.push_back(std::move(shader));
+    }
+  }
+  closedir(directory);
+}
+
+static std::vector<CustomShaderInfo> customShaderList() {
+  std::vector<CustomShaderInfo> shaders;
+  scanCustomShaderDirectory(SHADERS_DIR,{},0,shaders);
+  std::sort(shaders.begin(),shaders.end(),[](const auto &left,const auto &right){
+    return strcasecmp(left.name.c_str(),right.name.c_str())<0;
+  });
+  return shaders;
+}
+
+static std::string customShaderValue(const char *value) {
+  if(!value||!*value) return "(not selected)";
+  const char *slash=strrchr(value,'/');
+  std::string name=slash?slash+1:value;
+  if(name.size()>4&&!strcasecmp(name.c_str()+name.size()-4,".dfx"))
+    name.resize(name.size()-4);
+  return name;
+}
+
+static bool validateCustomShaderSelection(const Store &settings,
+                                          const std::string &renderer,
+                                          std::string &error) {
+  auto value=[&](const char *key,const char *fallback){
+    for(const KV &entry:settings.kv) if(entry.k==key) return entry.v.c_str();
+    return fallback;
+  };
+  if(strcmp(value("Wrapper/VideoFilter","nearest"),"custom")) return true;
+  const char *selected=value("Wrapper/CustomShader","");
+  if(!selected||!*selected){
+    error="Select a custom shader in Settings -> Graphics";
+    return false;
+  }
+  std::vector<CustomShaderInfo> shaders=customShaderList();
+  for(const CustomShaderInfo &shader:shaders){
+    if(shader.relative!=selected) continue;
+    if(renderer=="vk"&&!shader.vulkanReady){
+      error="Custom shader Vulkan pack is missing";
+      return false;
+    }
+    return true;
+  }
+  error="Selected custom .dfx is missing or invalid";
+  return false;
+}
+
 static int choiceIdx(const Opt &o) {
   const char *cur = iniGet(o.key, o.def);
   for (int i=0;i<o.nch;i++) if (!strcmp(o.ch[i].val, cur)) return i;
@@ -2574,6 +2718,7 @@ static void optValue(const Opt &o, char *out, int n) {
   else if (o.type==OT_TEXT){ const char *v=iniGet(o.key,o.def); snprintf(out,n,"%s", (v&&*v)?v:"(auto)"); }
   else if (o.type==OT_HOTKEY){ const char *v=iniGet(o.key,o.def); snprintf(out,n,"%s", (v&&*v)?v:"None"); }
   else if (o.type==OT_STATUS) snprintf(out,n,"%s",lsfgDllInstalled()?"Installed":"Missing");
+  else if (o.type==OT_SHADER) snprintf(out,n,"%s",customShaderValue(iniGet(o.key,o.def)).c_str());
   else if (o.type==OT_SUBMENU) snprintf(out,n,">");
 }
 static void optAdjust(const Opt &o, int dir) {
@@ -2740,8 +2885,11 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
     SDL_Color lc = !en?(SDL_Color){92,98,110,255}:(cur?COL_VAL:COL_TXT);
     SDL_Color vc = !en?(SDL_Color){92,98,110,255}:(cur?COL_VAL:COL_DIM);
     drawText(g_font,labelX,y,S.opts[i].label,lc);
-    char v[96]; optValue(S.opts[i],v,sizeof(v));
-    drawTextR(g_font,valX,y,v,vc);
+    char v[256]; optValue(S.opts[i],v,sizeof(v));
+    if(S.opts[i].type==OT_SHADER)
+      drawScrollTextR(g_font,valX,y,colW/2-40,v,vc);
+    else
+      drawTextR(g_font,valX,y,v,vc);
   }
   if(S.n>vis){
     int trH=vis*ROW_H, trX=colX+colW+16, trY=LIST_Y0-2;
@@ -2789,7 +2937,14 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
     for(int r=0;r<vis && top+r<n;r++){
       int i=top+r, y=ly+r*rowH; bool curr=(i==sel);
       if(curr){ fillRect(px+8,y,pw-16,rowH-4,COL_FOCUS); fillRect(px+8,y,5,rowH-4,COL_SEL); }
-      drawText(g_font, px+34, y+(rowH-TTF_FontHeight(g_font))/2, labels[i], curr?COL_VAL:COL_TXT);
+      const int textX=px+34;
+      const int textY=y+(rowH-TTF_FontHeight(g_font))/2;
+      const int textWidth=pw-76;
+      if(curr)
+        drawScrollTextL(g_font,textX,textY,textWidth,labels[i],COL_VAL);
+      else
+        drawText(g_font,textX,textY,
+                 ellipsizedText(g_font,labels[i],textWidth).c_str(),COL_TXT);
     }
     if(n>vis){ int trH=vis*rowH,trX=px+pw-12,trY=ly; fillRect(trX,trY,4,trH,(SDL_Color){40,44,54,255});
       int thH=trH*vis/n,dn=(n-vis>0?n-vis:1); fillRect(trX,trY+(trH-thH)*top/dn,4,thH,COL_SEL); }
@@ -2804,6 +2959,41 @@ static void optChoosePopup(const Opt &o) {
   for(int i=0;i<n;i++) labels[i]=o.ch[i].label;
   int idx = dropdown(o.label, labels, n, choiceIdx(o));
   if(idx>=0 && idx<o.nch) iniSet(o.key, o.ch[idx].val);
+}
+
+static void chooseCustomShader(const Opt &option) {
+  std::vector<CustomShaderInfo> shaders=customShaderList();
+  if(shaders.empty()){
+    modalMessage("No custom shaders found",
+                 {"Copy DraStic .dfx/.dsd shader files to:",
+                  "/switch/drastic/shaders/"});
+    return;
+  }
+  const bool vulkan=strcmp(iniGet("Wrapper/Renderer","vk"),"gl")!=0;
+  std::vector<std::string> labelStorage;
+  std::vector<const char*> labels;
+  labelStorage.reserve(shaders.size()); labels.reserve(shaders.size());
+  int current=-1;
+  const char *configured=iniGet(option.key,option.def);
+  for(size_t index=0;index<shaders.size();index++){
+    std::string label=shaders[index].name;
+    if(vulkan&&!shaders[index].vulkanReady) label+="  [Vulkan pack missing]";
+    labelStorage.push_back(std::move(label));
+    if(!strcmp(shaders[index].relative.c_str(),configured)) current=(int)index;
+  }
+  for(const std::string &label:labelStorage) labels.push_back(label.c_str());
+  int selected=dropdown("Custom DraStic shader",labels.data(),
+                        (int)labels.size(),current);
+  if(selected<0||selected>=(int)shaders.size()) return;
+  if(vulkan&&!shaders[selected].vulkanReady){
+    modalMessage("Vulkan shader pack missing",
+                 {shaders[selected].name,
+                  "Compile the .dfx with tools/compile_custom_shader.py,",
+                  "then keep its .dfx.nxvk folder beside the shader."});
+    return;
+  }
+  iniSet(option.key,shaders[selected].relative.c_str());
+  iniSet("Wrapper/VideoFilter","custom");
 }
 
 static const Opt *findHotkeyConflict(const Opt &option,
@@ -2865,6 +3055,7 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
         case BTN_CONFIRM: {
           const Opt &o=S.opts[sel];
           if(o.type==OT_SUBMENU){ runSettings(o.sub,pad,ctx); beginScreenFx(); }
+          else if(o.type==OT_SHADER){ chooseCustomShader(o); beginScreenFx(); }
           else if(o.type==OT_TEXT){
             if(optEnabled(o)){
               char buf[128];
@@ -3750,6 +3941,61 @@ static bool extractTree(const std::string &src, const std::string &dst, bool for
 
 static const char *BUILD_STAMP = __DATE__ " " __TIME__;
 static const char *RES_MARKER = "sdmc:/switch/drastic/system/.drastic_build";
+static const char *BUNDLED_SHADER_MARKER =
+    "sdmc:/switch/drastic/shaders/Bundled/.drasticds_nx_build";
+
+static bool bundledShadersPresent() {
+  static const char *manifests[] = {
+    "lcd1x+natural_vision.dfx",
+    "lcd1x+nds_color+natural_vision.dfx",
+    "lcd1x+nds_color.dfx",
+    "lcd1x.dfx",
+    "natural_vision.dfx",
+    "nds_color.dfx",
+    "sharp_bilinear+natural_vision.dfx",
+    "sharp_bilinear+nds_color+natural_vision.dfx",
+    "sharp_bilinear+nds_color.dfx",
+    "sharp_bilinear.dfx",
+    "zfast_lcd+dsi_color.dfx",
+    "zfast_lcd+dslite_color+natural_vision.dfx",
+    "zfast_lcd+dslite_color.dfx",
+    "zfast_lcd+natural_vision.dfx",
+    "zfast_lcd+nds_color+natural_vision.dfx",
+    "zfast_lcd+nds_color.dfx",
+    "zfast_lcd.dfx",
+  };
+  const std::string root=BUNDLED_SHADERS_DIR;
+  if(!regularFileExists(root+"/README.md")||
+     !regularFileExists(root+"/NOTICE.md")||
+     !regularFileExists(root+"/COPYING")) return false;
+  for(const char *manifest:manifests){
+    const std::string dfx=root+"/"+manifest;
+    std::string dsd=dfx.substr(0,dfx.size()-4)+".dsd";
+    const std::string pack=dfx+".nxvk";
+    if(!regularFileExists(dfx)||!regularFileExists(dsd)||
+       !regularFileExists(pack+"/pack.info")||
+       !regularFileExists(pack+"/pass0.vert.spv")||
+       !regularFileExists(pack+"/pass0.frag.spv")) return false;
+  }
+  return true;
+}
+
+static bool ensureBundledShaders() {
+  char current[64]={0};
+  FILE *file=fopen(BUNDLED_SHADER_MARKER,"r");
+  if(file){
+    if(!fgets(current,sizeof(current),file)) current[0]=0;
+    fclose(file);
+  }
+  const std::string marker=std::string("1 ")+BUILD_STAMP;
+  if(trim(current)==marker&&bundledShadersPresent()) return true;
+  toast("Installing bundled custom shaders (one-time)...");
+  const bool ok=extractTree("romfs:/shaders",BUNDLED_SHADERS_DIR,true)&&
+                bundledShadersPresent();
+  if(ok) writeAtomicText(BUNDLED_SHADER_MARKER,marker+"\n");
+  return ok;
+}
+
 static bool ensureResources() {
   char cur[64] = {0};
   FILE *f = fopen(RES_MARKER, "r");
@@ -4109,7 +4355,7 @@ int main(int argc, char **argv){
   g_griddbReady=griddb_global_init();
   if(!g_griddbReady&&R_SUCCEEDED(socketInitializeDefault())) g_storageSocketReady=true;
   const char *directories[]={"sdmc:/switch",DATA_DIR,EMU_HOST_DIR,COVERS_DIR,CORES_DIR,GAMECFG_DIR,DEF_GAMEDIR,SYSTEM_DIR,USER_DIR,CACHE_DIR,LSFG_DIR,
-                             "sdmc:/switch/drastic/cheats","sdmc:/switch/drastic/scripts",
+                             "sdmc:/switch/drastic/cheats","sdmc:/switch/drastic/scripts",SHADERS_DIR,
                              "sdmc:/switch/drastic/slot2","sdmc:/switch/drastic/microphone",
                              "sdmc:/switch/drastic/user/savestates","sdmc:/switch/drastic/user/backup"};
   for(const char *directory:directories) if(!ensureDirectory(directory)) return startupFailure("Could not create the Drastic DS data directories.");
@@ -4158,6 +4404,8 @@ int main(int argc, char **argv){
   }
   applyLauncherAppearance();
   uiAudioSetEnabled(strcmp(storeGet(g_global,"Wrapper/UiSounds","true"),"false")!=0);
+  if(!ensureBundledShaders())
+    return startupFailure("Could not install the bundled custom shaders.");
   std::vector<std::string> gamePaths=loadGameSources();
   bool hasUsbSource=hasConfiguredUsbSource(gamePaths);
   SwitchStorage::InitializeFromConfig(LAUNCHER_INI,hasUsbSource);
@@ -4331,6 +4579,9 @@ int main(int argc, char **argv){
     /* Renderer is a per-game option too, so choose the extracted host from the
        merged launch profile rather than from global settings alone. */
     std::string renderer=!strcmp(storeGet(effective,"Wrapper/Renderer","vk"),"gl")?"gl":"vk";
+    std::string shaderError;
+    const bool shaderReady=validateCustomShaderSelection(
+        effective,renderer,shaderError);
     appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
     std::string coreSource="romfs:/cores/libdrastic_arm64.so";
     std::string coreDestination=std::string(CORES_DIR)+"/libdrastic_arm64.so";
@@ -4370,12 +4621,14 @@ int main(int argc, char **argv){
       lsfgWarning="LSFG disabled: Lossless.dll is missing";
     }
     bool configSaved=storeSave(effective,EMU_INI);
-    willChain=haveCore&&haveEmulator&&haveResources&&haveSystemFiles&&configSaved;
+    willChain=haveCore&&haveEmulator&&haveResources&&haveSystemFiles&&
+              configSaved&&shaderReady;
     if(willChain&&lsfgWarning){
       toast(lsfgWarning);
       SDL_Delay(1800);
     } else if(!willChain){
-      if(!haveSystemFiles) toast("Missing DS BIOS/firmware in /switch/drastic/system");
+      if(!shaderReady) toast(shaderError.c_str());
+      else if(!haveSystemFiles) toast("Missing DS BIOS/firmware in /switch/drastic/system");
       else if(!haveResources) toast("Could not extract Drastic resources (SD full?)");
       else if(!haveCore||!haveEmulator) toast("Could not extract emulator files (SD full?)");
       else toast("Could not write the launch configuration");

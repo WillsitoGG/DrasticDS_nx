@@ -284,7 +284,8 @@ static int make_directory(const char *path) {
 static void setup_directories(void) {
   const char *directories[] = {
     "/switch", DATA_ROOT, SYSTEM_DIR, USER_DIR, CACHE_DIR, GAMES_DIR,
-    CHEATS_DIR, SCRIPTS_DIR, SLOT2_DIR, MICROPHONE_DIR, SAVESTATES_DIR,
+    CHEATS_DIR, SCRIPTS_DIR, SHADERS_DIR, SLOT2_DIR, MICROPHONE_DIR,
+    SAVESTATES_DIR,
     BACKUPS_DIR,
   };
   for (unsigned index = 0; index < sizeof(directories) / sizeof(*directories);
@@ -334,6 +335,16 @@ static void select_panel_size(void) {
     panel_width = screen_width = 1280;
     panel_height = screen_height = 720;
   }
+
+  /* libnx creates the default NWindow at 1280x720 even in console mode.
+   * Configure it before EGL/Vulkan registers any buffers; changing only the
+   * wrapper globals leaves a 720p layer centred inside the 1080p TV output. */
+  NWindow *window = nwindowGetDefault();
+  if (!window || R_FAILED(nwindowSetDimensions(
+          window, (u32)panel_width, (u32)panel_height)) ||
+      R_FAILED(nwindowSetCrop(window, 0, 0, panel_width, panel_height)))
+    fatal_error("Could not configure the %dx%d display surface.",
+                panel_width, panel_height);
 }
 
 enum {
@@ -923,9 +934,17 @@ int main(void) {
   core.setWhitenoiseFeed(fake_env, clazz, 0);
 
   drastic_config_calculate_layout(&runtime, panel_width, panel_height);
-  if (!drastic_renderer_init(&runtime))
+  if (!drastic_renderer_init(&runtime)) {
+    const char *renderer_error = drastic_renderer_last_error();
+    if (renderer_error && renderer_error[0])
+      fatal_error("Could not initialize the %s renderer:\n%s",
+                  DRASTIC_RENDERER == DRASTIC_RENDERER_VK
+                      ? "Vulkan" : "OpenGL",
+                  renderer_error);
     fatal_error("Could not initialize the %s renderer.",
-                DRASTIC_RENDERER == DRASTIC_RENDERER_VK ? "Vulkan" : "OpenGL");
+                DRASTIC_RENDERER == DRASTIC_RENDERER_VK
+                    ? "Vulkan" : "OpenGL");
+  }
   fatal_error_set_graphics_active(1);
   overlay_init(runtime.rotation);
   drastic_config_calculate_layout(&runtime, panel_width, panel_height);

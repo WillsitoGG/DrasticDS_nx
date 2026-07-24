@@ -83,6 +83,7 @@ static void seed_defaults(void) {
   seed("Wrapper/VulkanLowLatency", "false");
   seed("Wrapper/TextureFilter", "nearest");
   seed("Wrapper/VideoFilter", "nearest");
+  seed("Wrapper/CustomShader", "");
   seed("Wrapper/LSFGEnabled", "false");
   seed("Wrapper/LSFGFlowScale", "0.25");
   seed("Wrapper/LSFGPerformance", "true");

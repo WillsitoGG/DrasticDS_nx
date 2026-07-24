@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "drastic_custom_shader.h"
+
 typedef enum {
   DRASTIC_LAYOUT_VERTICAL,
   DRASTIC_LAYOUT_HORIZONTAL,
@@ -24,6 +26,7 @@ typedef enum {
   DRASTIC_FILTER_FXAA,
   DRASTIC_FILTER_FXAA_HQ,
   DRASTIC_FILTER_SMAA,
+  DRASTIC_FILTER_CUSTOM,
   DRASTIC_FILTER_COUNT,
 } DrasticVideoFilter;
 
@@ -48,6 +51,7 @@ typedef struct {
   int integer_scale;
   int vulkan_low_latency;
   DrasticVideoFilter video_filter;
+  char custom_shader[DRASTIC_CUSTOM_SHADER_PATH_MAX];
   int show_fps;
   int volume;
   int autosave_seconds;

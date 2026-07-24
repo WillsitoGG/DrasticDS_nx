@@ -19,6 +19,7 @@ CORE="$APK_DIR/lib/arm64-v8a/libdrastic_arm64.so"
 ASSETS="$APK_DIR/assets"
 VULKAN_HEADERS="$APP/third_party/vulkan-headers/include/vulkan"
 DFX_SOURCE="$ASSETS/shaders"
+BUNDLED_SHADER_SOURCE="$APP/third_party/drastic-ds-shaders"
 
 required=(
   "$CORE"
@@ -47,6 +48,9 @@ required=(
   "$DFX_SOURCE/smaa/SMAA.hlsl"
   "$DFX_SOURCE/smaa/AreaTexRGB.raw"
   "$DFX_SOURCE/smaa/SearchTexRGB.raw"
+  "$BUNDLED_SHADER_SOURCE/README.md"
+  "$BUNDLED_SHADER_SOURCE/NOTICE.md"
+  "$BUNDLED_SHADER_SOURCE/COPYING"
   "$VULKAN_HEADERS/vk_layer.h"
   "$VULKAN_HEADERS/vk_platform.h"
   "$VULKAN_HEADERS/vulkan.h"
@@ -72,12 +76,17 @@ for file in "${required[@]}"; do
     exit 1
   }
 done
-for command_name in cmake ninja make find; do
+for command_name in cmake ninja make find wc; do
   command -v "$command_name" >/dev/null || {
     echo "$command_name is required." >&2
     exit 1
   }
 done
+BUNDLED_SHADER_COUNT="$(find "$BUNDLED_SHADER_SOURCE" -type f -iname '*.dfx' | wc -l)"
+if (( BUNDLED_SHADER_COUNT < 1 )); then
+  echo "No bundled custom shader manifests were found in $BUNDLED_SHADER_SOURCE" >&2
+  exit 1
+fi
 PYTHON3=${PYTHON3:-$(command -v python3 || true)}
 [[ -n "$PYTHON3" && -x "$PYTHON3" ]] || {
   echo "python3 is required to generate the Drastic filter programs." >&2
@@ -200,6 +209,12 @@ for resource in game_database.xml usrcheat.dat; do
   cp -f "$ASSETS/$resource" "$ROMFS_STAGE/res/$resource"
 done
 
+echo "==== bundled custom shaders: $BUNDLED_SHADER_COUNT (OpenGL + Vulkan) ===="
+mkdir -p "$ROMFS_STAGE/shaders"
+cp -a "$BUNDLED_SHADER_SOURCE/." "$ROMFS_STAGE/shaders/"
+"$PYTHON3" "$APP/tools/compile_custom_shader.py" \
+  "$ROMFS_STAGE/shaders" --glslang "$GLSLANG"
+
 echo "==== forwarder stub ===="
 make -C "$APP/launcher/fwd" clean OUT="$ROMFS_STAGE/fwd" >/dev/null
 make -C "$APP/launcher/fwd" -j"$JOBS" OUT="$ROMFS_STAGE/fwd"
@@ -219,4 +234,5 @@ echo
 echo "Done. Copy this one file to the SD card:"
 ls -la "$APP/DrasticDS.nro"
 echo
-echo "The launcher creates sdmc:/switch/drastic/ and extracts both renderers on demand."
+echo "The launcher creates sdmc:/switch/drastic/, extracts both renderers on demand,"
+echo "and installs the bundled OpenGL/Vulkan custom shader packs."

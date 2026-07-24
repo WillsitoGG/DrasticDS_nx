@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #include "drastic_config.h"
 #include "overlay.h"
@@ -23,5 +24,8 @@ unsigned drastic_renderer_frame_count(void);
 bool drastic_renderer_lsfg_available(void);
 bool drastic_renderer_lsfg_enabled(void);
 bool drastic_renderer_lsfg_request_enabled(bool enabled);
+bool drastic_renderer_set_custom_shader(const char *relative_path,
+                                        char *error, size_t error_size);
+const char *drastic_renderer_last_error(void);
 
 #endif

@@ -35,6 +35,10 @@ void overlay_draw_text_scaled(int x, int y, int scale, uint32_t color,
                               const char *text);
 void overlay_draw_text_clipped(int x, int y, int max_width, uint32_t color,
                                const char *text);
+void overlay_draw_text_scrolling(int x, int y, int max_width,
+                                 uint32_t color, const char *text);
+void overlay_draw_text_scrolling_right(int right, int y, int max_width,
+                                       uint32_t color, const char *text);
 void overlay_draw_text_right(int right, int y, uint32_t color,
                              const char *text);
 void overlay_draw_wrapped(int x, int y, int max_width, int max_lines,
