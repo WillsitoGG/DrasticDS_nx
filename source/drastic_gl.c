@@ -857,11 +857,8 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
 void drastic_renderer_present(const DrasticRuntimeConfig *config,
                               DrasticCoreRenderFrame core_render,
                               void *env, void *clazz,
-                              const uint32_t *top, const uint32_t *bottom,
                               const DrasticOverlayFrame *overlay,
                               bool consume_core_frame) {
-  (void)top;
-  (void)bottom;
   if (consume_core_frame) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glActiveTexture(GL_TEXTURE0);

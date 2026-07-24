@@ -205,9 +205,10 @@ mkdir -p "$ROMFS_STAGE/cores" "$ROMFS_STAGE/emu" "$ROMFS_STAGE/res"
 cp -f "$CORE" "$ROMFS_STAGE/cores/libdrastic_arm64.so"
 cp -f "$HOST_STAGE/DrasticDS_nx_vk.nro" "$ROMFS_STAGE/emu/DrasticDS_nx_vk.nro"
 cp -f "$HOST_STAGE/DrasticDS_nx_gl.nro" "$ROMFS_STAGE/emu/DrasticDS_nx_gl.nro"
-for resource in game_database.xml usrcheat.dat; do
-  cp -f "$ASSETS/$resource" "$ROMFS_STAGE/res/$resource"
-done
+"$PYTHON3" "$APP/tools/patch_game_database.py" \
+  --input "$ASSETS/game_database.xml" \
+  --output "$ROMFS_STAGE/res/game_database.xml"
+cp -f "$ASSETS/usrcheat.dat" "$ROMFS_STAGE/res/usrcheat.dat"
 
 echo "==== bundled custom shaders: $BUNDLED_SHADER_COUNT (OpenGL + Vulkan) ===="
 mkdir -p "$ROMFS_STAGE/shaders"

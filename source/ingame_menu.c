@@ -832,12 +832,15 @@ static void render_emulation(DrasticIngameMenu *menu) {
   char values[9][48] = {{0}};
   const int frameskip = prefs_get_int("Drastic/FrameskipValue", 0);
   const int method = clamp_int(prefs_get_int("Drastic/FrameskipType", 0), 0, 3);
-  const int ff = clamp_int(prefs_get_int("Drastic/FastForwardSpeed", 2), 0, 15);
+  const int ff = clamp_int(prefs_get_int("Drastic/FastForwardSpeed", 2), 0, 5);
   const int autosave = menu->config->autosave_seconds;
   snprintf(values[0], sizeof(values[0]), "%d", frameskip);
   snprintf(values[1], sizeof(values[1]), "%s", methods[method]);
   snprintf(values[2], sizeof(values[2]), "%s", on_off(prefs_get_bool("Drastic/FrameskipSafe", false)));
-  snprintf(values[3], sizeof(values[3]), "%s", ff ? (ff == 1 ? "2x" : ff == 2 ? "3x" : ff == 3 ? "4x" : "Custom") : "Unlimited");
+  static const char *ff_speeds[] = {
+    "50%", "150%", "200%", "300%", "400%", "Unlimited"
+  };
+  snprintf(values[3], sizeof(values[3]), "%s", ff_speeds[ff]);
   snprintf(values[4], sizeof(values[4]), "%s", on_off(prefs_get_bool("Drastic/Threaded3D", true)));
   snprintf(values[5], sizeof(values[5]), "%s", on_off(prefs_get_bool("Drastic/CheatsEnabled", true)));
   snprintf(values[6], sizeof(values[6]), "%s", on_off(menu->config->show_fps));
@@ -1386,11 +1389,11 @@ static void update_emulation(DrasticIngameMenu *menu, u64 pressed) {
     case 2: save_bool("Drastic/FrameskipSafe",
                       !prefs_get_bool("Drastic/FrameskipSafe", false)); break;
     case 3: {
-      static const int speeds[] = {0, 1, 2, 3};
+      static const int speeds[] = {0, 1, 2, 3, 4, 5};
       const int current = prefs_get_int("Drastic/FastForwardSpeed", 2);
       int index = 0;
-      for (int i = 0; i < 4; i++) if (speeds[i] == current) index = i;
-      index = (index + direction + 4) % 4;
+      for (int i = 0; i < 6; i++) if (speeds[i] == current) index = i;
+      index = (index + direction + 6) % 6;
       save_int("Drastic/FastForwardSpeed", speeds[index]);
       break;
     }

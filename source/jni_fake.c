@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "config.h"
+#include "libc_shim.h"
 #include "util.h"
 #include "jni_fake.h"
 #include "prefs.h"
@@ -378,21 +379,17 @@ static int drastic_real_path(const char *virtual_path, char *output,
   return 1;
 }
 
-/* The Android frontend installs immutable assets beside the selected Drastic
- * system directory, while writable files retain their virtual-root locations.
- * The launcher extracts the database and cheat table under SYSTEM_DIR; users
- * place their own BIOS and firmware in the same directory.  For read-only
- * opens, fall back there only when the writable-path candidate is absent,
- * without redirecting saves or user writes. */
-static void drastic_resource_read_fallback(const char *virtual_path,
-                                           const char *mode, char *real_path,
-                                           size_t real_path_size) {
-  if (!virtual_path || !mode || !real_path ||
-      strpbrk(mode, "wa+"))
-    return;
-
-  struct stat status;
-  if (stat(real_path, &status) == 0)
+/* The Android frontend installs system resources beside the selected DraStic
+ * data directory.  The native cheat manager is the one exception to otherwise
+ * immutable resources: it reopens usrcheat.dat with "rb+" to persist toggles
+ * before rebuilding its active-code list.  Keep that file on the launcher's
+ * documented SYSTEM_DIR path for both reads and writes.  Other resources only
+ * use SYSTEM_DIR as a read-only fallback, so saves and user writes retain their
+ * virtual-root locations. */
+static void drastic_resource_path(const char *virtual_path, const char *mode,
+                                  char *real_path,
+                                  size_t real_path_size) {
+  if (!virtual_path || !mode || !real_path)
     return;
 
   const char *relative = NULL;
@@ -401,6 +398,18 @@ static void drastic_resource_read_fallback(const char *virtual_path,
   else if (!strncmp(virtual_path, "User/", 5))
     relative = virtual_path + 5;
   if (!relative || !*relative)
+    return;
+
+  if (!strcmp(relative, "usrcheat.dat")) {
+    snprintf(real_path, real_path_size, "%s/usrcheat.dat", SYSTEM_DIR);
+    return;
+  }
+
+  if (strpbrk(mode, "wa+"))
+    return;
+
+  struct stat status;
+  if (stat(real_path, &status) == 0)
     return;
 
   char candidate[1024];
@@ -428,8 +437,7 @@ static void *drastic_open_path(va_list va) {
   char real_path[1024];
   if (!drastic_real_path(virtual_path, real_path, sizeof(real_path)))
     return NULL;
-  drastic_resource_read_fallback(virtual_path, mode, real_path,
-                                 sizeof(real_path));
+  drastic_resource_path(virtual_path, mode, real_path, sizeof(real_path));
   if (strpbrk(mode, "wa+")) drastic_make_parents(real_path);
   void *handle = jni_make_object("com/dsemu/drastic/filesystem/NativePathHandle");
   jni_obj_set_string(handle, "filePath", real_path);
@@ -450,7 +458,11 @@ static juint dispatch_boolean(const char *name, va_list va) {
         !drastic_real_path(virtual_destination, destination,
                            sizeof(destination))) return 0;
     drastic_make_parents(destination);
-    return rename(source, destination) == 0;
+    /* Newer DraStic releases replace cartridge saves through
+     * DraSticPathCache.rename instead of the imported POSIX rename. Route the
+     * Java bridge through the same Horizon compatibility path: fsdev rename
+     * cannot replace an existing destination, while Android rename can. */
+    return rename_fake(source, destination) == 0;
   }
   if (!strcmp(name, "remove")) {
     char path[1024];

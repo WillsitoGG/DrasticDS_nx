@@ -40,13 +40,6 @@ so_module emu_mod;
 #define DRASTIC_JIT_OFFSET 0x001de000u
 #define DRASTIC_JIT_SIZE   0x01300000u
 
-#ifdef USE_VULKAN
-/* Build 109's private screen-buffer accessor. Unlike getScreenBuffers(), this
- * returns the full 512x384 buffers when high-resolution 3D is enabled. */
-#define DRASTIC_RAW_SCREEN_OFFSET 0x0001cd18u
-static const void *(*core_get_raw_screen)(unsigned screen);
-#endif
-
 static int configure_core_jit(so_module *mod) {
   /* Fingerprint the cache setup routine before relying on fixed offsets.
    * These are `mov w1,#0x1000000`, `mov w2,#7` at 0x961ac. */
@@ -60,21 +53,6 @@ static int configure_core_jit(so_module *mod) {
     return 0;
   return drastic_jit_install(mod);
 }
-
-#ifdef USE_VULKAN
-static int configure_core_screen_capture(so_module *mod) {
-  static const uint32_t expected[] = {
-    0xb001f888u, 0x9107e108u, 0xb9895909u, 0x52a0018au,
-  };
-  if (!mod || DRASTIC_RAW_SCREEN_OFFSET + sizeof(expected) > mod->load_size ||
-      memcmp((const char *)mod->load_base + DRASTIC_RAW_SCREEN_OFFSET,
-             expected, sizeof(expected)) != 0)
-    return 0;
-  core_get_raw_screen = (const void *(*)(unsigned))(
-      (uintptr_t)mod->load_virtbase + DRASTIC_RAW_SCREEN_OFFSET);
-  return 1;
-}
-#endif
 
 #ifdef USE_VULKAN
 u32 __nx_nv_transfermem_size = 16 * 1024 * 1024;
@@ -138,7 +116,6 @@ static struct {
   void (*waitScreen)(void *env, void *clazz);
   void (*signalScreen)(void *env, void *clazz);
   DrasticCoreRenderFrame renderFrame;
-  void (*getScreenBuffers)(void *env, void *clazz, void *top, void *bottom);
   int (*getFrameInfo)(void *env, void *clazz);
   jboolean (*getRumbleState)(void *env, void *clazz);
   jboolean (*saveState)(void *env, void *clazz, int slot, jboolean user);
@@ -202,7 +179,6 @@ static void resolve_core(void) {
   RESOLVE_REQUIRED(waitScreen, "waitScreen");
   RESOLVE_REQUIRED(signalScreen, "signalScreen");
   RESOLVE_REQUIRED(renderFrame, "renderFrame");
-  RESOLVE_REQUIRED(getScreenBuffers, "getScreenBuffers");
   RESOLVE_OPTIONAL(getFrameInfo, "getFrameInfo");
   RESOLVE_OPTIONAL(getRumbleState, "getRumbleState");
   RESOLVE_REQUIRED(saveState, "saveState");
@@ -283,8 +259,8 @@ static int make_directory(const char *path) {
 
 static void setup_directories(void) {
   const char *directories[] = {
-    "/switch", DATA_ROOT, SYSTEM_DIR, USER_DIR, CACHE_DIR, GAMES_DIR,
-    CHEATS_DIR, SCRIPTS_DIR, SHADERS_DIR, SLOT2_DIR, MICROPHONE_DIR,
+    "/switch", DATA_ROOT, SYSTEM_DIR, USER_DIR, CACHE_DIR, UNZIP_CACHE_DIR,
+    GAMES_DIR, CHEATS_DIR, SCRIPTS_DIR, SHADERS_DIR, SLOT2_DIR, MICROPHONE_DIR,
     SAVESTATES_DIR,
     BACKUPS_DIR,
   };
@@ -903,12 +879,6 @@ int main(void) {
   resolve_core();
   if (!configure_core_jit(&emu_mod))
     fatal_error("Unsupported Drastic ARM64 core JIT layout.");
-#ifdef USE_VULKAN
-  const bool high_resolution_3d =
-      (runtime.core_config & (UINT64_C(1) << 41)) != 0;
-  if (high_resolution_3d && !configure_core_screen_capture(&emu_mod))
-    fatal_error("Unsupported Drastic high-resolution screen layout.");
-#endif
   so_finalize(&emu_mod);
   so_flush_caches(&emu_mod);
 
@@ -962,20 +932,6 @@ int main(void) {
       vibration_handheld, 2, HidNpadIdType_Handheld,
       HidNpadStyleSet_NpadStandard));
   initialize_motion_sensors();
-
-  const uint32_t *top = NULL;
-  const uint32_t *bottom = NULL;
-#ifdef USE_VULKAN
-  void *top_array = NULL;
-  void *bottom_array = NULL;
-  if (!high_resolution_3d) {
-    top_array = jni_make_int_array(256 * 192);
-    bottom_array = jni_make_int_array(256 * 192);
-    top = (const uint32_t *)jni_int_array_data(top_array);
-    bottom = (const uint32_t *)jni_int_array_data(bottom_array);
-    if (!top || !bottom) fatal_error("Could not allocate DS screen buffers.");
-  }
-#endif
 
   RuntimeControls controls = {
     .state_slot = prefs_get_int("Wrapper/StateSlot", 0),
@@ -1053,10 +1009,16 @@ int main(void) {
       drastic_menu_update(menu, input.buttons, input.buttons_down,
                           input.left, input.right);
       if (drastic_menu_take_exit_request(menu)) controls.exit_requested = 1;
+      if (!drastic_menu_is_open(menu)) {
+        /* Overlay changes rebuild DraStic's base config, which intentionally
+         * excludes the transient fast-forward bit. Reconcile that bit on the
+         * first resumed input sample even when a toggle remains latched. */
+        controls.fast_forward = -1;
+      }
       drastic_input_sampler_update_runtime(
           input_sampler, &runtime, !drastic_menu_is_open(menu));
       drastic_renderer_present(&runtime, core.renderFrame, fake_env, clazz,
-                               top, bottom, overlay_frame(), false);
+                               overlay_frame(), false);
       continue;
     }
     /* The low 16 bits are Drastic's short transition counter, not a loading
@@ -1074,7 +1036,7 @@ int main(void) {
           &runtime, &controls, clazz, menu, input_sampler);
       update_runtime_hud(&hud, &runtime, &controls, 0);
       drastic_renderer_present(&runtime, core.renderFrame, fake_env, clazz,
-                               top, bottom, overlay_frame(), false);
+                               overlay_frame(), false);
       if (open_menu) drastic_menu_open(menu);
       svcSleepThread(16 * 1000 * 1000LL);
       continue;
@@ -1088,17 +1050,9 @@ int main(void) {
     core.waitScreen(fake_env, clazz);
     if (__atomic_load_n(&game.finished, __ATOMIC_ACQUIRE))
       break;
-#ifdef USE_VULKAN
-    if (high_resolution_3d) {
-      top = (const uint32_t *)core_get_raw_screen(0);
-      bottom = (const uint32_t *)core_get_raw_screen(1);
-    } else {
-      core.getScreenBuffers(fake_env, clazz, top_array, bottom_array);
-    }
-#endif
     update_runtime_hud(&hud, &runtime, &controls, 1);
     drastic_renderer_present(&runtime, core.renderFrame, fake_env, clazz,
-                             top, bottom, overlay_frame(), true);
+                             overlay_frame(), true);
     if (cpu_boost_active) {
       cpu_boost(0);
       cpu_boost_active = false;

@@ -137,6 +137,15 @@ static bool migrateLauncherSettings(Store &store) {
     storeSet(store, "Wrapper/LauncherSettingsVersion", "2");
     changed = true;
   }
+  if (version < 3) {
+    /* Versions through 1.0.4 exposed native value 0 as "Unlimited", but
+       DraStic's real table is 0=50% through 5=Unlimited. Preserve the user's
+       old selection before exposing the complete native speed list. */
+    if (!strcmp(storeGet(store, "Drastic/FastForwardSpeed", "2"), "0"))
+      storeSet(store, "Drastic/FastForwardSpeed", "5");
+    storeSet(store, "Wrapper/LauncherSettingsVersion", "3");
+    changed = true;
+  }
   return changed;
 }
 static void storeRemovePrefix(Store &s, const char *prefix) {
@@ -264,6 +273,27 @@ static bool storeSave(Store &s, const char *path) {
   return writeAtomicText(path, text);
 }
 
+static bool migrateFastForwardProfiles() {
+  DIR *directory = opendir(GAMECFG_DIR);
+  if (!directory) return errno == ENOENT;
+
+  bool success = true;
+  while (dirent *entry = readdir(directory)) {
+    const char *extension = strrchr(entry->d_name, '.');
+    if (!extension || strcasecmp(extension, ".ini")) continue;
+
+    const std::string path = std::string(GAMECFG_DIR) + "/" + entry->d_name;
+    Store profile;
+    storeLoad(profile, path.c_str());
+    if (strcmp(storeGet(profile, "Drastic/FastForwardSpeed", "2"), "0"))
+      continue;
+    storeSet(profile, "Drastic/FastForwardSpeed", "5");
+    if (!storeSave(profile, path.c_str())) success = false;
+  }
+  closedir(directory);
+  return success;
+}
+
 static const char *iniGet(const char *key, const char *def) {
   if (g_active == &g_game) {
     for (auto &e : g_game.kv)   if (e.k == key) return e.v.c_str();
@@ -352,7 +382,9 @@ static const Choice C_latency[]  = { {"Low","0"}, {"Balanced","1"}, {"High compa
 static const Choice C_micLevel[] = { {"Low","0"}, {"Normal","1"}, {"High","2"}, {"Maximum","3"} };
 static const Choice C_threads[]  = { {"1","1"}, {"2","2"}, {"3 (recommended)","3"} };
 static const Choice C_frameskipType[] = { {"Automatic","0"}, {"Fixed","1"}, {"Aggressive","2"}, {"Maximum","3"} };
-static const Choice C_ffSpeed[]  = { {"2x","1"}, {"3x","2"}, {"4x","3"}, {"Unlimited","0"} };
+static const Choice C_ffSpeed[]  = { {"50%","0"}, {"150%","1"},
+                                     {"200%","2"}, {"300%","3"},
+                                     {"400%","4"}, {"Unlimited","5"} };
 static const Choice C_autofire[] = { {"Slow","0"}, {"Normal","2"}, {"Fast","4"}, {"Very fast","7"} };
 /* Native DraStic Slot-2 enum. Keep these values aligned with build 109:
  * 0=None, 1=GBA, 2=SRAM, 3=rumble, 4/5=motion accessories. */
@@ -489,7 +521,7 @@ static const Opt S_launcher[] = {
 struct Screen { const char *title; const Opt *opts; int n; bool binds; };
 static const Screen g_screens[SCR_COUNT] = {
   { "Graphics",            S_graphics,   (int)(sizeof(S_graphics)/sizeof(Opt)),   false },
-  { "Enhancements",        S_enhance,    (int)(sizeof(S_enhance)/sizeof(Opt)),    false },
+  { "3D / Compatibility",  S_enhance,    (int)(sizeof(S_enhance)/sizeof(Opt)),    false },
   { "Frame Generation",    S_framegen,   (int)(sizeof(S_framegen)/sizeof(Opt)),   false },
   { "Audio",               S_audio,      (int)(sizeof(S_audio)/sizeof(Opt)),      false },
   { "Emulation / System",  S_emu,        (int)(sizeof(S_emu)/sizeof(Opt)),        false },
@@ -498,6 +530,174 @@ static const Screen g_screens[SCR_COUNT] = {
   { "Controller",          S_controller, (int)(sizeof(S_controller)/sizeof(Opt)), true  },
   { "Nintendo DS Firmware",S_firmware,   (int)(sizeof(S_firmware)/sizeof(Opt)),   false },
 };
+
+struct SettingHelpEntry {
+  const char *key;
+  const char *kind;
+  const char *text;
+};
+
+/* DraStic-owned descriptions are condensed from the manual bundled with the
+ * Android application. Wrapper-only settings are documented here alongside
+ * them so every launcher option has one contextual source of truth. */
+static const SettingHelpEntry SETTING_HELP[] = {
+  {"Wrapper/Renderer", "Display backend",
+   "Chooses the Switch presentation backend. Vulkan (NVK) is recommended for performance and is required by LSFG. Try OpenGL if a game or custom shader has rendering problems."},
+  {"Wrapper/VulkanLowLatency", "Latency / performance",
+   "Reduces queued Vulkan presentation work so new controller input reaches the display sooner. It can reduce performance headroom, so it is disabled by default."},
+  {"Wrapper/Layout", "Screen layout",
+   "Arranges the two Nintendo DS screens. Hybrid modes enlarge one screen, single-screen modes hide the other, and Custom uses positions saved by the in-game layout editor."},
+  {"Wrapper/SwapScreens", "Screen layout",
+   "Exchanges the displayed positions of the top and touch screens. Touch input continues to follow the emulated touch screen."},
+  {"Wrapper/Rotation", "Screen layout",
+   "Rotates gameplay and the in-game interface for book or tate play. Menu navigation directions remain tied to the physical controller."},
+  {"Wrapper/ScreenGap", "Screen layout",
+   "Adds space between the two emulated screens before the layout is fitted to the display. Larger gaps leave less room for the game image."},
+  {"Wrapper/IntegerScale", "Image scaling",
+   "Uses whole-number scaling for sharper, evenly sized pixels. Depending on the layout, this can leave unused borders and prevent the image from filling the display."},
+  {"Wrapper/VideoFilter", "Post-processing",
+   "Applies a GPU scaling filter after DraStic renders the screens. Filters may sharpen, smooth, or stylize the image; Custom uses the shader selected below."},
+  {"Wrapper/CustomShader", "Post-processing",
+   "Selects a DraStic .dfx custom shader. Choosing one automatically changes DraStic filter to Custom. Vulkan shaders also need their compiled .dfx.nxvk pack."},
+  {"Drastic/ShowFPS", "Performance display",
+   "Shows DraStic's on-screen speed and frame-rate indicator while a game is running."},
+
+  {"Drastic/Hires3D", "Visual enhancement",
+   "Renders Nintendo DS 3D graphics at twice their normal resolution. This improves 3D clarity but substantially increases emulation work and does not upscale 2D layers."},
+  {"Drastic/Threaded3D", "Performance / compatibility",
+   "Offloads 3D screen-update work to another CPU thread. It can improve performance, but DraStic warns that some games may show graphical glitches, swapped screens, or instability; disable it when troubleshooting."},
+  {"Drastic/DisableEdgeMarking", "Compatibility / visual trade-off",
+   "Disables the Nintendo DS edge-marking effect used to draw outlines around some 3D polygons. This can avoid edge-related glitches, but removes an intended visual effect."},
+  {"Drastic/Use16BitColor", "Performance / visual trade-off",
+   "Uses a lower-precision 16-bit texture format. It may improve performance or reduce memory use, but lowers image quality and can introduce color banding."},
+  {"Drastic/Blend", "Compatibility / visual trade-off",
+   "Blends consecutive emulated frames. This can reproduce effects that rely on rapid flicker, but may soften motion or create visible ghosting."},
+  {"Drastic/FixMainEngineScreen", "Game-specific workaround",
+   "Forces the main 2D+3D display engine onto the emulated top screen instead of honoring a game's engine swaps. It helps some games such as the Sonic titles, but can put content on the wrong screen in others."},
+
+  {"Wrapper/LSFGEnabled", "Frame generation",
+   "Generates one intermediate frame for each real frame to target a smoother 2x presentation. It does not increase emulation speed and may add artifacts or latency. Vulkan only."},
+  {"Wrapper/LSFGFlowScale", "Frame generation quality",
+   "Sets the resolution used for optical-flow analysis. Half can improve motion detail but costs more GPU time and memory; Quarter is recommended on Switch."},
+  {"Wrapper/LSFGPerformance", "Frame generation performance",
+   "Uses LSFG's lighter performance-oriented processing path. Disable it only when you prefer image quality and have enough GPU headroom."},
+
+  {"Drastic/SoundEnabled", "Audio",
+   "Enables or mutes emulated Nintendo DS sound."},
+  {"Wrapper/Volume", "Audio",
+   "Sets the final Switch output volume without changing the emulated game's own mixer settings."},
+  {"Drastic/AudioLatency", "Audio latency / stability",
+   "Controls DraStic's audio buffering. Lower settings react sooner but are more likely to crackle or stutter; higher settings are safer when a game cannot maintain steady speed."},
+  {"Drastic/MicEnabled", "Nintendo DS microphone",
+   "Enables the emulated DS microphone input path. On Switch, the microphone hotkey supplies simulated noise for games that expect blowing or voice input."},
+  {"Drastic/MicLevel", "Nintendo DS microphone",
+   "Sets the strength of the simulated microphone signal sent to the game."},
+
+  {"Drastic/CpuThreads", "CPU performance",
+   "Sets the number of host worker threads DraStic may use. Switch applications have three usable CPU cores, so 3 is recommended; reduce it only for troubleshooting."},
+  {"Drastic/PreloadRoms", "Loading / memory",
+   "Loads an uncompressed ROM into memory before play for fast, consistent access. Disabling it lowers memory use but can increase storage access during emulation."},
+  {"Drastic/AutoTrim", "Compatibility / memory",
+   "Uses only the ROM length declared in its Nintendo DS header. This can reduce memory use for oversized dumps, but should stay off for patched or malformed ROMs unless needed."},
+  {"Drastic/IgnoreGamecardLimit", "Game-specific workaround",
+   "Ignores the normal Nintendo DS cartridge-size limit. Enable it only when an oversized patched ROM refuses to load."},
+  {"Drastic/RtcSystemTime", "Nintendo DS clock",
+   "Starts the emulated real-time clock from the Switch system time. After boot, the DS clock follows emulated time and savestates; reset the game to resynchronize it."},
+  {"Drastic/AutosaveInterval", "Save protection",
+   "Controls how often DraStic commits automatic in-game save data while running. Shorter intervals reduce the amount of progress at risk after a crash, but write to storage more often."},
+  {"Wrapper/StateSlot", "Savestates",
+   "Selects the savestate slot used by the quick save and quick load hotkeys. Slots range from 0 to 9."},
+
+  {"Drastic/LuaEnabled", "Gameplay feature",
+   "Allows DraStic Lua scripts to run for supported games. Disable it if you do not use scripts or when troubleshooting script-related behavior."},
+  {"Drastic/Slot2Type", "Nintendo DS accessory",
+   "Chooses the accessory emulated in the Nintendo DS Slot-2 port. GBA Cart loads matching .gba/.sav files for supported game bonuses; the other modes emulate SRAM, rumble, or motion accessories."},
+  {"Drastic/BackupInSavestates", "Save compatibility",
+   "Stores a copy of the in-game save inside each savestate so both remain synchronized. DraStic recommends keeping this enabled because mismatched saves can cause corruption, especially in Pokemon games."},
+  {"Drastic/RawSaveFormat", "Save-file compatibility",
+   "Writes in-game backup memory as a raw save file for easier interchange with other emulators and tools. Leave it off when you need DraStic's normal save format."},
+
+  {"Wrapper/Vibration", "Slot-2 Rumble Pak",
+   "Forwards an emulated Slot-2 Rumble Pak effect to Switch controller vibration. It only has an effect when a game and the selected Slot-2 accessory use rumble."},
+  {"Wrapper/Motion", "Motion input",
+   "Forwards Joy-Con gyro and accelerometer data to DraStic's motion input. It is mainly useful with a compatible Slot-2 motion accessory or motion-aware homebrew."},
+  {"Wrapper/AnalogDpad", "Controller input",
+   "Lets the left analog stick act as the Nintendo DS D-Pad in addition to the physical D-Pad."},
+  {"Wrapper/AnalogDeadzone", "Controller input",
+   "Sets how far the left stick must move before it presses a DS direction. Raise it to prevent drift; lower it for faster response."},
+  {"Wrapper/AnalogStylus", "Touch input",
+   "Uses the right stick to move a virtual stylus cursor over the DS touch screen."},
+  {"Wrapper/AnalogTouchButton", "Touch input",
+   "Chooses the controller button that presses the virtual stylus at its current right-stick cursor position."},
+  {"Wrapper/AnalogStylusSpeed", "Touch input",
+   "Controls how quickly the right-stick stylus cursor moves across the DS touch screen."},
+  {"Wrapper/FastForwardMode", "Hotkey behavior",
+   "Hold runs fast-forward only while its hotkey is held. Toggle keeps fast-forward active until the hotkey is pressed again."},
+
+  {"Drastic/FrameskipValue", "Performance / visual trade-off",
+   "Sets how many frames the selected frame-skip method may omit. Zero disables skipping. Higher values can improve speed but make motion choppy and may visually break some games."},
+  {"Drastic/FrameskipType", "Performance / visual trade-off",
+   "Chooses when frames are omitted. Automatic skips when emulation falls behind; Fixed uses the configured ratio, while Aggressive and Maximum favor speed more strongly over smoothness and compatibility."},
+  {"Drastic/FrameskipSafe", "Compatibility / performance",
+   "Uses DraStic's more conservative frame-skipping behavior to reduce visual problems in sensitive games. It may provide less speedup than normal skipping."},
+  {"Drastic/FastForwardSpeed", "Speed control",
+   "Caps the speed used while fast-forward is active. 50% acts as slow motion; Unlimited runs only as fast as the Switch and current game allow."},
+  {"Drastic/AutoFireSpeed", "Controller input",
+   "Sets how rapidly supported DS buttons repeat while the auto-fire modifier hotkey is active."},
+
+  {"Drastic/FirmwareNickname", "Firmware profile",
+   "Sets the nickname stored in the emulated Nintendo DS firmware profile. Games may display this name."},
+  {"Drastic/FirmwareLanguage", "Firmware profile",
+   "Sets the language reported by the emulated DS firmware. Auto follows the Switch system language and falls back to English when that language is not supported by Nintendo DS."},
+  {"Drastic/FirmwareColor", "Firmware profile",
+   "Sets the favorite-color index stored in the emulated Nintendo DS user profile. Some games use it for personalization."},
+  {"Drastic/FirmwareBirthdayMonth", "Firmware profile",
+   "Sets the birthday month stored in the emulated Nintendo DS user profile."},
+  {"Drastic/FirmwareBirthdayDay", "Firmware profile",
+   "Sets the birthday day stored in the emulated Nintendo DS user profile."},
+
+  {"Wrapper/Theme", "Launcher appearance",
+   "Changes the launcher background and visual theme. It does not affect gameplay rendering."},
+  {"Wrapper/GridColumns", "Library layout",
+   "Sets how many game covers are displayed across each library row. More columns make each cover smaller."},
+  {"Wrapper/GridRows", "Library layout",
+   "Sets how many rows of game covers are shown on each library page. More rows make each cover smaller."},
+  {"Wrapper/ShowGameTitles", "Library layout",
+   "Shows or hides game names below their covers in the library."},
+  {"Wrapper/UiAnimations", "Launcher appearance",
+   "Enables launcher transitions, moving highlights, and animated theme effects."},
+  {"Wrapper/UiSounds", "Launcher audio",
+   "Enables navigation, confirmation, and back sound effects in the SDL launcher."},
+};
+
+struct SettingHelpInfo {
+  const char *kind;
+  std::string text;
+};
+
+static SettingHelpInfo settingHelpFor(const Opt &option) {
+  if(option.key){
+    for(const SettingHelpEntry &entry:SETTING_HELP)
+      if(!strcmp(entry.key,option.key)) return {entry.kind,entry.text};
+    if(!strncmp(option.key,"Wrapper/Pad/",12))
+      return {"Controller mapping",
+              std::string("Maps ")+option.label+" to a Switch controller button. Press A on this row, then press the desired button; choose None to leave it unmapped."};
+    if(!strncmp(option.key,"Wrapper/Hotkey",14))
+      return {"Hotkey binding",
+              std::string("Assigns a Switch button or button combination to ")+option.label+". Press A, hold every button in the combination, then release them. Each hotkey must be unique."};
+  }
+  if(option.type==OT_SUBMENU){
+    if(option.sub==SCR_ENHANCE)
+      return {"Settings group","Contains DraStic 3D enhancements, performance trade-offs, and game-specific visual compatibility workarounds."};
+    if(option.sub==SCR_FIRMWARE)
+      return {"Settings group","Edits the nickname, language, favorite color, and birthday reported by the emulated Nintendo DS firmware."};
+    if(option.sub==SCR_FRAMERATE)
+      return {"Settings group","Contains frame skipping, fast-forward speed, and auto-fire timing. Frame skipping trades visual accuracy and smoothness for performance."};
+  }
+  if(option.type==OT_STATUS)
+    return {"Required component","Shows whether the Lossless Scaling frame-generation library is installed. LSFG settings remain unavailable when this component is missing."};
+  return {"Setting","Changes this launcher or emulator option. Use the default value when troubleshooting an unexpected game-specific problem."};
+}
 
 static void commitAll() {
   for (int s = 0; s < SCR_COUNT; s++)
@@ -2868,6 +3068,76 @@ static void listCol(int *colX,int *colW,int *labelX,int *valX){
 }
 static int listVis(){ int v=(SH-LIST_Y0-72)/ROW_H; return v<1?1:v; }
 
+static void showHelpCard(const char *section,const char *title,const char *kind,
+                         const std::string &description,const char *current,
+                         const char *scope) {
+  for(;;){
+    if(!beginUiFrame()) return;
+    SDL_Event event;
+    while(pollUiEvent(event)){
+      pumpStick(event);
+      int touchX=0,touchY=0;
+      if(touchFeed(event,&touchX,&touchY)==TOUCH_TAP) return;
+      if(event.type==SDL_CONTROLLERBUTTONDOWN &&
+         (event.cbutton.button==BTN_CONFIRM ||
+          event.cbutton.button==BTN_CANCEL ||
+          event.cbutton.button==BTN_SETTINGS)) return;
+    }
+
+    clearUiBackground();
+    const int panelWidth=std::min(SW-120,1000);
+    const int panelHeight=std::min(SH-96,500);
+    const int panelX=(SW-panelWidth)/2,panelY=(SH-panelHeight)/2;
+    glassPanel(panelX,panelY,panelWidth,panelHeight);
+    border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
+    drawText(g_font_sm,panelX+40,panelY+24,section&&*section?section:"Settings",COL_DIM);
+    drawText(g_font_big,panelX+40,panelY+58,title&&*title?title:"Setting help",COL_VAL);
+
+    std::string metadata=kind&&*kind?kind:"Setting";
+    if(scope&&*scope){ metadata+="  |  "; metadata+=scope; }
+    drawText(g_font_sm,panelX+40,panelY+114,metadata.c_str(),COL_SEL);
+    int bodyY=panelY+164;
+    if(current&&*current){
+      const char *prefix="Current: ";
+      drawText(g_font_sm,panelX+40,panelY+146,prefix,COL_DIM);
+      drawScrollTextL(g_font_sm,panelX+40+textW(g_font_sm,prefix),panelY+146,
+                      panelWidth-80-textW(g_font_sm,prefix),current,COL_TXT);
+      bodyY=panelY+198;
+    }
+    fillRect(panelX+40,bodyY-18,panelWidth-80,2,(SDL_Color){70,78,92,210});
+    drawWrapped(g_font,panelX+40,bodyY,panelWidth-80,32,7,
+                description.c_str(),COL_TXT);
+    drawTextC(g_font_sm,SW/2,panelY+panelHeight-42,
+              "A / B / X  Close       Touch anywhere to close",COL_DIM);
+    SDL_RenderPresent(g_ren);
+    SDL_Delay(8);
+  }
+}
+
+static void showOptionHelp(const char *section,const Opt &option,
+                           const char *scope) {
+  SettingHelpInfo help=settingHelpFor(option);
+  char value[256]={};
+  const char *current=nullptr;
+  if(option.type!=OT_SUBMENU){ optValue(option,value,sizeof(value)); current=value; }
+  showHelpCard(section,option.label,help.kind,help.text,current,scope);
+}
+
+static const char *settingsScreenDescription(int screen) {
+  switch(screen){
+    case SCR_GRAPHICS: return "Selects the renderer, screen arrangement, scaling, post-processing, FPS display, and DraStic's 3D or visual compatibility options.";
+    case SCR_ENHANCE: return "Contains true 3D enhancements alongside performance trade-offs and game-specific display workarounds. Use X Help on each option before changing it.";
+    case SCR_FRAMEGEN: return "Configures Vulkan-only LSFG 2x frame generation. It creates intermediate display frames but does not make Nintendo DS emulation run faster.";
+    case SCR_AUDIO: return "Controls emulated sound, output volume, buffering latency, and the simulated Nintendo DS microphone.";
+    case SCR_EMU: return "Controls DraStic CPU use, ROM loading, saves, the emulated clock, firmware identity, frame skipping, and fast-forward behavior.";
+    case SCR_FRAMERATE: return "Controls frame skipping, fast-forward limits, and auto-fire timing. Frame skipping is a performance trade-off and can break visuals in some games.";
+    case SCR_NETWORK: return "Controls optional DraStic gameplay features, Slot-2 accessories, Lua, and how in-game save data interacts with savestates or other emulators.";
+    case SCR_CONTROLLER: return "Maps Nintendo DS controls, configures analog stylus and motion input, and assigns unique in-game hotkey combinations.";
+    case SCR_FIRMWARE: return "Edits the user information reported by the emulated Nintendo DS firmware, including language, nickname, favorite color, and birthday.";
+    default: return "Opens this group of emulator settings.";
+  }
+}
+
 static void renderSettings(int scr,int sel,int top,const char *ctx){
   clearUiBackground();
   const Screen &S=g_screens[scr];
@@ -2897,6 +3167,8 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
     int thH=trH*vis/S.n, denom=(S.n-vis>0?S.n-vis:1);
     fillRect(trX,trY+(trH-thH)*top/denom,4,thH,COL_SEL);
   }
+  drawTextC(g_font_sm,SW/2,SH-38,
+            "Left / Right  Change       A  Choose       X  Help       B  Back",COL_DIM);
   drawFadeIn();
   SDL_RenderPresent(g_ren);
 }
@@ -3088,6 +3360,10 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
           else optAdjust(o,1);
           break;
         }
+        case BTN_SETTINGS:
+          showOptionHelp(S.title,S.opts[sel],ctx&&*ctx?"Per-game setting":"Global setting");
+          beginScreenFx();
+          break;
         case BTN_CANCEL: return;
       }
       int vis=listVis(); if(sel<top) top=sel; if(sel>=top+vis) top=sel-vis+1; if(top<0)top=0;
@@ -3139,6 +3415,14 @@ static void launcherSettingsScreen() {
           else optAdjust(option,1);
           applyChange();
         }
+      } else if(event.cbutton.button==BTN_SETTINGS){
+        if(sel<optionCount)
+          showOptionHelp("Launcher",S_launcher[sel],"Launcher setting");
+        else
+          showHelpCard("Launcher","Download all covers","Library artwork",
+                       "Downloads missing cover artwork for the whole library from SteamGridDB. Existing local covers are kept.",
+                       nullptr,"Launcher action");
+        beginScreenFx();
       } else if(event.cbutton.button==BTN_CANCEL){ finish(); return; }
       if(sel<top) top=sel;
       if(sel>=top+visible) top=sel-visible+1;
@@ -3164,7 +3448,8 @@ static void launcherSettingsScreen() {
         drawTextR(g_font,valX,y,value,current?COL_VAL:COL_DIM);
       }
     }
-    drawTextC(g_font_sm,SW/2,SH-38,"Left / Right  Change       A  Choose       B  Back",COL_DIM);
+    drawTextC(g_font_sm,SW/2,SH-38,
+              "Left / Right  Change       A  Choose       X  Help       B  Back",COL_DIM);
     drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
   }
 }
@@ -3329,6 +3614,23 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx) {
         else if(global&&sel==framegenRow) runSettings(SCR_FRAMEGEN,pad,ctx);
         else runSettings(order[global?sel-screenStart:sel],pad,ctx);
         beginScreenFx();
+      } else if(event.cbutton.button==BTN_SETTINGS){
+        if(global&&sel==launcherRow)
+          showHelpCard("Settings","Launcher","Launcher appearance",
+                       "Changes the SDL launcher's theme, library grid, labels, animations, sounds, and cover downloads.",
+                       nullptr,"Settings category");
+        else if(global&&sel==libraryRow)
+          showHelpCard("Settings","Library & storage","Game and file management",
+                       "Manages game folders, local or removable storage, files, and SMB network shares used by the launcher.",
+                       nullptr,"Settings category");
+        else {
+          int screen=(global&&sel==framegenRow)?SCR_FRAMEGEN:
+                     order[global?sel-screenStart:sel];
+          showHelpCard(global?"Settings":"Game settings",g_screens[screen].title,
+                       "Settings category",settingsScreenDescription(screen),nullptr,
+                       global?"Global settings":"Per-game overrides");
+        }
+        beginScreenFx();
       } else if(event.cbutton.button==BTN_CANCEL) return;
       if(sel<top) top=sel;
       if(sel>=top+vis) top=sel-vis+1;
@@ -3366,6 +3668,7 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx) {
       }
     }
     if(n>vis){ int trackH=vis*rowH,trackX=colX+colW+16; fillRect(trackX,y0,4,trackH,(SDL_Color){40,44,54,255}); int thumbH=std::max(16,trackH*vis/n),denom=std::max(1,n-vis); fillRect(trackX,y0+(trackH-thumbH)*top/denom,4,thumbH,COL_SEL); }
+    drawTextC(g_font_sm,SW/2,SH-38,"A  Open       X  Help       B  Back",COL_DIM);
     drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
   }
 }
@@ -4001,11 +4304,17 @@ static bool ensureResources() {
   FILE *f = fopen(RES_MARKER, "r");
   if (f) { if (!fgets(cur, sizeof(cur), f)) cur[0] = 0; fclose(f); }
   const bool present = bundledResourcesPresent();
-  const std::string marker=std::string("109 ")+BUILD_STAMP;
+  const std::string marker=std::string("109-pokemon-save-v1-cheats-v1 ")+BUILD_STAMP;
   if(trim(cur)==marker&&present) return true;
-  toast("Extracting Drastic resources (one-time)...");
+  toast("Updating DraStic resources...");
   mkdir(SYSTEM_DIR, 0777);
-  bool ok = extractTree("romfs:/res", SYSTEM_DIR, true) && bundledResourcesPresent();
+  const std::string system=SYSTEM_DIR;
+  bool ok=extractFromRomfs("romfs:/res/game_database.xml",
+                           (system+"/game_database.xml").c_str(),true);
+  if(!regularFileExists(system+"/usrcheat.dat"))
+    ok=extractFromRomfs("romfs:/res/usrcheat.dat",
+                        (system+"/usrcheat.dat").c_str(),true)&&ok;
+  ok=bundledResourcesPresent()&&ok;
   if(ok) writeAtomicText(RES_MARKER,marker+"\n");
   return ok;
 }
@@ -4375,7 +4684,11 @@ int main(int argc, char **argv){
   storeLoad(g_global,LAUNCHER_INI);
   storeLoad(g_titles,TITLES_INI);
   storeLoad(g_recent,RECENT_INI);
+  const int previousSettingsVersion=atoi(storeGet(
+      g_global,"Wrapper/LauncherSettingsVersion","0"));
   bool settingsMigrated=migrateLauncherSettings(g_global);
+  if(previousSettingsVersion<3&&!migrateFastForwardProfiles())
+    return startupFailure("Could not migrate per-game fast-forward settings.");
   settingsMigrated=normalizeLsfgStore(g_global)||settingsMigrated;
   int sortMode=atoi(storeGet(g_global,"Wrapper/SortMode","0"));
   if(sortMode>=0&&sortMode<SORT_COUNT) g_sort=sortMode;

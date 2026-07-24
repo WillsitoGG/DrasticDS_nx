@@ -14,6 +14,7 @@
 #define SYSTEM_DIR      DATA_ROOT "/system"
 #define USER_DIR        DATA_ROOT "/user"
 #define CACHE_DIR       DATA_ROOT "/cache"
+#define UNZIP_CACHE_DIR DATA_ROOT "/unzip_cache"
 #define GAMES_DIR       DATA_ROOT "/games"
 #define CHEATS_DIR      DATA_ROOT "/cheats"
 #define SCRIPTS_DIR     DATA_ROOT "/scripts"

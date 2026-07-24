@@ -44,6 +44,7 @@
 #include "hooks.h"
 #include "dl_emu.h"
 #include "opensles.h"
+#include "drastic_vk_capture.h"
 
 // crt/newlib-provided symbols forwarded by address
 int *__errno(void);
@@ -256,8 +257,14 @@ static int c_toupper(int c) { return toupper(c); }
 
 #ifdef USE_VULKAN
 #define DRASTIC_GL_IMPORT(name) ((uintptr_t)&ret0)
+#define DRASTIC_GL_BIND_TEXTURE_IMPORT \
+  ((uintptr_t)&drastic_vk_capture_gl_bind_texture)
+#define DRASTIC_GL_TEX_SUB_IMAGE_IMPORT \
+  ((uintptr_t)&drastic_vk_capture_gl_tex_sub_image_2d)
 #else
 #define DRASTIC_GL_IMPORT(name) ((uintptr_t)&name)
+#define DRASTIC_GL_BIND_TEXTURE_IMPORT ((uintptr_t)&glBindTexture)
+#define DRASTIC_GL_TEX_SUB_IMAGE_IMPORT ((uintptr_t)&glTexSubImage2D)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -302,7 +309,7 @@ DynLibFunction dynlib_functions[] = {
   { "glActiveTexture", DRASTIC_GL_IMPORT(glActiveTexture) },
   { "glAttachShader", DRASTIC_GL_IMPORT(glAttachShader) },
   { "glBindFramebuffer", DRASTIC_GL_IMPORT(glBindFramebuffer) },
-  { "glBindTexture", DRASTIC_GL_IMPORT(glBindTexture) },
+  { "glBindTexture", DRASTIC_GL_BIND_TEXTURE_IMPORT },
   { "glCheckFramebufferStatus", DRASTIC_GL_IMPORT(glCheckFramebufferStatus) },
   { "glClear", DRASTIC_GL_IMPORT(glClear) },
   { "glCompileShader", DRASTIC_GL_IMPORT(glCompileShader) },
@@ -327,7 +334,7 @@ DynLibFunction dynlib_functions[] = {
   { "glShaderSource", DRASTIC_GL_IMPORT(glShaderSource) },
   { "glTexImage2D", DRASTIC_GL_IMPORT(glTexImage2D) },
   { "glTexParameteri", DRASTIC_GL_IMPORT(glTexParameteri) },
-  { "glTexSubImage2D", DRASTIC_GL_IMPORT(glTexSubImage2D) },
+  { "glTexSubImage2D", DRASTIC_GL_TEX_SUB_IMAGE_IMPORT },
   { "glUniform1f", DRASTIC_GL_IMPORT(glUniform1f) },
   { "glUniform1i", DRASTIC_GL_IMPORT(glUniform1i) },
   { "glUniform2f", DRASTIC_GL_IMPORT(glUniform2f) },

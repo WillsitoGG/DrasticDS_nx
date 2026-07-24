@@ -173,6 +173,14 @@ static void migrate_hotkey_defaults(void) {
   put_entry("Wrapper/HotkeyDefaultsVersion", "2");
 }
 
+static void migrate_fast_forward_speed(void) {
+  const int version = prefs_get_int("Wrapper/LauncherSettingsVersion", 0);
+  if (version >= 3) return;
+  if (prefs_get_int("Drastic/FastForwardSpeed", 2) == 0)
+    put_entry("Drastic/FastForwardSpeed", "5");
+  put_entry("Wrapper/LauncherSettingsVersion", "3");
+}
+
 void prefs_set_disc_path(const char *path) {
   snprintf(pending_rom, sizeof(pending_rom), "%s", path ? path : "");
   if (path && *path) put_entry("Drastic/RomPath", path);
@@ -190,6 +198,7 @@ void prefs_init(const char *path) {
     put_entry("Wrapper/LSFGFlowScale", lsfg_flow > 0.375f ? "0.5" : "0.25");
   seed_defaults();
   migrate_hotkey_defaults();
+  migrate_fast_forward_speed();
 }
 
 void prefs_save(void) {

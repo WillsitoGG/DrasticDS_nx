@@ -7,10 +7,11 @@
  * is selected. NVK's own
  * rust_switch_stubs already provides most egl* symbols (eglGetDisplay,
  * eglSwapBuffers, ...); this file adds only the handful it does not, so the link
- * resolves. The Vulkan presenter uploads Drastic's compact CPU screen buffers
- * as sampled images and composites them on the GPU; it never invokes the
- * core's OpenGL render entry point, so these fail benignly. Compiled to nothing
- * in the OpenGL build (real switch-mesa symbols linked instead).
+ * resolves. The Vulkan presenter uses DraStic's renderFrame only to select and
+ * consume its completed screen buffer; glBindTexture/glTexSubImage2D are
+ * redirected to the CPU capture bridge and no GLES context is created. These
+ * remaining EGL queries therefore fail benignly. Compiled to nothing in the
+ * OpenGL build (real switch-mesa symbols linked instead).
  */
 #ifdef USE_VULKAN
 

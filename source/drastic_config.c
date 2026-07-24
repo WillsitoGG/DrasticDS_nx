@@ -52,7 +52,7 @@ uint64_t drastic_config_build_core_config(void) {
   const int frameskip = clamp_int(prefs_get_int("Drastic/FrameskipValue", 0), 0, 9);
   const int frameskip_type = clamp_int(prefs_get_int("Drastic/FrameskipType", 0), 0, 3);
   const int audio_latency = clamp_int(prefs_get_int("Drastic/AudioLatency", 2), 0, 3);
-  const int fast_forward = clamp_int(prefs_get_int("Drastic/FastForwardSpeed", 2), 0, 15);
+  const int fast_forward = clamp_int(prefs_get_int("Drastic/FastForwardSpeed", 2), 0, 5);
   const int cpu_threads = clamp_int(prefs_get_int("Drastic/CpuThreads", 3), 1, 3);
   const int autofire = clamp_int(prefs_get_int("Drastic/AutoFireSpeed", 2), 0, 7);
   const int mic_level = clamp_int(prefs_get_int("Drastic/MicLevel", 1), 0, 3);

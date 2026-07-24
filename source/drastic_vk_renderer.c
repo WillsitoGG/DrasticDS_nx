@@ -30,6 +30,7 @@
 #include "drastic_dfx.h"
 #include "drastic_custom_shader.h"
 #include "drastic_renderer.h"
+#include "drastic_vk_capture.h"
 #include "drastic_smaa_area_rgb_bin.h"
 #include "drastic_smaa_search_rgb_bin.h"
 #include "drastic_vk_frag_bin.h"
@@ -178,6 +179,7 @@ static uint64_t g_overlay_generation = UINT64_MAX;
 static unsigned g_frames;
 static uint32_t g_ds_width = 256;
 static uint32_t g_ds_height = 192;
+static uint32_t *g_core_pixels;
 static VkPipeline g_filter_pipelines[DRASTIC_DFX_SHADER_COUNT];
 static VkDescriptorSet g_filter_descriptors[2][2];
 static DrasticVideoFilter g_filtered_filter = DRASTIC_FILTER_COUNT;
@@ -2211,6 +2213,14 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   g_ds_width = config &&
       (config->core_config & (UINT64_C(1) << 41)) ? 512 : 256;
   g_ds_height = g_ds_width * 3 / 4;
+  free(g_core_pixels);
+  const size_t core_pixel_count =
+      (size_t)g_ds_width * g_ds_height * 2;
+  g_core_pixels = calloc(core_pixel_count, sizeof(*g_core_pixels));
+  if (!g_core_pixels) {
+    set_renderer_error("Could not allocate Vulkan screen capture buffers.");
+    return false;
+  }
   int lsfg_launch_enabled =
       prefs_get_bool("Wrapper/LSFGEnabled", false) &&
       file_readable(lsfg_dll_path());
@@ -2318,43 +2328,21 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
 }
 
 static void stage_screen_pixels(uint8_t *destination,
-                                const uint32_t *source,
-                                const DrasticRuntimeConfig *config) {
+                                const uint32_t *source) {
   const size_t pixels = (size_t)g_ds_width * g_ds_height;
-  if (!(config->core_config & (UINT64_C(1) << 41))) {
-    memcpy(destination, source, pixels * sizeof(uint32_t));
-    return;
-  }
-
-  uint32_t *output = (uint32_t *)destination;
-  if (config->core_config & (UINT64_C(1) << 23)) {
-    const uint16_t *input = (const uint16_t *)source;
-    for (size_t index = 0; index < pixels; index++) {
-      const uint32_t pixel = input[index];
-      output[index] = UINT32_C(0xff000000) |
-                      ((pixel & UINT32_C(0xf800)) << 8) |
-                      ((pixel & UINT32_C(0x07e0)) << 5) |
-                      ((pixel & UINT32_C(0x001f)) << 3);
-    }
-    return;
-  }
-
-  /* DraStic's native 32-bit buffer is R,G,B,X in byte order. Match the
-   * exported getScreenBuffers() conversion expected by our BGRA textures. */
-  for (size_t index = 0; index < pixels; index++) {
-    const uint32_t pixel = source[index];
-    output[index] = UINT32_C(0xff000000) |
-                    ((pixel & UINT32_C(0x000000ff)) << 16) |
-                    (pixel & UINT32_C(0x0000ff00)) |
-                    ((pixel & UINT32_C(0x00ff0000)) >> 16);
-  }
+  memcpy(destination, source, pixels * sizeof(uint32_t));
 }
 
-static void release_core_frame(DrasticCoreRenderFrame core_render,
-                               void *env, void *clazz, int *released) {
-  if (*released) return;
-  core_render(env, clazz, 0, 0, 0);
-  *released = 1;
+static void capture_core_frame(DrasticCoreRenderFrame core_render,
+                               void *env, void *clazz, int *consumed) {
+  if (*consumed) return;
+  const size_t pixels = (size_t)g_ds_width * g_ds_height;
+  drastic_vk_capture_begin(g_core_pixels, g_core_pixels + pixels,
+                           g_ds_width, g_ds_height);
+  core_render(env, clazz, (int)DRASTIC_VK_CAPTURE_TOP_TEXTURE,
+              (int)DRASTIC_VK_CAPTURE_BOTTOM_TEXTURE, 0);
+  drastic_vk_capture_end();
+  *consumed = 1;
 }
 
 static int wait_frame_slot(uint32_t slot_index) {
@@ -2388,22 +2376,19 @@ static int wait_frame_slot(uint32_t slot_index) {
 void drastic_renderer_present(const DrasticRuntimeConfig *config,
                               DrasticCoreRenderFrame core_render,
                               void *env, void *clazz,
-                              const uint32_t *top, const uint32_t *bottom,
                               const DrasticOverlayFrame *overlay,
                               bool consume_core_frame) {
   if (config->video_filter == DRASTIC_FILTER_CUSTOM && !g_custom.valid)
     return;
-  const int upload_screens = consume_core_frame && top && bottom;
-  const int hold_high_resolution_frame = upload_screens &&
-      (config->core_config & (UINT64_C(1) << 41));
-  const int defer_core_release = consume_core_frame && g_low_latency;
-  int core_frame_released = !consume_core_frame;
-  /* Restore the original producer/consumer timing for ordinary frames. The
-   * high-resolution path is the sole exception: its private core buffers must
-   * be copied before renderFrame() lets DraStic reuse them. */
-  if (consume_core_frame && !hold_high_resolution_frame &&
-      !defer_core_release)
-    release_core_frame(core_render, env, clazz, &core_frame_released);
+  const int upload_screens = consume_core_frame;
+  const int defer_core_capture = consume_core_frame && g_low_latency;
+  int core_frame_consumed = !consume_core_frame;
+  /* Use DraStic's own renderFrame selection instead of getScreenBuffers().
+   * The latter reads the active producer buffer; renderFrame atomically picks
+   * the completed buffer and both screen regions before invoking our Vulkan
+   * upload hooks. */
+  if (consume_core_frame && !defer_core_capture)
+    capture_core_frame(core_render, env, clazz, &core_frame_consumed);
 
   /* Complete the LSFG -> native-present handoff before acquiring or writing
    * the first ordinary frame. Destroying the backend later, after the native
@@ -2417,7 +2402,7 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
   const uint32_t slot_index = g_frame_slot_cursor;
   RenderFrameSlot *frame = &g_frame_slots[slot_index];
   if (!wait_frame_slot(slot_index)) {
-    release_core_frame(core_render, env, clazz, &core_frame_released);
+    capture_core_frame(core_render, env, clazz, &core_frame_consumed);
     return;
   }
   g_staging_base = (VkDeviceSize)slot_index * g_staging_stride;
@@ -2428,36 +2413,27 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
     g_filter_valid[0] = g_filter_valid[1] = 0;
   }
   if (upload_screens) g_filter_valid[0] = g_filter_valid[1] = 0;
-  if (hold_high_resolution_frame && !defer_core_release) {
-    stage_screen_pixels(g_staging_mapped + g_staging_base +
-                            g_texture_offsets[TEXTURE_TOP],
-                        top, config);
-    stage_screen_pixels(g_staging_mapped + g_staging_base +
-                            g_texture_offsets[TEXTURE_BOTTOM],
-                        bottom, config);
-    release_core_frame(core_render, env, clazz, &core_frame_released);
-  }
 
   uint32_t image_index = 0;
   const VkResult acquired = vkAcquireNextImageKHR(
       g_device, g_swapchain, UINT64_MAX, frame->acquired, VK_NULL_HANDLE,
       &image_index);
   if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
-    release_core_frame(core_render, env, clazz, &core_frame_released);
+    capture_core_frame(core_render, env, clazz, &core_frame_consumed);
     return;
   }
 
-  if (upload_screens &&
-      (!hold_high_resolution_frame || defer_core_release)) {
+  if (defer_core_capture)
+    capture_core_frame(core_render, env, clazz, &core_frame_consumed);
+  if (upload_screens) {
+    const size_t pixels = (size_t)g_ds_width * g_ds_height;
     stage_screen_pixels(g_staging_mapped + g_staging_base +
                             g_texture_offsets[TEXTURE_TOP],
-                        top, config);
+                        g_core_pixels);
     stage_screen_pixels(g_staging_mapped + g_staging_base +
                             g_texture_offsets[TEXTURE_BOTTOM],
-                        bottom, config);
+                        g_core_pixels + pixels);
   }
-  if (defer_core_release)
-    release_core_frame(core_render, env, clazz, &core_frame_released);
   const int upload_overlay = overlay && overlay->visible && overlay->pixels &&
       overlay->generation != g_overlay_generation;
   const int overlay_texture = overlay_texture_index(overlay);
@@ -2602,6 +2578,8 @@ void drastic_renderer_shutdown(void) {
   }
   if (g_surface) vkDestroySurfaceKHR(g_instance, g_surface, NULL);
   if (g_instance) vkDestroyInstance(g_instance, NULL);
+  free(g_core_pixels);
+  g_core_pixels = NULL;
   memset(g_textures, 0, sizeof(g_textures));
   memset(g_filter_pipelines, 0, sizeof(g_filter_pipelines));
   g_instance = VK_NULL_HANDLE;

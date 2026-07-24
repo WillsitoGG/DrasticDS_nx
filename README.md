@@ -53,7 +53,7 @@ renderer and bundled application resources on demand:
     nds_bios_arm9.bin     <- your ARM9 BIOS dump (you supply)
     nds_firmware.bin      <- your firmware dump (you supply)
     game_database.xml     <- auto-extracted Drastic database
-    usrcheat.dat          <- auto-extracted cheat database
+    usrcheat.dat          <- cheat database (installed once; user-replaceable)
   user/backup/            <- cartridge save files
   user/savestates/        <- save states and previews
   launcher.ini            <- launcher settings
