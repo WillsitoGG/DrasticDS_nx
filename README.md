@@ -85,6 +85,10 @@ The launcher supports multiple library folders across SD, USB mass storage,
 and SMB shares, cover downloads, themes, a file manager, and HOME-menu
 shortcut creation.
 
+Enable **Settings > Launcher > Portrait launcher** to rotate and reflow the
+complete SDL launcher for vertical/tate use. Touch follows the portrait UI;
+D-Pad and stick menu directions remain physically mapped as normal.
+
 Press **L + R + Plus** to open the in-game menu for save states, per-title
 Action Replay cheats, screen layout and filter controls, emulation/audio/input
 settings, frame generation, reset, and return to the launcher.

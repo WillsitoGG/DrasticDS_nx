@@ -25,7 +25,7 @@ ROMFS_DIR	?=	$(CURDIR)/romfs	# build_all.sh overrides this with a temporary dire
 
 APP_TITLE	:=	Drastic DS
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.0.4
+APP_VERSION	:=	1.0.5
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE

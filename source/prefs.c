@@ -143,6 +143,8 @@ static void seed_defaults(void) {
   seed("Drastic/AutoTrim", "false");
   seed("Drastic/FixMainEngineScreen", "false");
   seed("Drastic/RtcSystemTime", "true");
+  seed("Drastic/CustomClockEnable", "false");
+  seed("Drastic/CustomClock", "0");
   seed("Drastic/DisableEdgeMarking", "false");
   seed("Drastic/Hires3D", "false");
   seed("Drastic/LuaEnabled", "true");
@@ -285,6 +287,14 @@ bool prefs_get_bool(const char *key, bool fallback) {
 int prefs_get_int(const char *key, int fallback) {
   const int index = find_entry(key);
   return index < 0 ? fallback : (int)strtol(entries[index].value, NULL, 0);
+}
+
+int64_t prefs_get_int64(const char *key, int64_t fallback) {
+  const int index = find_entry(key);
+  if (index < 0) return fallback;
+  char *end = NULL;
+  const long long value = strtoll(entries[index].value, &end, 10);
+  return end && *end == '\0' ? (int64_t)value : fallback;
 }
 
 float prefs_get_float(const char *key, float fallback) {

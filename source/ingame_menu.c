@@ -890,37 +890,76 @@ static void render_audio_input(DrasticIngameMenu *menu) {
   draw_status(menu);
 }
 
-static void custom_rect_for_ui(const DrasticRuntimeConfig *config,
-                               const DrasticScreenRect *rect,
-                               int *x, int *y, int *width, int *height) {
-  float ui_x = rect->x;
-  float ui_y = rect->y;
-  float ui_width = rect->width;
-  float ui_height = rect->height;
+static void custom_rect_to_ui(const DrasticRuntimeConfig *config,
+                              const DrasticScreenRect *rect,
+                              DrasticScreenRect *ui) {
+  *ui = *rect;
   switch (config->rotation & 3) {
     case 1:
-      ui_x = rect->y;
-      ui_y = 1.0f - rect->x - rect->width;
-      ui_width = rect->height;
-      ui_height = rect->width;
+      ui->x = rect->y;
+      ui->y = 1.0f - rect->x - rect->width;
+      ui->width = rect->height;
+      ui->height = rect->width;
       break;
     case 2:
-      ui_x = 1.0f - rect->x - rect->width;
-      ui_y = 1.0f - rect->y - rect->height;
+      ui->x = 1.0f - rect->x - rect->width;
+      ui->y = 1.0f - rect->y - rect->height;
       break;
     case 3:
-      ui_x = 1.0f - rect->y - rect->height;
-      ui_y = rect->x;
-      ui_width = rect->height;
-      ui_height = rect->width;
+      ui->x = 1.0f - rect->y - rect->height;
+      ui->y = rect->x;
+      ui->width = rect->height;
+      ui->height = rect->width;
       break;
     default:
       break;
   }
-  *x = (int)(ui_x * overlay_width() + 0.5f);
-  *y = (int)(ui_y * overlay_height() + 0.5f);
-  *width = (int)(ui_width * overlay_width() + 0.5f);
-  *height = (int)(ui_height * overlay_height() + 0.5f);
+}
+
+static void custom_rect_from_ui(const DrasticRuntimeConfig *config,
+                                const DrasticScreenRect *ui,
+                                DrasticScreenRect *rect) {
+  const int screen = rect->screen;
+  const int touch_target = rect->touch_target;
+  switch (config->rotation & 3) {
+    case 1:
+      rect->x = 1.0f - ui->y - ui->height;
+      rect->y = ui->x;
+      rect->width = ui->height;
+      rect->height = ui->width;
+      break;
+    case 2:
+      rect->x = 1.0f - ui->x - ui->width;
+      rect->y = 1.0f - ui->y - ui->height;
+      rect->width = ui->width;
+      rect->height = ui->height;
+      break;
+    case 3:
+      rect->x = ui->y;
+      rect->y = 1.0f - ui->x - ui->width;
+      rect->width = ui->height;
+      rect->height = ui->width;
+      break;
+    default:
+      rect->x = ui->x;
+      rect->y = ui->y;
+      rect->width = ui->width;
+      rect->height = ui->height;
+      break;
+  }
+  rect->screen = screen;
+  rect->touch_target = touch_target;
+}
+
+static void custom_rect_for_ui(const DrasticRuntimeConfig *config,
+                               const DrasticScreenRect *rect,
+                               int *x, int *y, int *width, int *height) {
+  DrasticScreenRect ui;
+  custom_rect_to_ui(config, rect, &ui);
+  *x = (int)(ui.x * overlay_width() + 0.5f);
+  *y = (int)(ui.y * overlay_height() + 0.5f);
+  *width = (int)(ui.width * overlay_width() + 0.5f);
+  *height = (int)(ui.height * overlay_height() + 0.5f);
 }
 
 static void render_layout_editor(DrasticIngameMenu *menu) {
@@ -1562,10 +1601,17 @@ static void update_layout_editor(DrasticIngameMenu *menu, u64 held,
     if (pressed & HidNpadButton_Down) move_y += step;
   }
   if (move_x || move_y || size_x || size_y) {
-    rect->x += move_x;
-    rect->y += move_y;
-    rect->width += size_x;
-    rect->height += size_y;
+    /* Edit the rectangle in the same rotated coordinate space shown by the
+     * overlay.  Otherwise at 90 degrees a rightward resize changes height,
+     * and at 270 degrees the axes appear inverted. */
+    DrasticScreenRect ui;
+    custom_rect_to_ui(menu->config, rect, &ui);
+    ui.x += move_x;
+    ui.y += move_y;
+    ui.width += size_x;
+    ui.height += size_y;
+    constrain_custom_rect(&ui);
+    custom_rect_from_ui(menu->config, &ui, rect);
     constrain_custom_rect(rect);
     drastic_config_calculate_layout(menu->config, panel_width, panel_height);
     menu->redraw = 1;

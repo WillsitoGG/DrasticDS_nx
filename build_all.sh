@@ -13,11 +13,11 @@ JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 APP="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$APP")"
 APK_DIR=${DRASTIC_APK_DIR:-"$ROOT/com.dsemu.drastic_r2.6.0.4a-109_minAPI14(arm64-v8a)(nodpi)_drasticds.com"}
-NVK_BUILD=${NVK_BUILD_DIR:-"$ROOT/vulkandrv/builddir-switch"}
+NVK_SDK=${NVK_SDK_DIR:-"$ROOT/nvk-switch-sdk"}
 BUILD_CACHE=${DRASTIC_BUILD_CACHE_DIR:-"$ROOT/.drasticds-nx-cache"}
 CORE="$APK_DIR/lib/arm64-v8a/libdrastic_arm64.so"
 ASSETS="$APK_DIR/assets"
-VULKAN_HEADERS="$APP/third_party/vulkan-headers/include/vulkan"
+VULKAN_HEADERS="$NVK_SDK/include/vulkan"
 DFX_SOURCE="$ASSETS/shaders"
 BUNDLED_SHADER_SOURCE="$APP/third_party/drastic-ds-shaders"
 
@@ -56,19 +56,19 @@ required=(
   "$VULKAN_HEADERS/vulkan.h"
   "$VULKAN_HEADERS/vulkan_core.h"
   "$VULKAN_HEADERS/vulkan_vi.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codecs_common.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codec_av1std.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codec_av1std_decode.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codec_av1std_encode.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codec_h264std.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codec_h264std_decode.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codec_h264std_encode.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codec_h265std.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codec_h265std_decode.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codec_h265std_encode.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codec_vp9std.h"
-  "$APP/third_party/vulkan-headers/include/vk_video/vulkan_video_codec_vp9std_decode.h"
-  "$NVK_BUILD/src/nouveau/vulkan/libnvk.a"
+  "$NVK_SDK/include/vk_video/vulkan_video_codecs_common.h"
+  "$NVK_SDK/include/vk_video/vulkan_video_codec_av1std.h"
+  "$NVK_SDK/include/vk_video/vulkan_video_codec_av1std_decode.h"
+  "$NVK_SDK/include/vk_video/vulkan_video_codec_av1std_encode.h"
+  "$NVK_SDK/include/vk_video/vulkan_video_codec_h264std.h"
+  "$NVK_SDK/include/vk_video/vulkan_video_codec_h264std_decode.h"
+  "$NVK_SDK/include/vk_video/vulkan_video_codec_h264std_encode.h"
+  "$NVK_SDK/include/vk_video/vulkan_video_codec_h265std.h"
+  "$NVK_SDK/include/vk_video/vulkan_video_codec_h265std_decode.h"
+  "$NVK_SDK/include/vk_video/vulkan_video_codec_h265std_encode.h"
+  "$NVK_SDK/include/vk_video/vulkan_video_codec_vp9std.h"
+  "$NVK_SDK/include/vk_video/vulkan_video_codec_vp9std_decode.h"
+  "$NVK_SDK/lib/libnvk.a"
 )
 for file in "${required[@]}"; do
   [[ -f "$file" ]] || {
@@ -129,8 +129,8 @@ nvk_archives=(
   libmesa_util.a libmesa_util_simd.a libblake3.a libmesa_util_c11.a
 )
 for archive in "${nvk_archives[@]}"; do
-  source_path="$(find "$NVK_BUILD" -type f -name "$archive" -print -quit)"
-  [[ -n "$source_path" ]] || {
+  source_path="$NVK_SDK/lib/$archive"
+  [[ -f "$source_path" ]] || {
     echo "Missing NVK archive: $archive" >&2
     exit 1
   }
@@ -191,7 +191,8 @@ storage_include_args=(
 
 echo "==== Drastic host: Vulkan (NVK) ===="
 make -C "$APP" -j"$JOBS" "${storage_include_args[@]}" \
-  "${dfx_args[@]}" RENDERER=VK VULKAN_STAGE="$NVK_STAGE"
+  "${dfx_args[@]}" RENDERER=VK VULKAN_STAGE="$NVK_STAGE" \
+  VULKAN_INCLUDE="$NVK_SDK/include"
 cp -f "$APP/DrasticDS_nx.nro" "$HOST_STAGE/DrasticDS_nx_vk.nro"
 make -C "$APP" clean >/dev/null
 

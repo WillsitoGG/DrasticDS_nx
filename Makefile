@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	Drastic DS
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.0.4
+APP_VERSION	:=	1.0.5
 BUILD		:=	build
 SOURCES		:=	source source/hooks source/switch
 DATA		:=	data
@@ -48,6 +48,7 @@ RENDERER ?= GL
 ifeq ($(RENDERER),VK)
 DEFINES	+=	-DUSE_VULKAN -DVK_USE_PLATFORM_VI_NN
 VULKAN_STAGE ?= $(TOPDIR)/vulkan
+VULKAN_INCLUDE ?= third_party/vulkan-headers/include
 SOURCES	+=	source/lsfg \
 			third_party/lsfg-vk/lsfg-vk-common/src/helpers \
 			third_party/lsfg-vk/lsfg-vk-common/src/vulkan \
@@ -56,7 +57,7 @@ SOURCES	+=	source/lsfg \
 			third_party/lsfg-vk/lsfg-vk-backend/src/helpers \
 			third_party/lsfg-vk/lsfg-vk-backend/src/shaderchains
 INCLUDES	+=	source/lsfg \
-			third_party/vulkan-headers/include \
+			$(VULKAN_INCLUDE) \
 			third_party/lsfg-vk/lsfg-vk-common/include \
 			third_party/lsfg-vk/lsfg-vk-backend/include \
 			third_party/lsfg-vk/lsfg-vk-backend/src
@@ -98,11 +99,11 @@ LIBS	:= -Wl,--start-group \
 		-l:libnouveau_ws.a -l:libnvidia_headers_c.a \
 		-l:libnir.a -l:libcompiler.a -l:libcompiler_c_helpers.a \
 		-l:libmesa_util.a -l:libmesa_util_simd.a -l:libblake3.a -l:libmesa_util_c11.a \
-		-Wl,--end-group $(STORAGE_LIBS) -lz -lzstd -lnx -lstdc++ -lm
+		-Wl,--end-group $(STORAGE_LIBS) -lminizip -lz -lzstd -lnx -lstdc++ -lm
 else
 # EGL/GLESv2/glapi/drm_nouveau: switch-mesa/nouveau GL.
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
-LIBS	:= $(STORAGE_LIBS) -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lz -lnx -lstdc++ -lm
+LIBS	:= $(STORAGE_LIBS) -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lminizip -lz -lnx -lstdc++ -lm
 endif
 
 #---------------------------------------------------------------------------------

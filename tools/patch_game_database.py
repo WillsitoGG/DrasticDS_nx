@@ -31,7 +31,6 @@ CORRECT_SAVE = (
     "<save name='save' size='0x80000' type='Flash' id='0x204013' />"
 )
 
-
 def patch_database(source: str) -> tuple[str, int, dict[str, int]]:
     seen = {game_id: 0 for game_id in POKEMON_BW2_GAME_IDS}
     changed = 0

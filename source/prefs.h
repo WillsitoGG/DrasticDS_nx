@@ -4,6 +4,7 @@
 #define __PREFS_H__
 
 #include <stdbool.h>
+#include <stdint.h>
 
 void prefs_init(const char *ini_path);
 
@@ -17,6 +18,7 @@ void prefs_save_runtime_key(const char *key);
 // "Section/Key" string the SharedPreferences shim passes through.
 bool        prefs_get_bool  (const char *key, bool def);
 int         prefs_get_int   (const char *key, int def);
+int64_t     prefs_get_int64 (const char *key, int64_t def);
 float       prefs_get_float (const char *key, float def);
 const char *prefs_get_string(const char *key, const char *def);
 bool        prefs_contains  (const char *key);

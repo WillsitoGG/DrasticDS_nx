@@ -52,6 +52,31 @@ static float normalized_axis(int value) {
   return result;
 }
 
+static void map_stylus_delta(int rotation, float display_x, float display_y,
+                             float *source_x, float *source_y) {
+  /* The virtual stylus is stored in unrotated DS coordinates, while stick
+   * movement must follow the image visible to the player.  Apply the inverse
+   * of drastic_config_map_stylus()'s source-to-display rotation. */
+  switch (rotation & 3) {
+    case 1:
+      *source_x = display_y;
+      *source_y = -display_x;
+      break;
+    case 2:
+      *source_x = -display_x;
+      *source_y = -display_y;
+      break;
+    case 3:
+      *source_x = -display_y;
+      *source_y = display_x;
+      break;
+    default:
+      *source_x = display_x;
+      *source_y = display_y;
+      break;
+  }
+}
+
 static int combo_held(u64 held, u64 combo) {
   return combo && (held & combo) == combo;
 }
@@ -177,10 +202,15 @@ static void *input_thread_main(void *opaque) {
       if (maximum && elapsed > maximum) elapsed = maximum;
       const float frame_scale =
           (float)((double)elapsed * 60.0 / (double)frequency);
-      sampler->stylus_x += normalized_axis(right.x) *
-                            sampler->config.stylus_speed * frame_scale;
-      sampler->stylus_y -= normalized_axis(right.y) *
-                            sampler->config.stylus_speed * frame_scale;
+      const float display_x = normalized_axis(right.x);
+      const float display_y = -normalized_axis(right.y);
+      float source_x, source_y;
+      map_stylus_delta(runtime.rotation, display_x, display_y,
+                       &source_x, &source_y);
+      sampler->stylus_x += source_x * sampler->config.stylus_speed *
+                           frame_scale;
+      sampler->stylus_y += source_y * sampler->config.stylus_speed *
+                           frame_scale;
       if (sampler->stylus_x < 0.0f) sampler->stylus_x = 0.0f;
       if (sampler->stylus_x > 255.0f) sampler->stylus_x = 255.0f;
       if (sampler->stylus_y < 0.0f) sampler->stylus_y = 0.0f;

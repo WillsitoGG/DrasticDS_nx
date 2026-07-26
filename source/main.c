@@ -14,6 +14,8 @@
 #include <sys/stat.h>
 
 #include "config.h"
+#include "archive_loader.h"
+#include "drastic_compat.h"
 #include "drastic_config.h"
 #include "drastic_jit.h"
 #include "drastic_renderer.h"
@@ -221,6 +223,7 @@ typedef struct {
   void *rom;
   int load_slot;
   jlong config;
+  jlong clock;
   int startup_mode;
   jboolean archive;
   volatile int finished;
@@ -233,7 +236,7 @@ static void *core_game_thread_main(void *opaque) {
   pthr_pin_emulation_core();
   const int result = core.startGame(
       fake_env, game->clazz, game->rom, game->load_slot, game->config,
-      game->startup_mode, game->archive, -1);
+      game->startup_mode, game->archive, game->clock);
   game->result = result;
   __atomic_store_n(&game->finished, 1, __ATOMIC_RELEASE);
   /* Wake a presentation thread parked in waitScreen() so it can observe the
@@ -843,6 +846,12 @@ static void shutdown_core(void *clazz, CoreGameThread *game) {
     core.JNI_OnUnload(fake_vm, NULL);
 }
 
+static jlong configured_start_clock(void) {
+  if (!prefs_get_bool("Drastic/CustomClockEnable", false)) return -1;
+  const int64_t clock = prefs_get_int64("Drastic/CustomClock", 0);
+  return clock != 0 ? (jlong)clock : -1;
+}
+
 int main(void) {
   cpu_boost(1);
   bool cpu_boost_active = true;
@@ -877,6 +886,8 @@ int main(void) {
   so_relocate(&emu_mod);
   so_resolve(&emu_mod, dynlib_functions, dynlib_numfunctions, 1);
   resolve_core();
+  if (!drastic_compat_install(&emu_mod))
+    fatal_error("Unsupported Drastic ARM64 core compatibility layout.");
   if (!configure_core_jit(&emu_mod))
     fatal_error("Unsupported Drastic ARM64 core JIT layout.");
   so_finalize(&emu_mod);
@@ -919,9 +930,24 @@ int main(void) {
   overlay_init(runtime.rotation);
   drastic_config_calculate_layout(&runtime, panel_width, panel_height);
 
-  void *rom = jni_make_string(runtime.rom_path);
+  char prepared_rom_path[sizeof(runtime.rom_path)];
+  snprintf(prepared_rom_path, sizeof(prepared_rom_path), "%s",
+           runtime.rom_path);
+  jboolean native_archive = has_archive_extension(runtime.rom_path);
+  const char *extension = strrchr(runtime.rom_path, '.');
+  if (extension && !strcasecmp(extension, ".zip")) {
+    char archive_error[256];
+    if (!drastic_zip_prepare(runtime.rom_path, prepared_rom_path,
+                             sizeof(prepared_rom_path), archive_error,
+                             sizeof(archive_error)))
+      fatal_error("Could not open the ZIP game:\n%s\n\n%s",
+                  runtime.rom_path, archive_error);
+    native_archive = 0;
+  }
+
+  void *rom = jni_make_string(prepared_rom_path);
   const int rom_type = core.getRomType(fake_env, clazz, rom);
-  if (rom_type < 0)
+  if (rom_type <= 0)
     fatal_error("Drastic does not recognize this ROM:\n%s", runtime.rom_path);
 
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
@@ -980,8 +1006,9 @@ int main(void) {
     .rom = rom,
     .load_slot = -1,
     .config = (jlong)runtime.core_config,
+    .clock = configured_start_clock(),
     .startup_mode = 0,
-    .archive = has_archive_extension(runtime.rom_path),
+    .archive = native_archive,
   };
   const int game_thread_result = core_game_thread_start(&game);
   if (game_thread_result != 0)
