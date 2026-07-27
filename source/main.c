@@ -19,6 +19,7 @@
 #include "drastic_config.h"
 #include "drastic_jit.h"
 #include "drastic_renderer.h"
+#include "drastic_rotation.h"
 #include "error.h"
 #include "imports.h"
 #include "ingame_menu.h"
@@ -508,13 +509,9 @@ static void update_motion(const DrasticRuntimeConfig *config, void *clazz,
   float y = state.acceleration.z * gravity;
   const float z = -state.acceleration.x * gravity;
   if (right_joycon) { x = -x; y = -y; }
-  float rotated_x = x, rotated_y = y;
-  switch (config->rotation & 3) {
-    case 1: rotated_x = y; rotated_y = -x; break;
-    case 2: rotated_x = -x; rotated_y = -y; break;
-    case 3: rotated_x = -y; rotated_y = x; break;
-    default: break;
-  }
+  float rotated_x, rotated_y;
+  drastic_rotation_display_delta_to_source(
+      config->rotation, x, y, &rotated_x, &rotated_y);
   core.updateAccelerometer(fake_env, clazz, rotated_x, rotated_y, z);
   core.updateGyroscope(fake_env, clazz, -state.angular_velocity.x);
 }
@@ -655,15 +652,15 @@ static void load_runtime_controls(RuntimeControls *controls) {
   controls->hotkeys.lid = buttons_for_combo(
       prefs_get_string("Wrapper/HotkeyLid", "None"));
   controls->hotkeys.save_state = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeySaveState", "L+R+Y"));
+      prefs_get_string("Wrapper/HotkeySaveState", "L+R+Minus+Y"));
   controls->hotkeys.load_state = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyLoadState", "L+R+X"));
+      prefs_get_string("Wrapper/HotkeyLoadState", "L+R+Minus+X"));
   controls->hotkeys.next_slot = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyNextSlot", "L+R+Up"));
+      prefs_get_string("Wrapper/HotkeyNextSlot", "L+R+Minus+Up"));
   controls->hotkeys.previous_slot = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyPreviousSlot", "L+R+Down"));
+      prefs_get_string("Wrapper/HotkeyPreviousSlot", "L+R+Minus+Down"));
   controls->hotkeys.reset = buttons_for_combo(
-      prefs_get_string("Wrapper/HotkeyReset", "L+R+A"));
+      prefs_get_string("Wrapper/HotkeyReset", "L+R+Minus+A"));
   controls->hotkeys.quit = buttons_for_combo(
       prefs_get_string("Wrapper/HotkeyQuit", "None"));
   /* A saved duplicate must never execute two emulator actions. The menu is
@@ -794,7 +791,10 @@ static int process_input(DrasticRuntimeConfig *config,
     config->swap_screens ^= 1;
     drastic_config_calculate_layout(config, panel_width, panel_height);
   }
-  const int microphone_feed = combo_held(held, controls->hotkeys.microphone);
+  const int microphone_feed =
+      config->microphone_enabled &&
+      config->microphone_source == DRASTIC_MICROPHONE_SIMULATED &&
+      combo_held(held, controls->hotkeys.microphone);
   if (microphone_feed != controls->microphone_feed) {
     controls->microphone_feed = microphone_feed;
     core.setWhitenoiseFeed(fake_env, clazz, microphone_feed != 0);
@@ -852,6 +852,66 @@ static jlong configured_start_clock(void) {
   return clock != 0 ? (jlong)clock : -1;
 }
 
+typedef struct {
+  void *clazz;
+  CoreGameThread *game;
+  DrasticRuntimeConfig *runtime;
+  RuntimeControls *controls;
+  DrasticIngameMenu *menu;
+  DrasticInputSampler *input_sampler;
+  int suspended;
+  int resume_core;
+  int resumed;
+} AppletLifecycle;
+
+static void suspend_emulation(AppletLifecycle *lifecycle) {
+  if (!lifecycle || lifecycle->suspended) return;
+  lifecycle->suspended = 1;
+  drastic_input_sampler_update_runtime(
+      lifecycle->input_sampler, lifecycle->runtime, false);
+  lifecycle->resume_core =
+      !__atomic_load_n(&lifecycle->game->finished, __ATOMIC_ACQUIRE) &&
+      !drastic_menu_is_open(lifecycle->menu);
+  if (lifecycle->resume_core)
+    core.pauseSystem(fake_env, lifecycle->clazz, 1);
+  opensles_set_suspended(true);
+  drastic_renderer_suspend();
+}
+
+static void resume_emulation(AppletLifecycle *lifecycle) {
+  if (!lifecycle || !lifecycle->suspended) return;
+  drastic_renderer_resume();
+  opensles_set_suspended(false);
+  if (lifecycle->resume_core &&
+      !__atomic_load_n(&lifecycle->game->finished, __ATOMIC_ACQUIRE))
+    core.pauseSystem(fake_env, lifecycle->clazz, 0);
+  lifecycle->resume_core = 0;
+  lifecycle->suspended = 0;
+  lifecycle->resumed = 1;
+  drastic_input_sampler_update_runtime(
+      lifecycle->input_sampler, lifecycle->runtime,
+      !drastic_menu_is_open(lifecycle->menu));
+}
+
+static void applet_lifecycle_hook(AppletHookType hook, void *parameter) {
+  if (hook != AppletHookType_OnFocusState &&
+      hook != AppletHookType_OnResume) return;
+  AppletLifecycle *lifecycle = (AppletLifecycle *)parameter;
+  const int focused = appletGetFocusState() == AppletFocusState_InFocus;
+  if (!focused) {
+    suspend_emulation(lifecycle);
+    /* NoSuspend lets us receive the focus-loss message and drain services
+     * first. Hand control back to the OS only after the host is quiescent. */
+    appletSetFocusHandlingMode(
+        AppletFocusHandlingMode_SuspendHomeSleepNotify);
+  } else {
+    /* Keep running long enough to restore every service before rendering the
+     * first post-resume frame. */
+    appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
+    resume_emulation(lifecycle);
+  }
+}
+
 int main(void) {
   cpu_boost(1);
   bool cpu_boost_active = true;
@@ -864,6 +924,11 @@ int main(void) {
 
   DrasticRuntimeConfig runtime;
   drastic_config_load(&runtime);
+  opensles_set_microphone_enabled(runtime.microphone_enabled != 0);
+  opensles_set_microphone_source(
+      runtime.microphone_source == DRASTIC_MICROPHONE_EXTERNAL
+          ? OPENSLES_MIC_SOURCE_EXTERNAL
+          : OPENSLES_MIC_SOURCE_SIMULATED);
   char storage_error[256];
   if (!switchStorageInitializeForPath(DATA_ROOT "/launcher.ini", runtime.rom_path,
                                       sizeof(runtime.rom_path), storage_error,
@@ -1023,11 +1088,39 @@ int main(void) {
     fatal_error("Could not create the dedicated input sampler.");
   drastic_input_sampler_update_runtime(input_sampler, &runtime, true);
 
+  AppletLifecycle lifecycle = {
+    .clazz = clazz,
+    .game = &game,
+    .runtime = &runtime,
+    .controls = &controls,
+    .menu = menu,
+    .input_sampler = input_sampler,
+  };
+  AppletHookCookie lifecycle_cookie = {0};
+  int lifecycle_hooked = 0;
+  appletHook(&lifecycle_cookie, applet_lifecycle_hook, &lifecycle);
+  if (R_SUCCEEDED(appletSetFocusHandlingMode(
+          AppletFocusHandlingMode_NoSuspend))) {
+    lifecycle_hooked = 1;
+  } else {
+    appletUnhook(&lifecycle_cookie);
+  }
+
   unsigned boot_frames = 0;
   int persisted_cheats_applied = 0;
   RuntimeHud hud = {0};
-  while (appletMainLoop() && !controls.exit_requested &&
+  while (!controls.exit_requested &&
          !__atomic_load_n(&game.finished, __ATOMIC_ACQUIRE)) {
+    if (!appletMainLoop()) break;
+    if (lifecycle.suspended) {
+      svcSleepThread(16 * 1000 * 1000LL);
+      continue;
+    }
+    if (lifecycle.resumed) {
+      lifecycle.resumed = 0;
+      reset_runtime_fps_window(&hud);
+      controls.fast_forward = -1;
+    }
     if (drastic_menu_is_open(menu)) {
       reset_runtime_fps_window(&hud);
       drastic_input_sampler_update_runtime(input_sampler, &runtime, false);
@@ -1094,6 +1187,10 @@ int main(void) {
      * menu; the request is local to this frame and needs no persistent state. */
     if (open_menu) drastic_menu_open(menu);
     boot_frames++;
+  }
+  if (lifecycle_hooked) {
+    appletUnhook(&lifecycle_cookie);
+    appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleep);
   }
   if (cpu_boost_active) cpu_boost(0);
   if (boot_frames == 0 &&

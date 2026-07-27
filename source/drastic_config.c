@@ -7,6 +7,7 @@
 
 #include "config.h"
 #include "drastic_config.h"
+#include "drastic_rotation.h"
 #include "prefs.h"
 
 static int clamp_int(int value, int minimum, int maximum) {
@@ -116,6 +117,12 @@ static DrasticVideoFilter read_filter(void) {
   return DRASTIC_FILTER_NEAREST;
 }
 
+static DrasticMicrophoneSource read_microphone_source(void) {
+  const char *source = prefs_get_string("Wrapper/MicrophoneSource", "noise");
+  return !strcmp(source, "external") ? DRASTIC_MICROPHONE_EXTERNAL
+                                     : DRASTIC_MICROPHONE_SIMULATED;
+}
+
 const char *drastic_config_filter_name(DrasticVideoFilter filter) {
   static const char *names[DRASTIC_FILTER_COUNT] = {
     "nearest", "linear", "quilez", "scanline", "scale2x", "hq2x", "fxaa",
@@ -166,6 +173,9 @@ void drastic_config_load(DrasticRuntimeConfig *config) {
            prefs_get_string("Wrapper/CustomShader", ""));
   config->show_fps = prefs_get_bool("Drastic/ShowFPS", false);
   config->volume = clamp_int(prefs_get_int("Wrapper/Volume", 100), 0, 100);
+  config->microphone_enabled =
+      prefs_get_bool("Drastic/MicEnabled", true);
+  config->microphone_source = read_microphone_source();
   config->autosave_seconds = clamp_int(
       prefs_get_int("Drastic/AutosaveInterval", 300), 0, 3600);
   config->vibration = prefs_get_bool("Wrapper/Vibration", true);
@@ -299,14 +309,17 @@ void drastic_config_calculate_layout(DrasticRuntimeConfig *config,
   }
 }
 
-bool drastic_config_map_touch(const DrasticRuntimeConfig *config,
-                              float panel_x, float panel_y,
-                              int *ds_x, int *ds_y) {
+bool drastic_config_map_touch_rects(const DrasticScreenRect *screens,
+                                    int screen_count, int rotation,
+                                    float panel_x, float panel_y,
+                                    int *ds_x, int *ds_y) {
+  if (!screens || screen_count <= 0) return false;
   /* Prefer the largest bottom-screen rectangle in hybrid modes. */
   const DrasticScreenRect *target = NULL;
-  for (int index = 0; index < config->screen_count; index++) {
-    const DrasticScreenRect *rect = &config->screens[index];
-    if (!rect->touch_target || panel_x < rect->x || panel_y < rect->y ||
+  for (int index = 0; index < screen_count; index++) {
+    const DrasticScreenRect *rect = &screens[index];
+    if (!rect->touch_target || rect->width <= 0.0f ||
+        rect->height <= 0.0f || panel_x < rect->x || panel_y < rect->y ||
         panel_x >= rect->x + rect->width ||
         panel_y >= rect->y + rect->height)
       continue;
@@ -314,21 +327,23 @@ bool drastic_config_map_touch(const DrasticRuntimeConfig *config,
       target = rect;
   }
   if (!target) return false;
-  float x = (panel_x - target->x) * 256.0f / target->width;
-  float y = (panel_y - target->y) * 192.0f / target->height;
-  int ix = clamp_int((int)x, 0, 255);
-  int iy = clamp_int((int)y, 0, 191);
-  switch (config->rotation & 3) {
-    case 1: { int old = ix; ix = clamp_int((int)(y * 256.0f / 192.0f), 0, 255);
-              iy = clamp_int(191 - (old * 192 / 256), 0, 191); break; }
-    case 2: ix = 255 - ix; iy = 191 - iy; break;
-    case 3: { int old = ix; ix = clamp_int(255 - (int)(y * 256.0f / 192.0f), 0, 255);
-              iy = clamp_int(old * 192 / 256, 0, 191); break; }
-    default: break;
-  }
-  if (ds_x) *ds_x = ix;
-  if (ds_y) *ds_y = iy;
+  const float display_u = (panel_x - target->x) / target->width;
+  const float display_v = (panel_y - target->y) / target->height;
+  float source_u, source_v;
+  drastic_rotation_display_to_source(rotation, display_u, display_v,
+                                     &source_u, &source_v);
+  if (ds_x) *ds_x = clamp_int((int)(source_u * 256.0f), 0, 255);
+  if (ds_y) *ds_y = clamp_int((int)(source_v * 192.0f), 0, 191);
   return true;
+}
+
+bool drastic_config_map_touch(const DrasticRuntimeConfig *config,
+                              float panel_x, float panel_y,
+                              int *ds_x, int *ds_y) {
+  if (!config) return false;
+  return drastic_config_map_touch_rects(
+      config->screens, config->screen_count, config->rotation,
+      panel_x, panel_y, ds_x, ds_y);
 }
 
 bool drastic_config_map_stylus(const DrasticRuntimeConfig *config,
@@ -345,12 +360,8 @@ bool drastic_config_map_stylus(const DrasticRuntimeConfig *config,
   float source_u = (float)clamp_int(ds_x, 0, 255) / 255.0f;
   float source_v = (float)clamp_int(ds_y, 0, 191) / 191.0f;
   float display_u, display_v;
-  switch (config->rotation & 3) {
-    case 1: display_u = 1.0f - source_v; display_v = source_u; break;
-    case 2: display_u = 1.0f - source_u; display_v = 1.0f - source_v; break;
-    case 3: display_u = source_v; display_v = 1.0f - source_u; break;
-    default: display_u = source_u; display_v = source_v; break;
-  }
+  drastic_rotation_source_to_display(config->rotation, source_u, source_v,
+                                     &display_u, &display_v);
   if (panel_x) *panel_x = target->x + display_u * target->width;
   if (panel_y) *panel_y = target->y + display_v * target->height;
   return true;

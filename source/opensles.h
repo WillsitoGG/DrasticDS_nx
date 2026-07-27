@@ -2,6 +2,7 @@
 #define DRASTIC_NX_OPENSLES_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "SLES/OpenSLES.h"
@@ -48,7 +49,24 @@ extern const SLInterfaceID SL_IID_ANDROIDSIMPLEBUFFERQUEUE;
 extern const SLInterfaceID SL_IID_VOLUME;
 extern const SLInterfaceID SL_IID_RECORD;
 
+typedef enum {
+  OPENSLES_MIC_SOURCE_SIMULATED = 0,
+  OPENSLES_MIC_SOURCE_EXTERNAL = 1,
+} OpenSLESMicrophoneSource;
+
+typedef enum {
+  OPENSLES_MIC_STATUS_DISABLED = 0,
+  OPENSLES_MIC_STATUS_SIMULATED,
+  OPENSLES_MIC_STATUS_CONNECTING,
+  OPENSLES_MIC_STATUS_ACTIVE,
+  OPENSLES_MIC_STATUS_UNAVAILABLE,
+} OpenSLESMicrophoneStatus;
+
 void opensles_set_master_volume(unsigned percent);
+void opensles_set_microphone_enabled(bool enabled);
+void opensles_set_microphone_source(OpenSLESMicrophoneSource source);
+OpenSLESMicrophoneStatus opensles_get_microphone_status(void);
+void opensles_set_suspended(bool suspended);
 void opensles_shutdown(void);
 
 #ifdef __cplusplus

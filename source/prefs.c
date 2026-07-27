@@ -88,6 +88,7 @@ static void seed_defaults(void) {
   seed("Wrapper/LSFGFlowScale", "0.25");
   seed("Wrapper/LSFGPerformance", "true");
   seed("Wrapper/Volume", "100");
+  seed("Wrapper/MicrophoneSource", "noise");
   seed("Wrapper/Vibration", "true");
   seed("Wrapper/Motion", "true");
   seed("Wrapper/AnalogDpad", "true");
@@ -99,6 +100,11 @@ static void seed_defaults(void) {
   seed("Wrapper/HotkeyMenu", "L+R+Plus");
   seed("Wrapper/HotkeySwapScreens", "ZL");
   seed("Wrapper/HotkeyMicrophone", "StickL");
+  seed("Wrapper/HotkeySaveState", "L+R+Minus+Y");
+  seed("Wrapper/HotkeyLoadState", "L+R+Minus+X");
+  seed("Wrapper/HotkeyNextSlot", "L+R+Minus+Up");
+  seed("Wrapper/HotkeyPreviousSlot", "L+R+Minus+Down");
+  seed("Wrapper/HotkeyReset", "L+R+Minus+A");
   seed("Wrapper/HotkeyQuit", "None");
   seed("Wrapper/StateSlot", "0");
   seed("Wrapper/CustomTopX", "0.30");
@@ -162,17 +168,37 @@ static void seed_defaults(void) {
 static void migrate_hotkey_defaults(void) {
   const int version_index = find_entry("Wrapper/HotkeyDefaultsVersion");
   const int version = version_index < 0 ? 0 : atoi(entries[version_index].value);
-  if (version >= 2) return;
+  if (version >= 3) return;
 
   const int menu_index = find_entry("Wrapper/HotkeyMenu");
   const int quit_index = find_entry("Wrapper/HotkeyQuit");
-  if (menu_index >= 0 && quit_index >= 0 &&
+  if (version < 2 && menu_index >= 0 && quit_index >= 0 &&
       !strcasecmp(entries[menu_index].value, "L+R+Minus") &&
       !strcasecmp(entries[quit_index].value, "L+R+Plus")) {
     put_entry("Wrapper/HotkeyMenu", "L+R+Plus");
     put_entry("Wrapper/HotkeyQuit", "None");
   }
-  put_entry("Wrapper/HotkeyDefaultsVersion", "2");
+  struct HotkeyDefault {
+    const char *key;
+    const char *old_value;
+    const char *new_value;
+  };
+  static const struct HotkeyDefault safer_defaults[] = {
+    {"Wrapper/HotkeySaveState", "L+R+Y", "L+R+Minus+Y"},
+    {"Wrapper/HotkeyLoadState", "L+R+X", "L+R+Minus+X"},
+    {"Wrapper/HotkeyNextSlot", "L+R+Up", "L+R+Minus+Up"},
+    {"Wrapper/HotkeyPreviousSlot", "L+R+Down", "L+R+Minus+Down"},
+    {"Wrapper/HotkeyReset", "L+R+A", "L+R+Minus+A"},
+  };
+  for (unsigned index = 0;
+       index < sizeof(safer_defaults) / sizeof(*safer_defaults); index++) {
+    const int entry_index = find_entry(safer_defaults[index].key);
+    if (entry_index >= 0 &&
+        !strcasecmp(entries[entry_index].value,
+                    safer_defaults[index].old_value))
+      put_entry(safer_defaults[index].key, safer_defaults[index].new_value);
+  }
+  put_entry("Wrapper/HotkeyDefaultsVersion", "3");
 }
 
 static void migrate_fast_forward_speed(void) {

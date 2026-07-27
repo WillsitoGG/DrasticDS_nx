@@ -30,6 +30,7 @@
 #include "drastic_dfx.h"
 #include "drastic_custom_shader.h"
 #include "drastic_renderer.h"
+#include "drastic_rotation.h"
 #include "drastic_vk_capture.h"
 #include "drastic_smaa_area_rgb_bin.h"
 #include "drastic_smaa_search_rgb_bin.h"
@@ -1719,13 +1720,14 @@ bool drastic_renderer_set_custom_shader(const char *relative_path,
 const char *drastic_renderer_last_error(void) { return g_renderer_error; }
 
 static void uv_for_rotation(int rotation, float uv[8]) {
-  static const float corners[4][8] = {
-    {0, 0, 1, 0, 0, 1, 1, 1},
-    {0, 1, 0, 0, 1, 1, 1, 0},
-    {1, 1, 0, 1, 1, 0, 0, 0},
-    {1, 0, 1, 1, 0, 0, 0, 1},
-  };
-  memcpy(uv, corners[rotation & 3], sizeof(corners[0]));
+  drastic_rotation_display_to_source(rotation, 0.0f, 0.0f,
+                                     &uv[0], &uv[1]);
+  drastic_rotation_display_to_source(rotation, 1.0f, 0.0f,
+                                     &uv[2], &uv[3]);
+  drastic_rotation_display_to_source(rotation, 0.0f, 1.0f,
+                                     &uv[4], &uv[5]);
+  drastic_rotation_display_to_source(rotation, 1.0f, 1.0f,
+                                     &uv[6], &uv[7]);
 }
 
 static void set_vertex(Vertex *vertex, float pixel_x, float pixel_y,
@@ -1776,8 +1778,11 @@ static void add_custom_rectangle(const DrasticScreenRect *rectangle,
   CustomFinalDraw *draw = &g_custom_draws[g_custom_draw_count++];
   draw->first_vertex = g_vertex_count;
   draw->screen = rectangle->screen ? 1 : 0;
-  draw->target_width = rectangle->width;
-  draw->target_height = rectangle->height;
+  /* Final filters run in rotated UV space. Keep DraStic's target-size
+   * uniform aligned with those texture axes rather than the physical output
+   * rectangle, whose width/height are exchanged by a quarter-turn. */
+  draw->target_width = (rotation & 1) ? rectangle->height : rectangle->width;
+  draw->target_height = (rotation & 1) ? rectangle->width : rectangle->height;
   Vertex *vertices = (Vertex *)(g_staging_mapped + g_staging_base +
                                 g_vertex_offset) +
                      g_vertex_count;
@@ -1841,10 +1846,14 @@ static void build_draws(const DrasticRuntimeConfig *config,
       const int screen_index = rectangle->screen ? 1 : 0;
       const int texture = texture_for_role(screen_index,
                                            chain->final_texture);
+      const float target_width = (config->rotation & 1)
+          ? rectangle->height : rectangle->width;
+      const float target_height = (config->rotation & 1)
+          ? rectangle->width : rectangle->height;
       const DrawParameters screen = texture_parameters(
           final_effect(chain), 2, (float)g_textures[texture].width,
-          (float)g_textures[texture].height, rectangle->width,
-          rectangle->height);
+          (float)g_textures[texture].height, target_width,
+          target_height);
       add_rectangle(rectangle->x, rectangle->y, rectangle->width,
                     rectangle->height, config->rotation,
                     texture, chain->final_sampler,
@@ -2250,9 +2259,9 @@ bool drastic_renderer_init(const DrasticRuntimeConfig *config) {
   const VkApplicationInfo application = {
     .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
     .pApplicationName = "DrasticDS_nx",
-    .applicationVersion = VK_MAKE_VERSION(1, 0, 3),
+    .applicationVersion = VK_MAKE_VERSION(1, 0, 6),
     .pEngineName = "Drastic Switch wrapper",
-    .engineVersion = VK_MAKE_VERSION(1, 0, 3),
+    .engineVersion = VK_MAKE_VERSION(1, 0, 6),
     .apiVersion = VK_API_VERSION_1_1,
   };
   const VkInstanceCreateInfo instance_info = {
@@ -2366,8 +2375,13 @@ static int wait_frame_slot(uint32_t slot_index) {
     }
   }
 
-  if (!vk_ok(vkWaitForFences(g_device, 1, &completion, VK_TRUE,
-                              UINT64_MAX)))
+  /* Keep the applet message pump reachable while HOME/sleep is taking the VI
+   * display away. With an infinite wait the focus notification cannot be
+   * processed, leaving the process stuck before it can enter a clean suspend. */
+  const VkResult waited = vkWaitForFences(
+      g_device, 1, &completion, VK_TRUE, UINT64_C(50000000));
+  if (waited == VK_TIMEOUT) return 0;
+  if (!vk_ok(waited))
     return 0;
   slot->pending = 0;
   return 1;
@@ -2416,8 +2430,13 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
 
   uint32_t image_index = 0;
   const VkResult acquired = vkAcquireNextImageKHR(
-      g_device, g_swapchain, UINT64_MAX, frame->acquired, VK_NULL_HANDLE,
+      g_device, g_swapchain, UINT64_C(50000000), frame->acquired,
+      VK_NULL_HANDLE,
       &image_index);
+  if (acquired == VK_TIMEOUT) {
+    capture_core_frame(core_render, env, clazz, &core_frame_consumed);
+    return;
+  }
   if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
     capture_core_frame(core_render, env, clazz, &core_frame_consumed);
     return;
@@ -2509,6 +2528,20 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
       return;
   }
   g_frames++;
+}
+
+void drastic_renderer_suspend(void) {
+  if (!g_device) return;
+  if (vkDeviceWaitIdle(g_device) != VK_SUCCESS) return;
+  for (uint32_t index = 0; index < g_frame_slot_count; index++)
+    g_frame_slots[index].pending = 0;
+}
+
+void drastic_renderer_resume(void) {
+  /* The device and VI swapchain survive Switch application suspension. Force
+   * cached post-FX and overlay content to be refreshed on the first frame. */
+  g_filter_valid[0] = g_filter_valid[1] = 0;
+  g_overlay_generation = UINT64_MAX;
 }
 
 void drastic_renderer_shutdown(void) {

@@ -30,6 +30,11 @@ typedef enum {
   DRASTIC_FILTER_COUNT,
 } DrasticVideoFilter;
 
+typedef enum {
+  DRASTIC_MICROPHONE_SIMULATED,
+  DRASTIC_MICROPHONE_EXTERNAL,
+} DrasticMicrophoneSource;
+
 typedef struct {
   float x;
   float y;
@@ -54,6 +59,8 @@ typedef struct {
   char custom_shader[DRASTIC_CUSTOM_SHADER_PATH_MAX];
   int show_fps;
   int volume;
+  int microphone_enabled;
+  DrasticMicrophoneSource microphone_source;
   int autosave_seconds;
   int vibration;
   int motion;
@@ -78,6 +85,10 @@ void drastic_config_calculate_layout(DrasticRuntimeConfig *config,
 bool drastic_config_map_touch(const DrasticRuntimeConfig *config,
                               float panel_x, float panel_y,
                               int *ds_x, int *ds_y);
+bool drastic_config_map_touch_rects(const DrasticScreenRect *screens,
+                                    int screen_count, int rotation,
+                                    float panel_x, float panel_y,
+                                    int *ds_x, int *ds_y);
 bool drastic_config_map_stylus(const DrasticRuntimeConfig *config,
                                int ds_x, int ds_y,
                                float *panel_x, float *panel_y);

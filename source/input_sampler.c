@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "drastic_rotation.h"
 #include "pthr.h"
 
 #define INPUT_SAMPLE_INTERVAL_NS UINT64_C(1000000)
@@ -39,12 +40,6 @@ struct DrasticInputSampler {
   u64 stylus_visible_until;
 };
 
-static int clamp_int(int value, int minimum, int maximum) {
-  if (value < minimum) return minimum;
-  if (value > maximum) return maximum;
-  return value;
-}
-
 static float normalized_axis(int value) {
   float result = (float)value / 32767.0f;
   if (result < -1.0f) result = -1.0f;
@@ -52,76 +47,8 @@ static float normalized_axis(int value) {
   return result;
 }
 
-static void map_stylus_delta(int rotation, float display_x, float display_y,
-                             float *source_x, float *source_y) {
-  /* The virtual stylus is stored in unrotated DS coordinates, while stick
-   * movement must follow the image visible to the player.  Apply the inverse
-   * of drastic_config_map_stylus()'s source-to-display rotation. */
-  switch (rotation & 3) {
-    case 1:
-      *source_x = display_y;
-      *source_y = -display_x;
-      break;
-    case 2:
-      *source_x = -display_x;
-      *source_y = -display_y;
-      break;
-    case 3:
-      *source_x = -display_y;
-      *source_y = display_x;
-      break;
-    default:
-      *source_x = display_x;
-      *source_y = display_y;
-      break;
-  }
-}
-
 static int combo_held(u64 held, u64 combo) {
   return combo && (held & combo) == combo;
-}
-
-static int map_touch(const InputRuntime *runtime, float panel_x, float panel_y,
-                     int *ds_x, int *ds_y) {
-  const DrasticScreenRect *target = NULL;
-  for (int index = 0; index < runtime->screen_count; index++) {
-    const DrasticScreenRect *rect = &runtime->screens[index];
-    if (!rect->touch_target || panel_x < rect->x || panel_y < rect->y ||
-        panel_x >= rect->x + rect->width ||
-        panel_y >= rect->y + rect->height)
-      continue;
-    if (!target || rect->width * rect->height > target->width * target->height)
-      target = rect;
-  }
-  if (!target || target->width <= 0.0f || target->height <= 0.0f) return 0;
-
-  const float x = (panel_x - target->x) * 256.0f / target->width;
-  const float y = (panel_y - target->y) * 192.0f / target->height;
-  int ix = clamp_int((int)x, 0, 255);
-  int iy = clamp_int((int)y, 0, 191);
-  switch (runtime->rotation & 3) {
-    case 1: {
-      const int old = ix;
-      ix = clamp_int((int)(y * 256.0f / 192.0f), 0, 255);
-      iy = clamp_int(191 - old * 192 / 256, 0, 191);
-      break;
-    }
-    case 2:
-      ix = 255 - ix;
-      iy = 191 - iy;
-      break;
-    case 3: {
-      const int old = ix;
-      ix = clamp_int(255 - (int)(y * 256.0f / 192.0f), 0, 255);
-      iy = clamp_int(old * 192 / 256, 0, 191);
-      break;
-    }
-    default:
-      break;
-  }
-  *ds_x = ix;
-  *ds_y = iy;
-  return 1;
 }
 
 static int map_buttons(const DrasticInputSampler *sampler, u64 held,
@@ -205,8 +132,8 @@ static void *input_thread_main(void *opaque) {
       const float display_x = normalized_axis(right.x);
       const float display_y = -normalized_axis(right.y);
       float source_x, source_y;
-      map_stylus_delta(runtime.rotation, display_x, display_y,
-                       &source_x, &source_y);
+      drastic_rotation_display_delta_to_source(
+          runtime.rotation, display_x, display_y, &source_x, &source_y);
       sampler->stylus_x += source_x * sampler->config.stylus_speed *
                            frame_scale;
       sampler->stylus_y += source_y * sampler->config.stylus_speed *
@@ -238,7 +165,9 @@ static void *input_thread_main(void *opaque) {
                             sampler->config.panel_width / 1280.0f;
       const float panel_y = (float)touch.touches[0].y *
                             sampler->config.panel_height / 720.0f;
-      if (map_touch(&runtime, panel_x, panel_y, &x, &y)) {
+      if (drastic_config_map_touch_rects(
+              runtime.screens, runtime.screen_count, runtime.rotation,
+              panel_x, panel_y, &x, &y)) {
         touching = 1;
         physical_touch = 1;
         touch_position = (x << 16) | y;

@@ -18,6 +18,8 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
                               void *env, void *clazz,
                               const DrasticOverlayFrame *overlay,
                               bool consume_core_frame);
+void drastic_renderer_suspend(void);
+void drastic_renderer_resume(void);
 void drastic_renderer_shutdown(void);
 unsigned drastic_renderer_frame_count(void);
 bool drastic_renderer_lsfg_available(void);

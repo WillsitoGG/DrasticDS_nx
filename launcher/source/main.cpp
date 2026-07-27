@@ -86,15 +86,33 @@ static bool storeHas(const Store &s, const char *key) {
   return false;
 }
 static bool migrateHotkeyDefaults(Store &store) {
-  if (atoi(storeGet(store, "Wrapper/HotkeyDefaultsVersion", "0")) >= 2)
+  const int version = atoi(storeGet(
+      store, "Wrapper/HotkeyDefaultsVersion", "0"));
+  if (version >= 3)
     return false;
 
-  if (!strcasecmp(storeGet(store, "Wrapper/HotkeyMenu", ""), "L+R+Minus") &&
+  if (version < 2 &&
+      !strcasecmp(storeGet(store, "Wrapper/HotkeyMenu", ""), "L+R+Minus") &&
       !strcasecmp(storeGet(store, "Wrapper/HotkeyQuit", ""), "L+R+Plus")) {
     storeSet(store, "Wrapper/HotkeyMenu", "L+R+Plus");
     storeSet(store, "Wrapper/HotkeyQuit", "None");
   }
-  storeSet(store, "Wrapper/HotkeyDefaultsVersion", "2");
+  struct HotkeyDefault {
+    const char *key;
+    const char *oldValue;
+    const char *newValue;
+  };
+  static const HotkeyDefault saferDefaults[] = {
+    {"Wrapper/HotkeySaveState", "L+R+Y",    "L+R+Minus+Y"},
+    {"Wrapper/HotkeyLoadState", "L+R+X",    "L+R+Minus+X"},
+    {"Wrapper/HotkeyNextSlot",  "L+R+Up",   "L+R+Minus+Up"},
+    {"Wrapper/HotkeyPreviousSlot", "L+R+Down", "L+R+Minus+Down"},
+    {"Wrapper/HotkeyReset",     "L+R+A",    "L+R+Minus+A"},
+  };
+  for (const HotkeyDefault &binding : saferDefaults)
+    if (!strcasecmp(storeGet(store, binding.key, ""), binding.oldValue))
+      storeSet(store, binding.key, binding.newValue);
+  storeSet(store, "Wrapper/HotkeyDefaultsVersion", "3");
   return true;
 }
 static bool normalizeCpuThreads(Store &store) {
@@ -107,6 +125,26 @@ static bool normalizeCpuThreads(Store &store) {
 static bool migrateLauncherSettings(Store &store) {
   bool changed = migrateHotkeyDefaults(store);
   changed = normalizeCpuThreads(store) || changed;
+
+  /* The original launcher option was a boolean whose enabled state rendered
+     the UI at 90 degrees. Preserve that exact orientation while replacing it
+     with the complete four-way rotation setting. */
+  if (!storeHas(store, "Wrapper/LauncherRotation")) {
+    const bool portrait = storeHas(store, "Wrapper/LauncherPortrait") &&
+        !strcmp(storeGet(store, "Wrapper/LauncherPortrait", "false"), "true");
+    storeSet(store, "Wrapper/LauncherRotation", portrait ? "1" : "0");
+    changed = true;
+  }
+  if (storeHas(store, "Wrapper/LauncherPortrait")) {
+    storeRemove(store, "Wrapper/LauncherPortrait");
+    changed = true;
+  }
+  const int launcherRotation = atoi(storeGet(
+      store, "Wrapper/LauncherRotation", "0"));
+  if (launcherRotation < 0 || launcherRotation > 3) {
+    storeSet(store, "Wrapper/LauncherRotation", "0");
+    changed = true;
+  }
 
   /* Startup boost is now an unconditional host policy, and cheat enablement
      is controlled per title from the in-game overlay. Do not keep obsolete
@@ -381,6 +419,8 @@ static const Choice C_rotation[] = { {"0 degrees","0"}, {"90 degrees","1"}, {"18
                                      {"FXAA high quality","fxaa_hq"}, {"SMAA","smaa"},
                                      {"Custom shader","custom"} };
 static const Choice C_latency[]  = { {"Low","0"}, {"Balanced","1"}, {"High compatibility","2"}, {"Maximum","3"} };
+static const Choice C_micSource[] = { {"Simulated noise","noise"},
+                                      {"External microphone","external"} };
 static const Choice C_micLevel[] = { {"Low","0"}, {"Normal","1"}, {"High","2"}, {"Maximum","3"} };
 static const Choice C_threads[]  = { {"1","1"}, {"2","2"}, {"3 (recommended)","3"} };
 static const Choice C_frameskipType[] = { {"Automatic","0"}, {"Fixed","1"}, {"Aggressive","2"}, {"Maximum","3"} };
@@ -397,6 +437,20 @@ static const Choice C_slot2[]    = { {"None","0"}, {"GBA Cart","1"},
 static const Choice C_autosave[] = { {"Off","0"}, {"1 minute","60"}, {"5 minutes","300"}, {"10 minutes","600"}, {"30 minutes","1800"} };
 static const Choice C_firmwareLanguage[] = { {g_autoFirmwareLanguage,"-1"}, {"Japanese","0"}, {"English","1"}, {"French","2"}, {"German","3"},
                                              {"Italian","4"}, {"Spanish","5"}, {"Korean","6"} };
+/* Nintendo DS IPL user-color order and RGB15 palette. The stored values stay
+   identical to DraStic's native 0..15 firmware field. */
+static const Choice C_firmwareColor[] = {
+  {"Gray","0"}, {"Brown","1"}, {"Red","2"}, {"Pink","3"},
+  {"Orange","4"}, {"Yellow","5"}, {"Lime green","6"}, {"Green","7"},
+  {"Dark green","8"}, {"Sea green","9"}, {"Turquoise","10"}, {"Blue","11"},
+  {"Dark blue","12"}, {"Dark purple","13"}, {"Violet","14"}, {"Magenta","15"},
+};
+static const SDL_Color C_firmwareColorRgb[] = {
+  { 99,132,156,255}, {189, 74,  0,255}, {255,  0, 24,255}, {255,140,255,255},
+  {255,148,  0,255}, {247,231,  0,255}, {173,255,  0,255}, {  0,255,  0,255},
+  {  0,165, 57,255}, { 74,222,140,255}, { 49,189,247,255}, {  0, 90,247,255},
+  {  0,  0,148,255}, {140,  0,214,255}, {214,  0,239,255}, {255,  0,148,255},
+};
 static const Choice C_btn[]      = { {"A","A"},{"B","B"},{"X","X"},{"Y","Y"},{"L","L"},{"R","R"},{"ZL","ZL"},{"ZR","ZR"},
                                      {"Plus","Plus"},{"Minus","Minus"},{"L-Stick","StickL"},{"R-Stick","StickR"},
                                      {"D-Up","Up"},{"D-Down","Down"},{"D-Left","Left"},{"D-Right","Right"},{"None","None"} };
@@ -444,7 +498,9 @@ static const Opt S_audio[] = {
   O_CHOICE("Sound",             "Drastic/SoundEnabled", C_bool, "true"),
   O_RANGE ("Volume",            "Wrapper/Volume", 0, 100, 5, "100"),
   O_CHOICE("Audio latency",     "Drastic/AudioLatency", C_latency, "2"),
-  O_CHOICE("Microphone emulation", "Drastic/MicEnabled", C_bool, "true"),
+  O_CHOICE("Microphone",           "Drastic/MicEnabled", C_bool, "true"),
+  O_CHOICEG("Microphone source", "Wrapper/MicrophoneSource", C_micSource,
+            "noise", "Drastic/MicEnabled", "false"),
   O_CHOICEG("Microphone level", "Drastic/MicLevel", C_micLevel, "1", "Drastic/MicEnabled", "false"),
 };
 static const Opt S_emu[] = {
@@ -494,11 +550,11 @@ static const Opt S_controller[] = {
   O_HOTKEY("Microphone hotkey",   "Wrapper/HotkeyMicrophone", "StickL"),
   O_HOTKEY("Auto-fire modifier",  "Wrapper/HotkeyAutoFire", "None"),
   O_HOTKEY("Close/open lid",      "Wrapper/HotkeyLid", "None"),
-  O_HOTKEY("Save state",          "Wrapper/HotkeySaveState", "L+R+Y"),
-  O_HOTKEY("Load state",          "Wrapper/HotkeyLoadState", "L+R+X"),
-  O_HOTKEY("Next state slot",     "Wrapper/HotkeyNextSlot", "L+R+Up"),
-  O_HOTKEY("Previous state slot", "Wrapper/HotkeyPreviousSlot", "L+R+Down"),
-  O_HOTKEY("Reset game",          "Wrapper/HotkeyReset", "L+R+A"),
+  O_HOTKEY("Save state",          "Wrapper/HotkeySaveState", "L+R+Minus+Y"),
+  O_HOTKEY("Load state",          "Wrapper/HotkeyLoadState", "L+R+Minus+X"),
+  O_HOTKEY("Next state slot",     "Wrapper/HotkeyNextSlot", "L+R+Minus+Up"),
+  O_HOTKEY("Previous state slot", "Wrapper/HotkeyPreviousSlot", "L+R+Minus+Down"),
+  O_HOTKEY("Reset game",          "Wrapper/HotkeyReset", "L+R+Minus+A"),
   O_HOTKEY("Quit to launcher",    "Wrapper/HotkeyQuit", "None"),
 };
 static const Opt S_framerate[] = {
@@ -511,13 +567,13 @@ static const Opt S_framerate[] = {
 static const Opt S_firmware[] = {
   O_TEXT  ("Nickname",           "Drastic/FirmwareNickname", "Switch"),
   O_CHOICE("Language",           "Drastic/FirmwareLanguage", C_firmwareLanguage, "-1"),
-  O_RANGE ("Favorite color",     "Drastic/FirmwareColor", 0, 15, 1, "0"),
+  O_CHOICE("Favorite color",     "Drastic/FirmwareColor", C_firmwareColor, "0"),
   O_RANGE ("Birthday month",     "Drastic/FirmwareBirthdayMonth", 1, 12, 1, "6"),
   O_RANGE ("Birthday day",       "Drastic/FirmwareBirthdayDay", 1, 31, 1, "6"),
 };
 static const Opt S_launcher[] = {
   O_CHOICE("Theme",             "Wrapper/Theme",          C_launcherTheme, "animated"),
-  O_CHOICE("Portrait launcher", "Wrapper/LauncherPortrait", C_bool,          "false"),
+  O_CHOICE("Launcher rotation", "Wrapper/LauncherRotation", C_rotation,       "0"),
   O_CHOICE("Games per row",     "Wrapper/GridColumns",    C_gridColumns,   "6"),
   O_CHOICE("Rows per page",     "Wrapper/GridRows",       C_gridRows,      "2"),
   O_CHOICE("Show game titles",  "Wrapper/ShowGameTitles", C_bool,          "true"),
@@ -595,9 +651,13 @@ static const SettingHelpEntry SETTING_HELP[] = {
   {"Drastic/AudioLatency", "Audio latency / stability",
    "Controls DraStic's audio buffering. Lower settings react sooner but are more likely to crackle or stutter; higher settings are safer when a game cannot maintain steady speed."},
   {"Drastic/MicEnabled", "Nintendo DS microphone",
-   "Enables the emulated DS microphone input path. On Switch, the microphone hotkey supplies simulated noise for games that expect blowing or voice input."},
+   "Enables the emulated DS microphone input path. Its source can be simulated noise or a compatible microphone connected to the Switch."},
+  {"Wrapper/MicrophoneSource", "Nintendo DS microphone",
+   "Simulated noise uses the configured microphone hotkey for games that expect blowing. External microphone captures real audio from a CTIA headset microphone or compatible USB input; Bluetooth microphone input is not supported by Switch."},
   {"Drastic/MicLevel", "Nintendo DS microphone",
-   "Sets the strength of the simulated microphone signal sent to the game."},
+   "Sets the microphone strength supplied to the game for both simulated and external input."},
+  {"Wrapper/HotkeyMicrophone", "Nintendo DS microphone",
+   "Feeds simulated white noise while held. This binding is intentionally inactive when External microphone is selected, because DraStic then receives the captured waveform directly."},
 
   {"Drastic/CpuThreads", "CPU performance",
    "Sets the number of host worker threads DraStic may use. Switch applications have three usable CPU cores, so 3 is recommended; reduce it only for troubleshooting."},
@@ -660,7 +720,7 @@ static const SettingHelpEntry SETTING_HELP[] = {
   {"Drastic/FirmwareLanguage", "Firmware profile",
    "Sets the language reported by the emulated DS firmware. Auto follows the Switch system language and falls back to English when that language is not supported by Nintendo DS."},
   {"Drastic/FirmwareColor", "Firmware profile",
-   "Sets the favorite-color index stored in the emulated Nintendo DS user profile. Some games use it for personalization."},
+   "Sets the favorite color stored in the emulated Nintendo DS user profile using the original 16-color Nintendo DS palette. Some games use it for personalization."},
   {"Drastic/FirmwareBirthdayMonth", "Firmware profile",
    "Sets the birthday month stored in the emulated Nintendo DS user profile."},
   {"Drastic/FirmwareBirthdayDay", "Firmware profile",
@@ -668,8 +728,8 @@ static const SettingHelpEntry SETTING_HELP[] = {
 
   {"Wrapper/Theme", "Launcher appearance",
    "Changes the launcher background and visual theme. It does not affect gameplay rendering."},
-  {"Wrapper/LauncherPortrait", "Launcher orientation",
-   "Rotates and reflows the complete SDL launcher for vertical or tate use. Touch follows the portrait interface, while D-Pad and stick navigation keep their normal physical directions."},
+  {"Wrapper/LauncherRotation", "Launcher orientation",
+   "Rotates the complete SDL launcher by 0, 90, 180, or 270 degrees. The 90 and 270 degree modes use the portrait layout. Touch follows the displayed interface, while D-Pad and stick navigation keep their normal physical directions."},
   {"Wrapper/GridColumns", "Library layout",
    "Sets how many game covers are displayed across each library row. More columns make each cover smaller."},
   {"Wrapper/GridRows", "Library layout",
@@ -730,6 +790,7 @@ static TTF_Font     *g_font = nullptr, *g_font_sm = nullptr, *g_font_big = nullp
 static SDL_Texture  *g_logo = nullptr;
 static int SW = 1280, SH = 720;
 static int g_outputW = 1280, g_outputH = 720;
+static int g_launcherRotation = 0;
 static bool g_launcherPortrait = false;
 static SDL_Texture *g_uiTarget = nullptr;
 static bool g_romfsReady = false;
@@ -740,12 +801,14 @@ static bool g_plReady = false;
 static bool g_griddbReady = false;
 static bool g_storageSocketReady = false;
 
-static bool configureLauncherOrientation(bool portrait) {
+static bool configureLauncherOrientation(int rotation) {
   if(!g_ren || g_outputW<1 || g_outputH<1) return false;
-  if(!portrait){
+  if(rotation<0||rotation>3) rotation=0;
+  if(rotation==0){
     SDL_SetRenderTarget(g_ren,nullptr);
     if(g_uiTarget) SDL_DestroyTexture(g_uiTarget);
     g_uiTarget=nullptr;
+    g_launcherRotation=0;
     g_launcherPortrait=false;
     SW=g_outputW;
     SH=g_outputH;
@@ -753,10 +816,12 @@ static bool configureLauncherOrientation(bool portrait) {
     SDL_RenderSetScale(g_ren,1.0f,1.0f);
     return true;
   }
-  const int logicalWidth=g_outputH;
-  const int logicalHeight=g_outputW;
-  if(g_uiTarget && g_launcherPortrait==portrait &&
-     SW==logicalWidth && SH==logicalHeight) {
+  const bool portrait=(rotation&1)!=0;
+  const int logicalWidth=portrait?g_outputH:g_outputW;
+  const int logicalHeight=portrait?g_outputW:g_outputH;
+  if(g_uiTarget && SW==logicalWidth && SH==logicalHeight) {
+    g_launcherRotation=rotation;
+    g_launcherPortrait=portrait;
     SDL_SetRenderTarget(g_ren,g_uiTarget);
     return true;
   }
@@ -777,6 +842,7 @@ static bool configureLauncherOrientation(bool portrait) {
     return false;
   }
   g_uiTarget=target;
+  g_launcherRotation=rotation;
   g_launcherPortrait=portrait;
   SW=logicalWidth;
   SH=logicalHeight;
@@ -795,13 +861,15 @@ static void presentUi() {
   SDL_SetRenderTarget(g_ren,nullptr);
   SDL_SetRenderDrawColor(g_ren,0,0,0,255);
   SDL_RenderClear(g_ren);
-  /* RenderCopyEx rotates the destination rectangle around its centre.  The
-     pre-rotation rectangle therefore uses the physical height as its width
-     and the physical width as its height. */
-  SDL_Rect destination={(g_outputW-g_outputH)/2,
-                        (g_outputH-g_outputW)/2,
-                        g_outputH,g_outputW};
-  SDL_RenderCopyEx(g_ren,g_uiTarget,nullptr,&destination,90.0,nullptr,
+  /* Odd quarter-turns use a portrait render target. RenderCopyEx rotates its
+     destination around the centre, so its pre-rotation rectangle swaps the
+     physical dimensions and is centred beyond the output bounds. */
+  SDL_Rect destination = (g_launcherRotation&1)
+      ? SDL_Rect{(g_outputW-g_outputH)/2,(g_outputH-g_outputW)/2,
+                 g_outputH,g_outputW}
+      : SDL_Rect{0,0,g_outputW,g_outputH};
+  SDL_RenderCopyEx(g_ren,g_uiTarget,nullptr,&destination,
+                   g_launcherRotation*90.0,nullptr,
                    SDL_FLIP_NONE);
   SDL_RenderPresent(g_ren);
   SDL_SetRenderTarget(g_ren,g_uiTarget);
@@ -1290,7 +1358,8 @@ static void downloadAllCovers();
 static void toast(const char *msg);
 static void modalMessage(const char *title, const std::vector<std::string> &lines);
 static bool confirmBox(const char *title, const std::vector<std::string> &lines);
-static int dropdown(const char *title, const char *const *labels, int n, int cur);
+static int dropdown(const char *title, const char *const *labels, int n, int cur,
+                    const SDL_Color *swatches=nullptr);
 static void beginScreenFx();
 static void drawFadeIn();
 static int topBarH();
@@ -1452,12 +1521,23 @@ struct TouchG {
 static TouchG g_touch;
 static int g_touchScrollSteps=1;
 static void touchUiPoint(float normalizedX,float normalizedY,float &x,float &y){
-  if(g_launcherPortrait){
-    x=normalizedY*SW;
-    y=(1.0f-normalizedX)*SH;
-  } else {
-    x=normalizedX*SW;
-    y=normalizedY*SH;
+  switch(g_launcherRotation){
+    case 1:
+      x=normalizedY*SW;
+      y=(1.0f-normalizedX)*SH;
+      break;
+    case 2:
+      x=(1.0f-normalizedX)*SW;
+      y=(1.0f-normalizedY)*SH;
+      break;
+    case 3:
+      x=(1.0f-normalizedY)*SW;
+      y=normalizedX*SH;
+      break;
+    default:
+      x=normalizedX*SW;
+      y=normalizedY*SH;
+      break;
   }
 }
 static TouchKind touchFeed(const SDL_Event &e,int *ox,int *oy){
@@ -3480,6 +3560,23 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
     char v[256]; optValue(S.opts[i],v,sizeof(v));
     drawSettingsRowText(S.opts[i].label,v,slotY,colW,labelX,valX,
                         cur,lc,vc,S.opts[i].type==OT_SHADER);
+    if(S.opts[i].key && !strcmp(S.opts[i].key,"Drastic/FirmwareColor")){
+      int colorIndex=choiceIdx(S.opts[i]);
+      if(colorIndex>=0 && colorIndex<(int)(sizeof(C_firmwareColorRgb)/sizeof(*C_firmwareColorRgb))){
+        TTF_Font *valueFont=g_launcherPortrait?g_font_sm:g_font;
+        const int swatchSize=g_launcherPortrait?20:24;
+        int valueY=slotY+(rowH-TTF_FontHeight(valueFont))/2;
+        if(g_launcherPortrait){
+          const int gap=highResolutionUi()?5:3;
+          const int blockHeight=TTF_FontHeight(g_font)+gap+TTF_FontHeight(g_font_sm);
+          valueY=slotY+(rowH-blockHeight)/2+TTF_FontHeight(g_font)+gap;
+        }
+        const int swatchX=valX-textW(valueFont,v)-swatchSize-12;
+        const int swatchY=valueY+(TTF_FontHeight(valueFont)-swatchSize)/2;
+        fillRect(swatchX,swatchY,swatchSize,swatchSize,C_firmwareColorRgb[colorIndex]);
+        border(swatchX,swatchY,swatchSize,swatchSize,1,(SDL_Color){225,230,240,255});
+      }
+    }
   }
   if(S.n>vis){
     int trH=vis*rowH, trX=colX+colW+16, trY=listY-2;
@@ -3492,7 +3589,8 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
   presentUi();
 }
 
-static int dropdown(const char *title, const char *const *labels, int n, int cur) {
+static int dropdown(const char *title, const char *const *labels, int n, int cur,
+                    const SDL_Color *swatches) {
   int sel = (cur < 0 || cur >= n) ? 0 : cur, top = 0;
   const int rowH = 52;
   int vis = (SH - 200) / rowH; if (vis < 1) vis = 1; if (vis > n) vis = n;
@@ -3528,9 +3626,16 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
     for(int r=0;r<vis && top+r<n;r++){
       int i=top+r, y=ly+r*rowH; bool curr=(i==sel);
       if(curr){ fillRect(px+8,y,pw-16,rowH-4,COL_FOCUS); fillRect(px+8,y,5,rowH-4,COL_SEL); }
-      const int textX=px+34;
+      int textX=px+34;
       const int textY=y+(rowH-TTF_FontHeight(g_font))/2;
-      const int textWidth=pw-76;
+      if(swatches){
+        const int swatchSize=28;
+        const int swatchY=y+(rowH-swatchSize)/2;
+        fillRect(textX,swatchY,swatchSize,swatchSize,swatches[i]);
+        border(textX,swatchY,swatchSize,swatchSize,1,(SDL_Color){225,230,240,255});
+        textX+=swatchSize+14;
+      }
+      const int textWidth=px+pw-34-textX;
       if(curr)
         drawScrollTextL(g_font,textX,textY,textWidth,labels[i],COL_VAL);
       else
@@ -3548,7 +3653,9 @@ static void optChoosePopup(const Opt &o) {
   if(o.type!=OT_CHOICE || o.nch<=0) return;
   const char* labels[32]; int n = o.nch>32?32:o.nch;
   for(int i=0;i<n;i++) labels[i]=o.ch[i].label;
-  int idx = dropdown(o.label, labels, n, choiceIdx(o));
+  const SDL_Color *swatches=o.key&&!strcmp(o.key,"Drastic/FirmwareColor")
+      ? C_firmwareColorRgb : nullptr;
+  int idx = dropdown(o.label, labels, n, choiceIdx(o), swatches);
   if(idx>=0 && idx<o.nch) iniSet(o.key, o.ch[idx].val);
 }
 
@@ -3798,9 +3905,10 @@ static void launcherSettingsScreen() {
   int sel=std::max(0,std::min(savedSelection,rowCount-1)),top=0;
   auto applyChange=[&](){
     applyLauncherAppearance();
-    const bool requested=strcmp(storeGet(g_global,"Wrapper/LauncherPortrait","false"),"true")==0;
+    const int requested=atoi(storeGet(g_global,"Wrapper/LauncherRotation","0"));
     if(!configureLauncherOrientation(requested)){
-      storeSet(g_global,"Wrapper/LauncherPortrait",g_launcherPortrait?"true":"false");
+      storeSet(g_global,"Wrapper/LauncherRotation",
+               std::to_string(g_launcherRotation).c_str());
       toast("Could not change launcher orientation");
     } else {
       g_touch={};
@@ -5257,7 +5365,7 @@ int main(int argc, char **argv){
     storeSet(g_global,"Wrapper/SteamGridDBKey","");
     storeSet(g_global,"Wrapper/UiSounds","true");
     storeSet(g_global,"Wrapper/Theme","animated");
-    storeSet(g_global,"Wrapper/LauncherPortrait","false");
+    storeSet(g_global,"Wrapper/LauncherRotation","0");
     storeSet(g_global,"Wrapper/GridColumns","6");
     storeSet(g_global,"Wrapper/GridRows","2");
     storeSet(g_global,"Wrapper/Renderer","vk");
@@ -5276,9 +5384,9 @@ int main(int argc, char **argv){
     if(changed&&!storeSave(g_global,LAUNCHER_INI)) return startupFailure("Could not update launcher.ini.");
   }
   applyLauncherAppearance();
-  const bool portraitRequested=strcmp(
-      storeGet(g_global,"Wrapper/LauncherPortrait","false"),"true")==0;
-  if(!configureLauncherOrientation(portraitRequested))
+  const int launcherRotation=atoi(
+      storeGet(g_global,"Wrapper/LauncherRotation","0"));
+  if(!configureLauncherOrientation(launcherRotation))
     return startupFailure("Could not create the launcher interface surface.");
   uiAudioSetEnabled(strcmp(storeGet(g_global,"Wrapper/UiSounds","true"),"false")!=0);
   if(missingSystemFilesAtStartup){

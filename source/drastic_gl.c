@@ -13,6 +13,7 @@
 #include "drastic_dfx.h"
 #include "drastic_dfx_gl_generated.h"
 #include "drastic_renderer.h"
+#include "drastic_rotation.h"
 #include "drastic_smaa_area_rgb_bin.h"
 #include "drastic_smaa_search_rgb_bin.h"
 
@@ -628,13 +629,10 @@ static void uv_for_rotation(int rotation, float *tl_u, float *tl_v,
                             float *tr_u, float *tr_v,
                             float *bl_u, float *bl_v,
                             float *br_u, float *br_v) {
-  static const float corners[4][8] = {
-    {0,0, 1,0, 0,1, 1,1}, {0,1, 0,0, 1,1, 1,0},
-    {1,1, 0,1, 1,0, 0,0}, {1,0, 1,1, 0,0, 0,1},
-  };
-  const float *uv = corners[rotation & 3];
-  *tl_u=uv[0]; *tl_v=uv[1]; *tr_u=uv[2]; *tr_v=uv[3];
-  *bl_u=uv[4]; *bl_v=uv[5]; *br_u=uv[6]; *br_v=uv[7];
+  drastic_rotation_display_to_source(rotation, 0.0f, 0.0f, tl_u, tl_v);
+  drastic_rotation_display_to_source(rotation, 1.0f, 0.0f, tr_u, tr_v);
+  drastic_rotation_display_to_source(rotation, 0.0f, 1.0f, bl_u, bl_v);
+  drastic_rotation_display_to_source(rotation, 1.0f, 1.0f, br_u, br_v);
 }
 
 static void make_rect_vertices(const DrasticScreenRect *rect, int rotation,
@@ -664,8 +662,15 @@ static void draw_custom_screen(const DrasticScreenRect *rect, int rotation) {
   Vertex vertices[6];
   make_rect_vertices(rect, rotation, vertices);
   bind_geometry(program, vertices);
+  /* The final shader is fused with the rotated composite draw. DraStic's
+   * u_target_size is expressed in texture/shader space, so quarter-turns
+   * must exchange the physical destination axes. Without this, scanline
+   * phase and other pixel-grid effects are evaluated against the wrong
+   * dimension at 90/270 degrees. */
+  const int target_width = (int)((rotation & 1) ? rect->height : rect->width);
+  const int target_height = (int)((rotation & 1) ? rect->width : rect->height);
   set_program_parameters(program, input_width, input_height,
-                         (int)rect->width, (int)rect->height);
+                         target_width, target_height);
   for (int sampler = 0; sampler < pass->sampler_count; sampler++) {
     bind_custom_texture(screen, pass->sampler_textures[sampler], sampler);
     if (program->samplers[sampler] >= 0)
@@ -684,8 +689,10 @@ static void draw_screen(const DrasticScreenRect *rect, int rotation,
   make_rect_vertices(rect, rotation, vertices);
   const GlProgram *program = &g_programs[chain->final_shader];
   bind_geometry(program, vertices);
+  const int target_width = (int)((rotation & 1) ? rect->height : rect->width);
+  const int target_height = (int)((rotation & 1) ? rect->width : rect->height);
   set_program_parameters(program, texture_width, texture_height,
-                         (int)rect->width, (int)rect->height);
+                         target_width, target_height);
   glActiveTexture(GL_TEXTURE0);
   set_texture_filter(texture_for_role(screen, chain->final_texture),
                      chain->final_sampler);
@@ -907,6 +914,18 @@ void drastic_renderer_present(const DrasticRuntimeConfig *config,
     draw_overlay(config->rotation);
   eglSwapBuffers(g_display, g_surface);
   g_frames++;
+}
+
+void drastic_renderer_suspend(void) {
+  if (g_display != EGL_NO_DISPLAY && g_context != EGL_NO_CONTEXT)
+    glFinish();
+}
+
+void drastic_renderer_resume(void) {
+  if (g_display == EGL_NO_DISPLAY || g_context == EGL_NO_CONTEXT) return;
+  eglMakeCurrent(g_display, g_surface, g_surface, g_context);
+  g_filter_valid[0] = g_filter_valid[1] = 0;
+  g_overlay_generation = UINT64_MAX;
 }
 
 void drastic_renderer_shutdown(void) {

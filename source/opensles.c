@@ -2,9 +2,9 @@
  *
  * Drastic uses Android's push-style simple buffer queue.  This implementation
  * preserves that ABI and feeds libnx audren from a small page-aligned ring.
- * Recording queues are serviced with silence: retail Switch hardware has no
- * built-in microphone, while a deterministic silent source keeps games and
- * Drastic's white-noise microphone mode functional.
+ * Recorder queues are fed either with deterministic silence for Drastic's
+ * white-noise mode or with live Horizon AudioIn samples from an attached
+ * headset/USB microphone.
  */
 
 #include <switch.h>
@@ -15,10 +15,21 @@
 
 #include "opensles.h"
 #include "pthr.h"
+#include "switch_mic.h"
 
 #define OSL_QUEUE_CAPACITY 16
 #define OSL_WAVEBUFS 4
 #define OSL_BLOCK_CAPACITY 0x10000
+
+#define OSL_MIC_CAPTURE_BUFFERS 4
+#define OSL_MIC_CAPTURE_FRAMES 480
+#define OSL_MIC_CAPTURE_PAGE_SIZE 0x1000
+#define OSL_MIC_FIFO_FRAMES 4096
+#define OSL_MIC_LIVE_FIFO_FRAMES (OSL_MIC_CAPTURE_FRAMES + 1)
+#define OSL_MIC_POLL_NS 5000000ULL
+#define OSL_MIC_PACKET_WAIT_NS 20000000ULL
+#define OSL_MIC_RETRY_NS 2000000000ULL
+#define OSL_MIC_STALE_TIMEOUTS 40
 
 typedef enum {
   OSL_OBJECT_ENGINE,
@@ -59,6 +70,7 @@ struct OslAudioObject {
   pthread_t thread;
   int thread_started;
   volatile int running;
+  int suspended;
 
   SLuint32 io_state;
   SLuint32 sample_rate;
@@ -86,11 +98,27 @@ struct OslAudioObject {
   unsigned wave_pending[OSL_WAVEBUFS];
   unsigned next_wave;
 
+  SwitchMic microphone;
+  void *mic_capture_ring;
+  AudioInBuffer mic_capture_buffers[OSL_MIC_CAPTURE_BUFFERS];
+  int16_t *mic_fifo;
+  size_t mic_fifo_head;
+  size_t mic_fifo_count;
+  uint64_t mic_resample_phase;
+  uint64_t mic_retry_tick;
+  uint64_t mic_device_scan_tick;
+  unsigned mic_timeout_count;
+  unsigned mic_config_generation;
+  int mic_backend_active;
 };
 
 static OslAudioObject *g_player;
 static OslAudioObject *g_recorder;
 static unsigned g_master_volume = 100;
+static volatile unsigned g_microphone_source = OPENSLES_MIC_SOURCE_SIMULATED;
+static volatile int g_microphone_enabled = 1;
+static volatile unsigned g_microphone_status = OPENSLES_MIC_STATUS_SIMULATED;
+static volatile unsigned g_microphone_generation = 1;
 
 static const struct SLInterfaceID_ iid_engine = { 1, 1, 1, 1, {1,1,1,1,1,1} };
 static const struct SLInterfaceID_ iid_play = { 2, 2, 2, 2, {2,2,2,2,2,2} };
@@ -149,6 +177,68 @@ void opensles_set_master_volume(unsigned percent) {
   player_update_gain(g_player);
 }
 
+static void wake_audio_thread(OslAudioObject *audio) {
+  if (!audio) return;
+  mutexLock(&audio->lock);
+  condvarWakeAll(&audio->wake);
+  mutexUnlock(&audio->lock);
+}
+
+static void microphone_set_status(OpenSLESMicrophoneStatus status) {
+  __atomic_store_n(&g_microphone_status, (unsigned)status, __ATOMIC_RELEASE);
+}
+
+void opensles_set_microphone_enabled(bool enabled) {
+  __atomic_store_n(&g_microphone_enabled, enabled ? 1 : 0, __ATOMIC_RELEASE);
+  __atomic_add_fetch(&g_microphone_generation, 1, __ATOMIC_ACQ_REL);
+  if (!enabled)
+    microphone_set_status(OPENSLES_MIC_STATUS_DISABLED);
+  else if (__atomic_load_n(&g_microphone_source, __ATOMIC_ACQUIRE) ==
+           OPENSLES_MIC_SOURCE_EXTERNAL)
+    microphone_set_status(OPENSLES_MIC_STATUS_CONNECTING);
+  else
+    microphone_set_status(OPENSLES_MIC_STATUS_SIMULATED);
+  wake_audio_thread(g_recorder);
+}
+
+void opensles_set_microphone_source(OpenSLESMicrophoneSource source) {
+  if (source != OPENSLES_MIC_SOURCE_EXTERNAL)
+    source = OPENSLES_MIC_SOURCE_SIMULATED;
+  __atomic_store_n(&g_microphone_source, (unsigned)source, __ATOMIC_RELEASE);
+  __atomic_add_fetch(&g_microphone_generation, 1, __ATOMIC_ACQ_REL);
+  if (!__atomic_load_n(&g_microphone_enabled, __ATOMIC_ACQUIRE))
+    microphone_set_status(OPENSLES_MIC_STATUS_DISABLED);
+  else if (source == OPENSLES_MIC_SOURCE_EXTERNAL)
+    microphone_set_status(OPENSLES_MIC_STATUS_CONNECTING);
+  else
+    microphone_set_status(OPENSLES_MIC_STATUS_SIMULATED);
+  wake_audio_thread(g_recorder);
+}
+
+OpenSLESMicrophoneStatus opensles_get_microphone_status(void) {
+  return (OpenSLESMicrophoneStatus)__atomic_load_n(
+      &g_microphone_status, __ATOMIC_ACQUIRE);
+}
+
+static void audio_set_suspended(OslAudioObject *audio, bool suspended) {
+  if (!audio) return;
+  mutexLock(&audio->lock);
+  audio->suspended = suspended ? 1 : 0;
+  if (audio->audren_inited) {
+    audrvVoiceSetPaused(&audio->driver, audio->voice_id,
+                        audio->suspended ||
+                        audio->io_state != SL_PLAYSTATE_PLAYING);
+    audrvUpdate(&audio->driver);
+  }
+  condvarWakeAll(&audio->wake);
+  mutexUnlock(&audio->lock);
+}
+
+void opensles_set_suspended(bool suspended) {
+  audio_set_suspended(g_player, suspended);
+  audio_set_suspended(g_recorder, suspended);
+}
+
 static int player_voice_init(OslAudioObject *audio) {
   const int voice_ok = audrvVoiceInit(
       &audio->driver, audio->voice_id, (int)audio->channels,
@@ -169,6 +259,7 @@ static int player_voice_init(OslAudioObject *audio) {
   audrvVoiceSetVolume(&audio->driver, audio->voice_id, player_gain(audio));
   audrvVoiceStart(&audio->driver, audio->voice_id);
   audrvVoiceSetPaused(&audio->driver, audio->voice_id,
+                      audio->suspended ||
                       audio->io_state != SL_PLAYSTATE_PLAYING);
   const Result rc = audrvUpdate(&audio->driver);
   return R_SUCCEEDED(rc);
@@ -268,7 +359,8 @@ static void *player_thread(void *argument) {
       }
     }
 
-    if (audio->io_state == SL_PLAYSTATE_PLAYING && audio->packet_count) {
+    if (!audio->suspended &&
+        audio->io_state == SL_PLAYSTATE_PLAYING && audio->packet_count) {
       unsigned index = audio->next_wave;
       unsigned searched = 0;
       while (searched < OSL_WAVEBUFS &&
@@ -321,6 +413,237 @@ static void *player_thread(void *argument) {
   return NULL;
 }
 
+static int microphone_result_is_timeout(Result result) {
+  return R_VALUE(result) == R_VALUE(KERNELRESULT(TimedOut)) ||
+         R_VALUE(result) ==
+             R_VALUE(MAKERESULT(Module_Libnx, LibnxError_Timeout));
+}
+
+static void recorder_fifo_reset(OslAudioObject *audio) {
+  audio->mic_fifo_head = 0;
+  audio->mic_fifo_count = 0;
+  audio->mic_resample_phase = 0;
+}
+
+static void recorder_fifo_drop(OslAudioObject *audio, size_t frames) {
+  if (frames >= audio->mic_fifo_count) {
+    audio->mic_fifo_head = 0;
+    audio->mic_fifo_count = 0;
+    return;
+  }
+  audio->mic_fifo_head =
+      (audio->mic_fifo_head + frames) % OSL_MIC_FIFO_FRAMES;
+  audio->mic_fifo_count -= frames;
+}
+
+static int recorder_resources_init(OslAudioObject *audio) {
+  const size_t capture_size =
+      OSL_MIC_CAPTURE_BUFFERS * OSL_MIC_CAPTURE_PAGE_SIZE;
+  if (!audio->mic_capture_ring) {
+    audio->mic_capture_ring = aligned_alloc(OSL_MIC_CAPTURE_PAGE_SIZE,
+                                             capture_size);
+    if (!audio->mic_capture_ring) return 0;
+    memset(audio->mic_capture_ring, 0, capture_size);
+  }
+  if (!audio->mic_fifo) {
+    audio->mic_fifo = calloc(OSL_MIC_FIFO_FRAMES * 2,
+                             sizeof(*audio->mic_fifo));
+    if (!audio->mic_fifo) return 0;
+  }
+  return 1;
+}
+
+static void recorder_backend_close(OslAudioObject *audio) {
+  if (audio->mic_backend_active || audio->microphone.opened)
+    switch_mic_close(&audio->microphone);
+  audio->mic_backend_active = 0;
+  audio->mic_timeout_count = 0;
+  audio->mic_device_scan_tick = 0;
+  recorder_fifo_reset(audio);
+}
+
+static void recorder_schedule_retry(OslAudioObject *audio) {
+  recorder_backend_close(audio);
+  audio->mic_retry_tick = armGetSystemTick() + armNsToTicks(OSL_MIC_RETRY_NS);
+  microphone_set_status(OPENSLES_MIC_STATUS_UNAVAILABLE);
+}
+
+static int recorder_backend_init(OslAudioObject *audio) {
+  if (!recorder_resources_init(audio)) {
+    recorder_schedule_retry(audio);
+    return 0;
+  }
+  recorder_backend_close(audio);
+  Result result = switch_mic_open(&audio->microphone);
+  if (R_FAILED(result)) {
+    recorder_schedule_retry(audio);
+    return 0;
+  }
+
+  const size_t data_size = OSL_MIC_CAPTURE_FRAMES *
+                           audio->microphone.channel_count * sizeof(int16_t);
+  for (unsigned index = 0; index < OSL_MIC_CAPTURE_BUFFERS; index++) {
+    AudioInBuffer *buffer = &audio->mic_capture_buffers[index];
+    memset(buffer, 0, sizeof(*buffer));
+    buffer->buffer = (char *)audio->mic_capture_ring +
+                     index * OSL_MIC_CAPTURE_PAGE_SIZE;
+    buffer->buffer_size = OSL_MIC_CAPTURE_PAGE_SIZE;
+    buffer->data_size = data_size;
+  }
+
+  result = switch_mic_start(&audio->microphone);
+  if (R_FAILED(result)) {
+    recorder_schedule_retry(audio);
+    return 0;
+  }
+  for (unsigned index = 0; index < OSL_MIC_CAPTURE_BUFFERS; index++) {
+    result = switch_mic_append(&audio->microphone,
+                               &audio->mic_capture_buffers[index]);
+    if (R_FAILED(result)) {
+      recorder_schedule_retry(audio);
+      return 0;
+    }
+  }
+
+  recorder_fifo_reset(audio);
+  audio->mic_retry_tick = 0;
+  audio->mic_device_scan_tick =
+      armGetSystemTick() + armNsToTicks(OSL_MIC_RETRY_NS);
+  audio->mic_timeout_count = 0;
+  audio->mic_backend_active = 1;
+  microphone_set_status(OPENSLES_MIC_STATUS_ACTIVE);
+  return 1;
+}
+
+static void recorder_fifo_append(OslAudioObject *audio,
+                                 const AudioInBuffer *buffer) {
+  if (!audio->mic_fifo || !buffer || !buffer->buffer) return;
+  const unsigned channels = audio->microphone.channel_count;
+  if (!channels || channels > 2) return;
+  const size_t frame_bytes = channels * sizeof(int16_t);
+  const size_t frames = buffer->data_size / frame_bytes;
+  const int16_t *source = (const int16_t *)buffer->buffer;
+  for (size_t frame = 0; frame < frames; frame++) {
+    if (audio->mic_fifo_count == OSL_MIC_FIFO_FRAMES) {
+      recorder_fifo_drop(audio, 1);
+      audio->mic_resample_phase = 0;
+    }
+    const size_t destination =
+        (audio->mic_fifo_head + audio->mic_fifo_count) %
+        OSL_MIC_FIFO_FRAMES;
+    const int16_t left = source[frame * channels];
+    const int16_t right = channels == 2 ? source[frame * channels + 1] : left;
+    audio->mic_fifo[destination * 2] = left;
+    audio->mic_fifo[destination * 2 + 1] = right;
+    audio->mic_fifo_count++;
+  }
+}
+
+static int recorder_capture_once(OslAudioObject *audio, u64 timeout_ns) {
+  AudioInBuffer *released = NULL;
+  u32 released_count = 0;
+  Result result = switch_mic_wait(&audio->microphone, &released,
+                                  &released_count, timeout_ns);
+  if (R_FAILED(result)) {
+    if (microphone_result_is_timeout(result)) {
+      if (++audio->mic_timeout_count >= OSL_MIC_STALE_TIMEOUTS)
+        recorder_schedule_retry(audio);
+      return 0;
+    }
+    recorder_schedule_retry(audio);
+    return -1;
+  }
+  audio->mic_timeout_count = 0;
+  if (!released || !released_count) return 0;
+
+  recorder_fifo_append(audio, released);
+  released->data_offset = 0;
+  released->data_size = OSL_MIC_CAPTURE_FRAMES *
+                        audio->microphone.channel_count * sizeof(int16_t);
+  result = switch_mic_append(&audio->microphone, released);
+  if (R_FAILED(result)) {
+    recorder_schedule_retry(audio);
+    return -1;
+  }
+  return 1;
+}
+
+static int16_t recorder_fifo_sample(const OslAudioObject *audio,
+                                    size_t frame, unsigned channel) {
+  const size_t index = (audio->mic_fifo_head + frame) % OSL_MIC_FIFO_FRAMES;
+  return audio->mic_fifo[index * 2 + channel];
+}
+
+static int16_t interpolate_sample(int16_t first, int16_t second,
+                                  uint32_t fraction) {
+  const int64_t delta = (int32_t)second - (int32_t)first;
+  return (int16_t)((int32_t)first +
+                   (int32_t)((delta * fraction) >> 32));
+}
+
+static void recorder_write_sample(OslAudioObject *audio, void *destination,
+                                  size_t frame, int16_t sample) {
+  for (unsigned channel = 0; channel < audio->channels; channel++) {
+    const size_t index = frame * audio->channels + channel;
+    if (audio->bits == 8)
+      ((int8_t *)destination)[index] = (int8_t)(sample >> 8);
+    else
+      ((int16_t *)destination)[index] = sample;
+  }
+}
+
+static void recorder_fill_from_microphone(OslAudioObject *audio,
+                                          const OslPacket *packet) {
+  memset((void *)packet->data, 0, packet->size);
+  const size_t frame_bytes = audio->channels * (audio->bits / 8);
+  const size_t output_frames = frame_bytes ? packet->size / frame_bytes : 0;
+  if (!output_frames || !audio->sample_rate ||
+      !audio->microphone.sample_rate) return;
+
+  const uint64_t step =
+      ((uint64_t)audio->microphone.sample_rate << 32) / audio->sample_rate;
+  if (!step) return;
+  for (size_t frame = 0; frame < output_frames; frame++) {
+    const uint64_t next_phase = audio->mic_resample_phase + step;
+    const size_t advance = (size_t)(next_phase >> 32);
+    const size_t needed = advance + 1 > 2 ? advance + 1 : 2;
+    while (audio->mic_fifo_count < needed) {
+      if (!audio->mic_backend_active ||
+          recorder_capture_once(audio, OSL_MIC_PACKET_WAIT_NS) <= 0)
+        return;
+    }
+
+    const uint32_t fraction = (uint32_t)audio->mic_resample_phase;
+    const int16_t left = interpolate_sample(
+        recorder_fifo_sample(audio, 0, 0),
+        recorder_fifo_sample(audio, 1, 0), fraction);
+    const int16_t right = interpolate_sample(
+        recorder_fifo_sample(audio, 0, 1),
+        recorder_fifo_sample(audio, 1, 1), fraction);
+    const int16_t mono = (int16_t)(((int32_t)left + (int32_t)right) / 2);
+    recorder_write_sample(audio, (void *)packet->data, frame, mono);
+
+    recorder_fifo_drop(audio, advance);
+    audio->mic_resample_phase = (uint32_t)next_phase;
+  }
+}
+
+static void recorder_fill_silence(OslAudioObject *audio,
+                                  const OslPacket *packet) {
+  memset((void *)packet->data, 0, packet->size);
+  const size_t frame_bytes = audio->channels * (audio->bits / 8);
+  const size_t frames = frame_bytes ? packet->size / frame_bytes : 0;
+  if (audio->sample_rate && frames)
+    svcSleepThread((u64)frames * 1000000000ULL / audio->sample_rate);
+}
+
+static void recorder_wait_idle(OslAudioObject *audio, u64 timeout_ns) {
+  mutexLock(&audio->lock);
+  if (__atomic_load_n(&audio->running, __ATOMIC_ACQUIRE))
+    condvarWaitTimeout(&audio->wake, &audio->lock, timeout_ns);
+  mutexUnlock(&audio->lock);
+}
+
 static void *recorder_thread(void *argument) {
   OslAudioObject *audio = (OslAudioObject *)argument;
   pthr_ensure_fake_tls();
@@ -329,8 +652,11 @@ static void *recorder_thread(void *argument) {
   while (__atomic_load_n(&audio->running, __ATOMIC_ACQUIRE)) {
     OslPacket packet = {0};
     int have_packet = 0;
+    int can_record = 0;
     mutexLock(&audio->lock);
-    if (audio->io_state == SL_RECORDSTATE_RECORDING && audio->packet_count) {
+    can_record = !audio->suspended &&
+                 audio->io_state == SL_RECORDSTATE_RECORDING;
+    if (can_record && audio->packet_count) {
       packet = audio->packets[audio->packet_head];
       audio->packet_head = (audio->packet_head + 1) % OSL_QUEUE_CAPACITY;
       audio->packet_count--;
@@ -338,18 +664,76 @@ static void *recorder_thread(void *argument) {
     }
     mutexUnlock(&audio->lock);
 
-    if (!have_packet) {
-      svcSleepThread(2000000ULL);
+    const int enabled =
+        __atomic_load_n(&g_microphone_enabled, __ATOMIC_ACQUIRE);
+    const OpenSLESMicrophoneSource source =
+        (OpenSLESMicrophoneSource)__atomic_load_n(
+            &g_microphone_source, __ATOMIC_ACQUIRE);
+    const unsigned generation = __atomic_load_n(
+        &g_microphone_generation, __ATOMIC_ACQUIRE);
+    if (generation != audio->mic_config_generation) {
+      audio->mic_config_generation = generation;
+      recorder_backend_close(audio);
+      audio->mic_retry_tick = 0;
+    }
+    const int wants_external = enabled && can_record &&
+                               source == OPENSLES_MIC_SOURCE_EXTERNAL;
+
+    if (!wants_external) {
+      if (audio->mic_backend_active || audio->microphone.opened)
+        recorder_backend_close(audio);
+      if (!enabled)
+        microphone_set_status(OPENSLES_MIC_STATUS_DISABLED);
+      else if (source == OPENSLES_MIC_SOURCE_SIMULATED)
+        microphone_set_status(OPENSLES_MIC_STATUS_SIMULATED);
+      else
+        microphone_set_status(OPENSLES_MIC_STATUS_CONNECTING);
+    } else if (!audio->mic_backend_active) {
+      const uint64_t now = armGetSystemTick();
+      if (!audio->mic_retry_tick || now >= audio->mic_retry_tick) {
+        microphone_set_status(OPENSLES_MIC_STATUS_CONNECTING);
+        recorder_backend_init(audio);
+      }
+    }
+
+    if (have_packet) {
+      if (wants_external && audio->mic_backend_active)
+        recorder_fill_from_microphone(audio, &packet);
+      else
+        recorder_fill_silence(audio, &packet);
+      mutexLock(&audio->lock);
+      audio->completed_count++;
+      mutexUnlock(&audio->lock);
+      queue_invoke_callback(audio);
       continue;
     }
-    memset((void *)packet.data, 0, packet.size);
-    size_t frame_bytes = audio->channels * (audio->bits / 8);
-    size_t frames = frame_bytes ? packet.size / frame_bytes : 0;
-    if (audio->sample_rate && frames)
-      svcSleepThread((u64)frames * 1000000000ULL / audio->sample_rate);
-    audio->completed_count++;
-    queue_invoke_callback(audio);
+
+    if (wants_external && audio->mic_backend_active) {
+      recorder_capture_once(audio, OSL_MIC_POLL_NS);
+      if (audio->mic_fifo_count > OSL_MIC_LIVE_FIFO_FRAMES) {
+        recorder_fifo_drop(audio,
+                           audio->mic_fifo_count - OSL_MIC_LIVE_FIFO_FRAMES);
+        audio->mic_resample_phase = 0;
+      }
+      const uint64_t now = armGetSystemTick();
+      if (audio->mic_backend_active &&
+          (!audio->mic_device_scan_tick || now >= audio->mic_device_scan_tick)) {
+        bool external_available = false;
+        const Result scan_result = switch_mic_external_available(
+            &audio->microphone, &external_available);
+        audio->mic_device_scan_tick = now + armNsToTicks(OSL_MIC_RETRY_NS);
+        if (R_FAILED(scan_result) ||
+            external_available != audio->microphone.external_device) {
+          recorder_backend_close(audio);
+          audio->mic_retry_tick = 0;
+          microphone_set_status(OPENSLES_MIC_STATUS_CONNECTING);
+        }
+      }
+    } else {
+      recorder_wait_idle(audio, OSL_MIC_POLL_NS);
+    }
   }
+  recorder_backend_close(audio);
   return NULL;
 }
 
@@ -374,6 +758,11 @@ static void audio_backend_shutdown(OslAudioObject *audio) {
   }
   free(audio->ring);
   audio->ring = NULL;
+  recorder_backend_close(audio);
+  free(audio->mic_capture_ring);
+  audio->mic_capture_ring = NULL;
+  free(audio->mic_fifo);
+  audio->mic_fifo = NULL;
 }
 
 static SLresult object_realize(SLObjectItf self, SLboolean async) {
@@ -527,7 +916,7 @@ static SLresult play_set_state(SLPlayItf self, SLuint32 state) {
   audio->io_state = state;
   if (audio->audren_inited) {
     audrvVoiceSetPaused(&audio->driver, audio->voice_id,
-                        state != SL_PLAYSTATE_PLAYING);
+                        audio->suspended || state != SL_PLAYSTATE_PLAYING);
     audrvUpdate(&audio->driver);
   }
   condvarWakeAll(&audio->wake);
@@ -588,13 +977,20 @@ static const struct SLPlayItf_ play_vtable = {
 };
 
 static SLresult record_set_state(SLRecordItf self, SLuint32 state) {
-  audio_from_self(self)->io_state = state;
+  OslAudioObject *audio = audio_from_self(self);
+  mutexLock(&audio->lock);
+  audio->io_state = state;
+  condvarWakeAll(&audio->wake);
+  mutexUnlock(&audio->lock);
   return SL_RESULT_SUCCESS;
 }
 
 static SLresult record_get_state(SLRecordItf self, SLuint32 *state) {
   if (!state) return SL_RESULT_PARAMETER_INVALID;
-  *state = audio_from_self(self)->io_state;
+  OslAudioObject *audio = audio_from_self(self);
+  mutexLock(&audio->lock);
+  *state = audio->io_state;
+  mutexUnlock(&audio->lock);
   return SL_RESULT_SUCCESS;
 }
 

@@ -73,6 +73,7 @@ struct DrasticIngameMenu {
   int filter_picker_custom;
   int filter_picker_valid;
   u64 marquee_tick;
+  OpenSLESMicrophoneStatus microphone_status;
   DrasticLayoutMode editor_old_layout;
   DrasticScreenRect editor_backup[2];
   int editor_screen;
@@ -862,31 +863,46 @@ static void render_emulation(DrasticIngameMenu *menu) {
 
 static void render_audio_input(DrasticIngameMenu *menu) {
   static const char *labels[] = {
-    "Volume", "Sound", "Microphone emulation", "Microphone level",
-    "Rumble Pak vibration", "Gyro & accelerometer", "Right-stick stylus", "Back"
+    "Volume", "Sound", "Microphone", "Microphone source",
+    "Microphone level", "Rumble Pak vibration", "Gyro & accelerometer",
+    "Right-stick stylus", "Back"
   };
   static const char *levels[] = {"Low", "Normal", "High", "Maximum"};
-  char values[8][48] = {{0}};
+  char values[9][64] = {{0}};
   snprintf(values[0], sizeof(values[0]), "%d%%", menu->config->volume);
   snprintf(values[1], sizeof(values[1]), "%s", on_off(prefs_get_bool("Drastic/SoundEnabled", true)));
-  snprintf(values[2], sizeof(values[2]), "%s", on_off(prefs_get_bool("Drastic/MicEnabled", true)));
-  snprintf(values[3], sizeof(values[3]), "%s", levels[clamp_int(prefs_get_int("Drastic/MicLevel", 1), 0, 3)]);
-  snprintf(values[4], sizeof(values[4]), "%s", on_off(menu->config->vibration));
-  snprintf(values[5], sizeof(values[5]), "%s", on_off(menu->config->motion));
-  snprintf(values[6], sizeof(values[6]), "%s", on_off(menu->config->analog_stylus));
+  snprintf(values[2], sizeof(values[2]), "%s",
+           on_off(menu->config->microphone_enabled));
+  if (menu->config->microphone_source == DRASTIC_MICROPHONE_EXTERNAL) {
+    const char *state = "External";
+    if (menu->microphone_status == OPENSLES_MIC_STATUS_ACTIVE)
+      state = "External (active)";
+    else if (menu->microphone_status == OPENSLES_MIC_STATUS_CONNECTING)
+      state = "External (connecting)";
+    else if (menu->microphone_status == OPENSLES_MIC_STATUS_UNAVAILABLE)
+      state = "External (not detected)";
+    snprintf(values[3], sizeof(values[3]), "%s", state);
+  } else {
+    snprintf(values[3], sizeof(values[3]), "Simulated noise");
+  }
+  snprintf(values[4], sizeof(values[4]), "%s",
+           levels[clamp_int(prefs_get_int("Drastic/MicLevel", 1), 0, 3)]);
+  snprintf(values[5], sizeof(values[5]), "%s", on_off(menu->config->vibration));
+  snprintf(values[6], sizeof(values[6]), "%s", on_off(menu->config->motion));
+  snprintf(values[7], sizeof(values[7]), "%s", on_off(menu->config->analog_stylus));
   draw_shell("Audio, input & motion",
              "Left / Right  Change     A  Toggle     B  Back");
   const int panel_x = ui_is_portrait() ? 24 : 156;
   const int panel_width = ui_is_portrait() ? ui_width() - 48 : 968;
-  overlay_fill_rect(panel_x, 106, panel_width, 456, COLOR_PANEL);
-  for (int index = 0; index < 8; index++)
-    draw_row(panel_x + 24, 124 + index * 52, panel_width - 48,
+  overlay_fill_rect(panel_x, 98, panel_width, 478, COLOR_PANEL);
+  for (int index = 0; index < 9; index++)
+    draw_row(panel_x + 24, 110 + index * 50, panel_width - 48,
              menu->selection[MENU_AUDIO_INPUT] == index, labels[index],
-             index < 7 ? values[index] : NULL, 1);
-  overlay_draw_wrapped(panel_x + 24, 584, panel_width - 48,
+             index < 8 ? values[index] : NULL, 1);
+  overlay_draw_wrapped(panel_x + 24, 590, panel_width - 48,
                        ui_is_portrait() ? 8 : 3, COLOR_MUTED,
-      "Motion forwards the active controller's accelerometer and gyroscope "
-      "using Drastic's native Android sensor interface.");
+      "External uses a connected CTIA headset or compatible USB microphone. "
+      "The microphone hotkey only controls simulated noise.");
   draw_status(menu);
 }
 
@@ -1468,13 +1484,13 @@ static void update_emulation(DrasticIngameMenu *menu, u64 pressed) {
 }
 
 static void update_audio_input(DrasticIngameMenu *menu, u64 pressed) {
-  navigate_list(menu, 8, pressed);
+  navigate_list(menu, 9, pressed);
   if (pressed & HidNpadButton_B) {
     select_page(menu, MENU_MAIN);
     return;
   }
   const int selection = menu->selection[MENU_AUDIO_INPUT];
-  if (selection == 7 && (pressed & HidNpadButton_A)) {
+  if (selection == 8 && (pressed & HidNpadButton_A)) {
     select_page(menu, MENU_MAIN);
     return;
   }
@@ -1492,27 +1508,50 @@ static void update_audio_input(DrasticIngameMenu *menu, u64 pressed) {
       break;
     case 1: save_bool("Drastic/SoundEnabled",
                       !prefs_get_bool("Drastic/SoundEnabled", true)); break;
-    case 2: save_bool("Drastic/MicEnabled",
-                      !prefs_get_bool("Drastic/MicEnabled", true)); break;
+    case 2:
+      menu->config->microphone_enabled ^= 1;
+      save_bool("Drastic/MicEnabled", menu->config->microphone_enabled);
+      opensles_set_microphone_enabled(menu->config->microphone_enabled != 0);
+      break;
     case 3:
+      menu->config->microphone_source =
+          menu->config->microphone_source == DRASTIC_MICROPHONE_EXTERNAL
+              ? DRASTIC_MICROPHONE_SIMULATED
+              : DRASTIC_MICROPHONE_EXTERNAL;
+      save_string("Wrapper/MicrophoneSource",
+                  menu->config->microphone_source ==
+                          DRASTIC_MICROPHONE_EXTERNAL
+                      ? "external" : "noise");
+      opensles_set_microphone_source(
+          menu->config->microphone_source == DRASTIC_MICROPHONE_EXTERNAL
+              ? OPENSLES_MIC_SOURCE_EXTERNAL
+              : OPENSLES_MIC_SOURCE_SIMULATED);
+      set_status(menu,
+                 menu->config->microphone_source ==
+                         DRASTIC_MICROPHONE_EXTERNAL
+                     ? "External input selected; connect a headset or USB microphone"
+                     : "Simulated-noise microphone selected");
+      break;
+    case 4:
       save_int("Drastic/MicLevel",
                (prefs_get_int("Drastic/MicLevel", 1) + direction + 4) % 4);
       break;
-    case 4:
+    case 5:
       menu->config->vibration ^= 1;
       save_bool("Wrapper/Vibration", menu->config->vibration);
       break;
-    case 5:
+    case 6:
       menu->config->motion ^= 1;
       save_bool("Wrapper/Motion", menu->config->motion);
       break;
-    case 6:
+    case 7:
       menu->config->analog_stylus ^= 1;
       save_bool("Wrapper/AnalogStylus", menu->config->analog_stylus);
       break;
     default: return;
   }
-  if (selection >= 1 && selection <= 3) apply_core_config(menu);
+  if (selection == 1 || selection == 2 || selection == 4)
+    apply_core_config(menu);
   menu->redraw = 1;
 }
 
@@ -1632,6 +1671,7 @@ DrasticIngameMenu *drastic_menu_create(DrasticRuntimeConfig *config,
   menu->snapshot_bottom_array = jni_make_int_array(256 * 192);
   menu->snapshot_top = jni_int_array_data(menu->snapshot_top_array);
   menu->snapshot_bottom = jni_int_array_data(menu->snapshot_bottom_array);
+  menu->microphone_status = opensles_get_microphone_status();
   refresh_custom_shaders(menu);
   return menu;
 }
@@ -1692,6 +1732,14 @@ void drastic_menu_update(DrasticIngameMenu *menu, u64 held, u64 pressed,
     menu->pending_snapshot = 0;
     refresh_snapshot(menu);
     set_status(menu, "Save-state complete");
+  }
+  if (menu->page == MENU_AUDIO_INPUT) {
+    const OpenSLESMicrophoneStatus microphone_status =
+        opensles_get_microphone_status();
+    if (microphone_status != menu->microphone_status) {
+      menu->microphone_status = microphone_status;
+      menu->redraw = 1;
+    }
   }
   switch (menu->page) {
     case MENU_STATES: update_states(menu, pressed); break;
