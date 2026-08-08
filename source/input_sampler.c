@@ -59,6 +59,28 @@ static float normalized_axis(int value) {
   return result;
 }
 
+static void analog_stylus_delta_to_source(
+    int rotation, u32 style_set, float controller_x, float controller_y,
+    float *source_x, float *source_y) {
+  if (appletGetOperationMode() != AppletOperationMode_Console ||
+      (style_set & HidNpadStyleTag_NpadHandheld)) {
+    /* In a vertical portable grip, the screen and controls rotate together.
+     * Some grips expose their Joy-Cons as a wireless pair rather than the
+     * Handheld style, so operation mode is the reliable primary signal.  The
+     * renderer's source-to-display transform already turns these controller-
+     * relative axes into the expected physical direction; applying the
+     * inverse rotation here would rotate them a second time. */
+    *source_x = controller_x;
+    *source_y = controller_y;
+    return;
+  }
+
+  /* External controllers remain upright when the displayed game is rotated,
+   * so keep their cursor movement relative to the visible screen. */
+  drastic_rotation_display_delta_to_source(
+      rotation, controller_x, controller_y, source_x, source_y);
+}
+
 static void initialize_motion_sensors(DrasticInputSampler *sampler) {
   static const struct {
     HidNpadIdType id;
@@ -314,8 +336,9 @@ static void *input_thread_main(void *opaque) {
       const float display_x = normalized_axis(right.x);
       const float display_y = -normalized_axis(right.y);
       float source_x, source_y;
-      drastic_rotation_display_delta_to_source(
-          runtime.rotation, display_x, display_y, &source_x, &source_y);
+      analog_stylus_delta_to_source(
+          runtime.rotation, style_set, display_x, display_y,
+          &source_x, &source_y);
       sampler->stylus_x += source_x * sampler->config.stylus_speed *
                            frame_scale;
       sampler->stylus_y += source_y * sampler->config.stylus_speed *
