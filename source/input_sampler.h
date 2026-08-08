@@ -14,6 +14,7 @@ typedef enum {
   DRASTIC_INPUT_HOTKEY_FAST_FORWARD,
   DRASTIC_INPUT_HOTKEY_SWAP_SCREENS,
   DRASTIC_INPUT_HOTKEY_MICROPHONE,
+  DRASTIC_INPUT_HOTKEY_MOTION_STYLUS_RECENTER,
   DRASTIC_INPUT_HOTKEY_AUTOFIRE,
   DRASTIC_INPUT_HOTKEY_LID,
   DRASTIC_INPUT_HOTKEY_SAVE_STATE,
@@ -57,6 +58,11 @@ typedef struct {
   u32 style_set;
   u32 attributes;
   uint32_t hotkeys_pressed;
+  uint64_t motion_sample;
+  HidVector motion_acceleration;
+  HidVector motion_angular_velocity;
+  int motion_source;
+  int motion_right_joycon;
   int stylus_x;
   int stylus_y;
   int stylus_visible;

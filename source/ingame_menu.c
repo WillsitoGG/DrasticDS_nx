@@ -19,6 +19,10 @@
 
 #define MENU_CHEAT_LIMIT 4096
 #define MENU_FOLDER_LIMIT 128
+#define MENU_STICK_ACTIVATION 18000
+#define MENU_STICK_RELEASE 8000
+#define MENU_STICK_REPEAT_DELAY_MS 360
+#define MENU_STICK_REPEAT_RATE_MS 85
 
 enum MenuPage {
   MENU_MAIN,
@@ -73,6 +77,9 @@ struct DrasticIngameMenu {
   int filter_picker_custom;
   int filter_picker_valid;
   u64 marquee_tick;
+  u64 analog_nav_direction;
+  u64 analog_nav_since;
+  u64 analog_nav_last;
   OpenSLESMicrophoneStatus microphone_status;
   DrasticLayoutMode editor_old_layout;
   DrasticScreenRect editor_backup[2];
@@ -99,6 +106,61 @@ static float clamp_float(float value, float minimum, float maximum) {
   if (value < minimum) return minimum;
   if (value > maximum) return maximum;
   return value;
+}
+
+static void reset_analog_navigation(DrasticIngameMenu *menu) {
+  menu->analog_nav_direction = 0;
+  menu->analog_nav_since = 0;
+  menu->analog_nav_last = 0;
+}
+
+static u64 analog_navigation_direction(const DrasticIngameMenu *menu,
+                                       HidAnalogStickState stick) {
+  const int x = abs(stick.x);
+  const int y = abs(stick.y);
+  if (x >= MENU_STICK_ACTIVATION || y >= MENU_STICK_ACTIVATION) {
+    if (y >= x)
+      return stick.y > 0 ? HidNpadButton_Up : HidNpadButton_Down;
+    return stick.x > 0 ? HidNpadButton_Right : HidNpadButton_Left;
+  }
+
+  /* Keep the current direction latched until the stick returns close to its
+   * centre.  This hysteresis prevents a slightly noisy stick from producing
+   * extra menu steps around the activation threshold. */
+  switch (menu->analog_nav_direction) {
+    case HidNpadButton_Up:
+      return stick.y > MENU_STICK_RELEASE ? HidNpadButton_Up : 0;
+    case HidNpadButton_Down:
+      return stick.y < -MENU_STICK_RELEASE ? HidNpadButton_Down : 0;
+    case HidNpadButton_Left:
+      return stick.x < -MENU_STICK_RELEASE ? HidNpadButton_Left : 0;
+    case HidNpadButton_Right:
+      return stick.x > MENU_STICK_RELEASE ? HidNpadButton_Right : 0;
+    default: return 0;
+  }
+}
+
+static u64 analog_navigation_pressed(DrasticIngameMenu *menu,
+                                     HidAnalogStickState stick) {
+  const u64 direction = analog_navigation_direction(menu, stick);
+  const u64 now = armGetSystemTick();
+  if (direction != menu->analog_nav_direction) {
+    menu->analog_nav_direction = direction;
+    menu->analog_nav_since = now;
+    menu->analog_nav_last = now;
+    return direction;
+  }
+  if (!direction) return 0;
+
+  const u64 frequency = armGetSystemTickFreq();
+  if (!frequency) return 0;
+  const u64 delay = frequency * MENU_STICK_REPEAT_DELAY_MS / 1000u;
+  const u64 rate = frequency * MENU_STICK_REPEAT_RATE_MS / 1000u;
+  if (now - menu->analog_nav_since < delay ||
+      now - menu->analog_nav_last < rate)
+    return 0;
+  menu->analog_nav_last = now;
+  return direction;
 }
 
 static int ui_width(void) { return overlay_width(); }
@@ -823,6 +885,12 @@ static void render_display(DrasticIngameMenu *menu) {
 
 static const char *on_off(int value) { return value ? "On" : "Off"; }
 
+static const char *stylus_mode_label(DrasticStylusMode mode) {
+  static const char *labels[] = {"Off", "Right stick", "Motion controls"};
+  return (unsigned)mode < sizeof(labels) / sizeof(*labels)
+      ? labels[mode] : labels[0];
+}
+
 static void render_emulation(DrasticIngameMenu *menu) {
   static const char *labels[] = {
     "Frames to skip", "Frame-skip method", "Safe frame skipping",
@@ -865,10 +933,10 @@ static void render_audio_input(DrasticIngameMenu *menu) {
   static const char *labels[] = {
     "Volume", "Sound", "Microphone", "Microphone source",
     "Microphone level", "Rumble Pak vibration", "Gyro & accelerometer",
-    "Right-stick stylus", "Back"
+    "Virtual stylus", "USB mouse stylus", "Back"
   };
   static const char *levels[] = {"Low", "Normal", "High", "Maximum"};
-  char values[9][64] = {{0}};
+  char values[10][64] = {{0}};
   snprintf(values[0], sizeof(values[0]), "%d%%", menu->config->volume);
   snprintf(values[1], sizeof(values[1]), "%s", on_off(prefs_get_bool("Drastic/SoundEnabled", true)));
   snprintf(values[2], sizeof(values[2]), "%s",
@@ -889,20 +957,23 @@ static void render_audio_input(DrasticIngameMenu *menu) {
            levels[clamp_int(prefs_get_int("Drastic/MicLevel", 1), 0, 3)]);
   snprintf(values[5], sizeof(values[5]), "%s", on_off(menu->config->vibration));
   snprintf(values[6], sizeof(values[6]), "%s", on_off(menu->config->motion));
-  snprintf(values[7], sizeof(values[7]), "%s", on_off(menu->config->analog_stylus));
+  snprintf(values[7], sizeof(values[7]), "%s",
+           stylus_mode_label(menu->config->stylus_mode));
+  snprintf(values[8], sizeof(values[8]), "%s",
+           on_off(menu->config->mouse_stylus));
   draw_shell("Audio, input & motion",
              "Left / Right  Change     A  Toggle     B  Back");
   const int panel_x = ui_is_portrait() ? 24 : 156;
   const int panel_width = ui_is_portrait() ? ui_width() - 48 : 968;
   overlay_fill_rect(panel_x, 98, panel_width, 478, COLOR_PANEL);
-  for (int index = 0; index < 9; index++)
-    draw_row(panel_x + 24, 110 + index * 50, panel_width - 48,
+  for (int index = 0; index < 10; index++)
+    draw_row(panel_x + 24, 110 + index * 45, panel_width - 48,
              menu->selection[MENU_AUDIO_INPUT] == index, labels[index],
-             index < 8 ? values[index] : NULL, 1);
+             index < 9 ? values[index] : NULL, 1);
   overlay_draw_wrapped(panel_x + 24, 590, panel_width - 48,
                        ui_is_portrait() ? 8 : 3, COLOR_MUTED,
       "External uses a connected CTIA headset or compatible USB microphone. "
-      "The microphone hotkey only controls simulated noise.");
+      "Motion stylus uses its recenter hotkey; a mouse left-click touches.");
   draw_status(menu);
 }
 
@@ -1484,13 +1555,13 @@ static void update_emulation(DrasticIngameMenu *menu, u64 pressed) {
 }
 
 static void update_audio_input(DrasticIngameMenu *menu, u64 pressed) {
-  navigate_list(menu, 9, pressed);
+  navigate_list(menu, 10, pressed);
   if (pressed & HidNpadButton_B) {
     select_page(menu, MENU_MAIN);
     return;
   }
   const int selection = menu->selection[MENU_AUDIO_INPUT];
-  if (selection == 8 && (pressed & HidNpadButton_A)) {
+  if (selection == 9 && (pressed & HidNpadButton_A)) {
     select_page(menu, MENU_MAIN);
     return;
   }
@@ -1545,8 +1616,18 @@ static void update_audio_input(DrasticIngameMenu *menu, u64 pressed) {
       save_bool("Wrapper/Motion", menu->config->motion);
       break;
     case 7:
-      menu->config->analog_stylus ^= 1;
-      save_bool("Wrapper/AnalogStylus", menu->config->analog_stylus);
+      menu->config->stylus_mode = (DrasticStylusMode)(
+          ((int)menu->config->stylus_mode + direction + 3) % 3);
+      save_string("Wrapper/StylusMode",
+                  menu->config->stylus_mode == DRASTIC_STYLUS_OFF ? "off" :
+                  menu->config->stylus_mode == DRASTIC_STYLUS_MOTION
+                      ? "motion" : "stick");
+      if (menu->config->stylus_mode == DRASTIC_STYLUS_MOTION)
+        set_status(menu, "Motion stylus will center on the current controller angle");
+      break;
+    case 8:
+      menu->config->mouse_stylus ^= 1;
+      save_bool("Wrapper/MouseStylus", menu->config->mouse_stylus);
       break;
     default: return;
   }
@@ -1689,6 +1770,7 @@ void drastic_menu_open(DrasticIngameMenu *menu) {
   menu->open = 1;
   menu->page = MENU_MAIN;
   menu->status[0] = '\0';
+  reset_analog_navigation(menu);
   if (menu->core.pause_system)
     menu->core.pause_system(menu->core.env, menu->core.clazz, 1);
   menu->redraw = 1;
@@ -1741,6 +1823,10 @@ void drastic_menu_update(DrasticIngameMenu *menu, u64 held, u64 pressed,
       menu->redraw = 1;
     }
   }
+  if (menu->page == MENU_LAYOUT_EDITOR)
+    reset_analog_navigation(menu);
+  else
+    pressed |= analog_navigation_pressed(menu, left);
   switch (menu->page) {
     case MENU_STATES: update_states(menu, pressed); break;
     case MENU_CHEATS: update_cheats(menu, pressed); break;

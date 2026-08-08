@@ -93,9 +93,12 @@ static void seed_defaults(void) {
   seed("Wrapper/Motion", "true");
   seed("Wrapper/AnalogDpad", "true");
   seed("Wrapper/AnalogDeadzone", "35");
-  seed("Wrapper/AnalogStylus", "true");
+  seed("Wrapper/StylusMode", "stick");
+  seed("Wrapper/MouseStylus", "true");
   seed("Wrapper/AnalogTouchButton", "StickR");
   seed("Wrapper/AnalogStylusSpeed", "8");
+  seed("Wrapper/MotionStylusSensitivity", "10");
+  seed("Wrapper/HotkeyMotionStylusRecenter", "L+R+StickR");
   seed("Wrapper/HotkeyFastForward", "ZR");
   seed("Wrapper/HotkeyMenu", "L+R+Plus");
   seed("Wrapper/HotkeySwapScreens", "ZL");
@@ -209,6 +212,14 @@ static void migrate_fast_forward_speed(void) {
   put_entry("Wrapper/LauncherSettingsVersion", "3");
 }
 
+static void migrate_stylus_mode(void) {
+  if (find_entry("Wrapper/StylusMode") >= 0) return;
+  const int legacy = find_entry("Wrapper/AnalogStylus");
+  if (legacy < 0) return;
+  put_entry("Wrapper/StylusMode",
+            prefs_get_bool("Wrapper/AnalogStylus", true) ? "stick" : "off");
+}
+
 void prefs_set_disc_path(const char *path) {
   snprintf(pending_rom, sizeof(pending_rom), "%s", path ? path : "");
   if (path && *path) put_entry("Drastic/RomPath", path);
@@ -224,6 +235,7 @@ void prefs_init(const char *path) {
   const float lsfg_flow = prefs_get_float("Wrapper/LSFGFlowScale", 0.25f);
   if (prefs_contains("Wrapper/LSFGFlowScale"))
     put_entry("Wrapper/LSFGFlowScale", lsfg_flow > 0.375f ? "0.5" : "0.25");
+  migrate_stylus_mode();
   seed_defaults();
   migrate_hotkey_defaults();
   migrate_fast_forward_speed();

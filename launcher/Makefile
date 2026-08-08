@@ -25,7 +25,7 @@ ROMFS_DIR	?=	$(CURDIR)/romfs	# build_all.sh overrides this with a temporary dire
 
 APP_TITLE	:=	Drastic DS
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.0.6
+APP_VERSION	:=	1.0.7
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
@@ -39,6 +39,10 @@ CFLAGS	:=	`$(PREFIX)pkg-config --cflags $(PKGS)` -Wall -Wextra $(OPTIMIZATION) -
 			$(ARCH) $(DEFINES)
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__ -D_GNU_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 \
 			-DDRASTIC_NX_VERSION='"$(APP_VERSION)"'
+
+ifeq ($(UPDATE_TEST),1)
+CFLAGS += -DDRASTIC_NX_UPDATE_TEST
+endif
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -std=gnu++17
 

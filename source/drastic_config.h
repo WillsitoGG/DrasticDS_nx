@@ -35,6 +35,12 @@ typedef enum {
   DRASTIC_MICROPHONE_EXTERNAL,
 } DrasticMicrophoneSource;
 
+typedef enum {
+  DRASTIC_STYLUS_OFF,
+  DRASTIC_STYLUS_STICK,
+  DRASTIC_STYLUS_MOTION,
+} DrasticStylusMode;
+
 typedef struct {
   float x;
   float y;
@@ -65,7 +71,9 @@ typedef struct {
   int vibration;
   int motion;
   int lua_enabled;
-  int analog_stylus;
+  DrasticStylusMode stylus_mode;
+  int mouse_stylus;
+  int motion_stylus_sensitivity;
   int stylus_x;
   int stylus_y;
   int stylus_visible;

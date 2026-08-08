@@ -30,6 +30,7 @@
 
 #include "griddb.h"
 #include "forwarder.h"
+#include "launcher_update.h"
 #include "SwitchStorage.h"
 #include "ui_audio.h"
 
@@ -122,9 +123,35 @@ static bool normalizeCpuThreads(Store &store) {
   storeSet(store, "Drastic/CpuThreads", "3");
   return true;
 }
+static bool migrateStylusMode(Store &store, bool addDefault) {
+  bool changed=false;
+  if(!storeHas(store,"Wrapper/StylusMode")){
+    if(storeHas(store,"Wrapper/AnalogStylus")){
+      const char *legacy=storeGet(store,"Wrapper/AnalogStylus","true");
+      const bool enabled=strcasecmp(legacy,"false")&&strcmp(legacy,"0")&&
+                         strcasecmp(legacy,"off");
+      storeSet(store,"Wrapper/StylusMode",enabled?"stick":"off");
+      changed=true;
+    }else if(addDefault){
+      storeSet(store,"Wrapper/StylusMode","stick");
+      changed=true;
+    }
+  }
+  const char *mode=storeGet(store,"Wrapper/StylusMode","stick");
+  if(strcmp(mode,"off")&&strcmp(mode,"stick")&&strcmp(mode,"motion")){
+    storeSet(store,"Wrapper/StylusMode","stick");
+    changed=true;
+  }
+  if(storeHas(store,"Wrapper/AnalogStylus")){
+    storeRemove(store,"Wrapper/AnalogStylus");
+    changed=true;
+  }
+  return changed;
+}
 static bool migrateLauncherSettings(Store &store) {
   bool changed = migrateHotkeyDefaults(store);
   changed = normalizeCpuThreads(store) || changed;
+  changed = migrateStylusMode(store,true) || changed;
 
   /* The original launcher option was a boolean whose enabled state rendered
      the UI at 90 degrees. Preserve that exact orientation while replacing it
@@ -183,6 +210,10 @@ static bool migrateLauncherSettings(Store &store) {
     if (!strcmp(storeGet(store, "Drastic/FastForwardSpeed", "2"), "0"))
       storeSet(store, "Drastic/FastForwardSpeed", "5");
     storeSet(store, "Wrapper/LauncherSettingsVersion", "3");
+    changed = true;
+  }
+  if (version < 4) {
+    storeSet(store, "Wrapper/LauncherSettingsVersion", "4");
     changed = true;
   }
   return changed;
@@ -369,6 +400,7 @@ struct Opt {
 #define O_TEXT(l,k,d)          { l, k, OT_TEXT, nullptr,0, 0,0,0, d, 0, nullptr, nullptr, 1, nullptr }
 #define O_TEXTG(l,k,d,gk,go)   { l, k, OT_TEXT, nullptr,0, 0,0,0, d, 0, gk, go, 1, nullptr }
 #define O_HOTKEY(l,k,d)        { l, k, OT_HOTKEY, nullptr,0, 0,0,0, d, 0, nullptr, nullptr, 1, nullptr }
+#define O_HOTKEYG(l,k,d,gk,go) { l, k, OT_HOTKEY, nullptr,0, 0,0,0, d, 0, gk, go, 1, nullptr }
 #define O_STATUS(l)            { l, nullptr, OT_STATUS, nullptr,0, 0,0,0, nullptr, 0, nullptr, nullptr, 1, nullptr }
 #define O_SHADER(l,k,d)        { l, k, OT_SHADER, nullptr,0, 0,0,0, d, 0, nullptr, nullptr, 1, nullptr }
 #define O_DATETIMEG(l,k,d,gk,go) { l, k, OT_DATETIME, nullptr,0, 0,0,0, d, 0, gk, go, 1, nullptr }
@@ -455,6 +487,9 @@ static const Choice C_btn[]      = { {"A","A"},{"B","B"},{"X","X"},{"Y","Y"},{"L
                                      {"Plus","Plus"},{"Minus","Minus"},{"L-Stick","StickL"},{"R-Stick","StickR"},
                                      {"D-Up","Up"},{"D-Down","Down"},{"D-Left","Left"},{"D-Right","Right"},{"None","None"} };
 static const Choice C_hotkeyMode[] = { {"Hold","hold"}, {"Toggle","toggle"} };
+static const Choice C_stylusMode[] = { {"Off","off"},
+                                       {"Right stick","stick"},
+                                       {"Motion controls","motion"} };
 static const Choice C_launcherTheme[] = { {"XMB (PS3)","xmb"}, {"Glow","animated"}, {"Bubbles","homebrew"},
                                           {"Classic","classic"}, {"OLED black","oled"} };
 static const Choice C_gridColumns[] = { {"3","3"}, {"4","4"}, {"5","5"}, {"6","6"}, {"7","7"}, {"8","8"} };
@@ -540,9 +575,12 @@ static const Opt S_controller[] = {
   O_CHOICE("D-Pad Right",        "Wrapper/Pad/Right", C_btn, "Right"),
   O_CHOICE("Analog stick as D-Pad", "Wrapper/AnalogDpad", C_bool, "true"),
   O_RANGEG("Analog deadzone %",   "Wrapper/AnalogDeadzone", 5, 80, 5, "35", "Wrapper/AnalogDpad", "false"),
-  O_CHOICE("Right-stick stylus",  "Wrapper/AnalogStylus", C_bool, "true"),
-  O_CHOICEG("Stylus touch button","Wrapper/AnalogTouchButton", C_btn, "StickR", "Wrapper/AnalogStylus", "false"),
-  O_RANGEG("Stylus cursor speed", "Wrapper/AnalogStylusSpeed", 1, 20, 1, "8", "Wrapper/AnalogStylus", "false"),
+  O_CHOICE("Virtual stylus",      "Wrapper/StylusMode", C_stylusMode, "stick"),
+  O_CHOICEG("Stylus touch button","Wrapper/AnalogTouchButton", C_btn, "StickR", "Wrapper/StylusMode", "off"),
+  O_RANGEG("Stick cursor speed",  "Wrapper/AnalogStylusSpeed", 1, 20, 1, "8", "Wrapper/StylusMode", "=stick"),
+  O_RANGEG("Motion sensitivity",  "Wrapper/MotionStylusSensitivity", 1, 20, 1, "10", "Wrapper/StylusMode", "=motion"),
+  O_HOTKEYG("Recenter motion stylus", "Wrapper/HotkeyMotionStylusRecenter", "L+R+StickR", "Wrapper/StylusMode", "=motion"),
+  O_CHOICE("USB mouse stylus",    "Wrapper/MouseStylus", C_bool, "true"),
   O_HOTKEY("In-game menu",        "Wrapper/HotkeyMenu", "L+R+Plus"),
   O_HOTKEY("Fast-forward hotkey", "Wrapper/HotkeyFastForward", "ZR"),
   O_CHOICE("Fast-forward mode",   "Wrapper/FastForwardMode", C_hotkeyMode, "hold"),
@@ -579,6 +617,7 @@ static const Opt S_launcher[] = {
   O_CHOICE("Show game titles",  "Wrapper/ShowGameTitles", C_bool,          "true"),
   O_CHOICE("UI animations",     "Wrapper/UiAnimations",   C_bool,          "true"),
   O_CHOICE("Sound effects",     "Wrapper/UiSounds",       C_bool,          "true"),
+  O_CHOICE("Check updates at boot", "Wrapper/CheckUpdatesAtBoot", C_bool,   "true"),
 };
 struct Screen { const char *title; const Opt *opts; int n; bool binds; };
 static const Screen g_screens[SCR_COUNT] = {
@@ -695,12 +734,18 @@ static const SettingHelpEntry SETTING_HELP[] = {
    "Lets the left analog stick act as the Nintendo DS D-Pad in addition to the physical D-Pad."},
   {"Wrapper/AnalogDeadzone", "Controller input",
    "Sets how far the left stick must move before it presses a DS direction. Raise it to prevent drift; lower it for faster response."},
-  {"Wrapper/AnalogStylus", "Touch input",
-   "Uses the right stick to move a virtual stylus cursor over the DS touch screen."},
+  {"Wrapper/StylusMode", "Touch input",
+   "Off disables the controller cursor. Right stick moves a relative cursor, while Motion controls map the calibrated controller angle to an absolute point on the DS touch screen."},
   {"Wrapper/AnalogTouchButton", "Touch input",
-   "Chooses the controller button that presses the virtual stylus at its current right-stick cursor position."},
+   "Chooses the controller button that presses the virtual stylus at its current stick or motion-controlled cursor position."},
   {"Wrapper/AnalogStylusSpeed", "Touch input",
    "Controls how quickly the right-stick stylus cursor moves across the DS touch screen."},
+  {"Wrapper/MotionStylusSensitivity", "Touch input",
+   "Controls how far the motion stylus travels for a given controller tilt. Recenter after changing how you hold the Switch, Joy-Con, or Pro Controller."},
+  {"Wrapper/HotkeyMotionStylusRecenter", "Touch input",
+   "Calibrates the current controller angle as the center of the DS touch screen. It is consumed by the wrapper while motion stylus mode is active."},
+  {"Wrapper/MouseStylus", "Touch input",
+   "Lets a connected USB mouse point at the displayed DS touch screen. The left mouse button presses the stylus, and screen rotation is applied automatically."},
   {"Wrapper/FastForwardMode", "Hotkey behavior",
    "Hold runs fast-forward only while its hotkey is held. Toggle keeps fast-forward active until the hotkey is pressed again."},
 
@@ -740,6 +785,8 @@ static const SettingHelpEntry SETTING_HELP[] = {
    "Enables launcher transitions, moving highlights, and animated theme effects."},
   {"Wrapper/UiSounds", "Launcher audio",
    "Enables navigation, confirmation, and back sound effects in the SDL launcher."},
+  {"Wrapper/CheckUpdatesAtBoot", "Launcher updates",
+   "Checks GitHub for a newer DrasticDS_nx release when the launcher starts. The check is skipped for HOME Menu game shortcuts."},
 };
 
 struct SettingHelpInfo {
@@ -800,6 +847,10 @@ static bool g_imgReady = false;
 static bool g_plReady = false;
 static bool g_griddbReady = false;
 static bool g_storageSocketReady = false;
+static std::string g_launcherNroPath;
+static std::string g_updateNoticeTag;
+static std::string g_updateNotifiedTag;
+static Uint32 g_updateNoticeUntil = 0;
 
 static bool configureLauncherOrientation(int rotation) {
   if(!g_ren || g_outputW<1 || g_outputH<1) return false;
@@ -1355,6 +1406,10 @@ static void drawTextC(TTF_Font*f,int cx,int y,const char*s,SDL_Color c){ drawTex
 
 static void drawTitleCell(int cx,int cellW,int y,const std::string&title,bool sel,SDL_Color col);
 static void downloadAllCovers();
+static void runUpdateScreen();
+static std::string installedReleaseTag();
+static void pollUpdateNotification();
+static void drawUpdateNotification();
 static void toast(const char *msg);
 static void modalMessage(const char *title, const std::vector<std::string> &lines);
 static bool confirmBox(const char *title, const std::vector<std::string> &lines);
@@ -1373,7 +1428,7 @@ static void drawSettingsRowText(const char *label,const char *value,
                                 bool current,SDL_Color labelColor,
                                 SDL_Color valueColor,bool scrollValue=false,
                                 int rowHeight=0);
-static void drawFooterText(const char *text);
+static void drawFooterText(const char *text,int centerY=-1);
 static void drawScrollTextR(TTF_Font *font,int xRight,int y,int maxWidth,const char *text,SDL_Color color);
 static void drawScrollTextL(TTF_Font *font,int x,int y,int maxWidth,const char *text,SDL_Color color);
 static void drawWrapped(TTF_Font *font,int x,int y,int maxWidth,int lineHeight,int maxLines,const char *text,SDL_Color color);
@@ -1452,19 +1507,58 @@ static void makeGlyphs(){
 }
 
 enum FootAct { FA_NONE, FA_LAUNCH, FA_SORT, FA_OPTIONS, FA_SETTINGS, FA_PAGEL, FA_PAGER, FA_QUIT };
-struct FootItem { SDL_Texture *glyph; const char *label; int act; };
+struct FootItem { const char *button; const char *label; int act; };
 static SDL_Rect g_footHit[10]; static int g_footAct[10]; static int g_footN=0;
+static SDL_Texture *footerGlyph(const char *button){
+  if(!button) return nullptr;
+  if(!strcmp(button,"A")) return g_gA;
+  if(!strcmp(button,"B")) return g_gB;
+  if(!strcmp(button,"X")) return g_gX;
+  if(!strcmp(button,"Y")) return g_gY;
+  if(!strcmp(button,"+")) return g_gPlus;
+  if(!strcmp(button,"L")) return g_gL;
+  if(!strcmp(button,"R")) return g_gR;
+  return nullptr;
+}
+static void footerButtonSize(const char *button,int &width,int &height){
+  SDL_Texture *glyph=footerGlyph(button);
+  width=height=0;
+  if(glyph){
+    SDL_QueryTexture(glyph,nullptr,nullptr,&width,&height);
+    width/=GLYPH_SS; height/=GLYPH_SS;
+  } else {
+    width=textW(g_font_sm,button?button:"")+14;
+    height=TTF_FontHeight(g_font_sm)+6;
+  }
+}
+static int footerHintWidth(const char *button,const char *label){
+  int width=0,height=0; footerButtonSize(button,width,height);
+  if(label&&*label) width+=8+textW(g_font_sm,label);
+  return width;
+}
+static void drawButtonHint(int x,int centerY,const char *button,const char *label){
+  int width=0,height=0; footerButtonSize(button,width,height);
+  SDL_Texture *glyph=footerGlyph(button);
+  if(glyph){
+    SDL_Rect destination={x,centerY-height/2,width,height};
+    SDL_RenderCopy(g_ren,glyph,nullptr,&destination);
+  } else {
+    border(x,centerY-height/2,width,height,1,COL_DIM);
+    drawTextC(g_font_sm,x+width/2,centerY-TTF_FontHeight(g_font_sm)/2,
+              button?button:"",COL_TXT);
+  }
+  if(label&&*label)
+    drawText(g_font_sm,x+width+8,centerY-TTF_FontHeight(g_font_sm)/2,label,COL_DIM);
+}
 static void drawFooterHints(const FootItem *it,int n,int cy){
-  const int gap=g_launcherPortrait?6:8;
+  const int gap=8;
   const int pairGap=g_launcherPortrait?12:26;
   const int glyphGap=g_launcherPortrait?8:16;
   const int fh=TTF_FontHeight(g_font_sm),maxWidth=SW-24;
   int itemWidth[10]={},gapAfter[10]={};
   for(int i=0;i<n&&i<10;i++){
-    int gw=0; if(it[i].glyph) SDL_QueryTexture(it[i].glyph,nullptr,nullptr,&gw,nullptr);
-    gw/=GLYPH_SS;
     bool hasLabel=it[i].label&&it[i].label[0];
-    itemWidth[i]=gw+(hasLabel?gap+textW(g_font_sm,it[i].label):0);
+    itemWidth[i]=footerHintWidth(it[i].button,it[i].label);
     gapAfter[i]=hasLabel?pairGap:glyphGap;
   }
   int rowStart[10]={0},rowEnd[10]={0},rowWidth[10]={0},rowCount=0;
@@ -1488,16 +1582,14 @@ static void drawFooterHints(const FootItem *it,int n,int cy){
     const int rowY=cy-(rowCount-1-row)*rowSpacing;
     int x=(SW-rowWidth[row])/2;
     for(int i=rowStart[row];i<rowEnd[row];i++){
-      int gw=0,gh=0;
-      if(it[i].glyph) SDL_QueryTexture(it[i].glyph,nullptr,nullptr,&gw,&gh);
-      gw/=GLYPH_SS; gh/=GLYPH_SS;
+      int bw=0,bh=0; footerButtonSize(it[i].button,bw,bh);
       int x0=x;
-      if(it[i].glyph){ SDL_Rect destination={x,rowY-gh/2,gw,gh}; SDL_RenderCopy(g_ren,it[i].glyph,nullptr,&destination); }
-      x+=gw;
+      drawButtonHint(x,rowY,it[i].button,it[i].label);
+      x+=bw;
       bool hasLabel=it[i].label&&it[i].label[0];
-      if(hasLabel){ x+=gap; drawText(g_font_sm,x,rowY-fh/2,it[i].label,COL_DIM); x+=textW(g_font_sm,it[i].label); }
+      if(hasLabel) x+=gap+textW(g_font_sm,it[i].label);
       if(g_footN<10){
-        g_footHit[g_footN]={x0-6,rowY-gh/2-8,(x-x0)+12,std::max(gh,fh)+16};
+        g_footHit[g_footN]={x0-6,rowY-bh/2-8,(x-x0)+12,std::max(bh,fh)+16};
         g_footAct[g_footN]=it[i].act;
         g_footN++;
       }
@@ -1641,7 +1733,25 @@ static bool beginUiFrame() {
     g_exitRequested = true;
     return false;
   }
+  if(g_pad&&!SDL_GameControllerGetAttached(g_pad)) closeController();
   return true;
+}
+
+static int keyboardNavigationButton(SDL_Keycode key) {
+  switch(key){
+    case SDLK_RETURN: case SDLK_KP_ENTER: return BTN_CONFIRM;
+    case SDLK_ESCAPE: return BTN_CANCEL;
+    case SDLK_UP: return SDL_CONTROLLER_BUTTON_DPAD_UP;
+    case SDLK_DOWN: return SDL_CONTROLLER_BUTTON_DPAD_DOWN;
+    case SDLK_LEFT: return SDL_CONTROLLER_BUTTON_DPAD_LEFT;
+    case SDLK_RIGHT: return SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
+    case SDLK_PAGEUP: return SDL_CONTROLLER_BUTTON_LEFTSHOULDER;
+    case SDLK_PAGEDOWN: return SDL_CONTROLLER_BUTTON_RIGHTSHOULDER;
+    case SDLK_s: return SDL_CONTROLLER_BUTTON_X;
+    case SDLK_F1: return BTN_SETTINGS;
+    case SDLK_SPACE: return SDL_CONTROLLER_BUTTON_START;
+    default: return -1;
+  }
 }
 
 static bool pollUiEvent(SDL_Event &event) {
@@ -1661,6 +1771,15 @@ static bool pollUiEvent(SDL_Event &event) {
           closeController();
       }
       continue;
+    }
+    if(event.type==SDL_KEYDOWN){
+      int button=keyboardNavigationButton(event.key.keysym.sym);
+      if(button>=0){
+        SDL_Event press{};
+        press.type=SDL_CONTROLLERBUTTONDOWN;
+        press.cbutton.button=(Uint8)button;
+        SDL_PushEvent(&press);
+      }
     }
     if (event.type == SDL_CONTROLLERBUTTONDOWN) {
       switch (event.cbutton.button) {
@@ -1682,7 +1801,7 @@ static bool pollUiEvent(SDL_Event &event) {
 }
 
 static void navRepeat(){
-  if(!g_pad) return;
+  if(!g_pad||!SDL_GameControllerGetAttached(g_pad)) return;
   const int TH=18000;
   int dir=0;
   if(SDL_GameControllerGetButton(g_pad,SDL_CONTROLLER_BUTTON_DPAD_UP)   || SDL_GameControllerGetAxis(g_pad,SDL_CONTROLLER_AXIS_LEFTY)<-TH) dir=SDL_CONTROLLER_BUTTON_DPAD_UP;
@@ -2349,7 +2468,10 @@ static bool transferFrame(TransferState &state) {
   int percent=total?(int)(progress*100/total):0;
   snprintf(text,sizeof(text),"%d%%  -  %.1f / %.1f MiB",percent,done/1048576.0,total/1048576.0);
   drawTextC(g_font,SW/2,by+66,text,COL_TXT);
-  drawTextC(g_font_sm,SW/2,SH-72,state.cancelled.load()?"Cancelling...":"B  Cancel",state.cancelled.load()?COL_VAL:COL_DIM);
+  if(state.cancelled.load())
+    drawTextC(g_font_sm,SW/2,SH-72,"Cancelling...",COL_VAL);
+  else
+    drawFooterText("B  Cancel",SH-72+TTF_FontHeight(g_font_sm)/2);
   presentUi();
   return !state.cancelled.load();
 }
@@ -2676,8 +2798,8 @@ static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
     std::string address="smb://"+(edited.server.empty()?std::string("server"):edited.server)+"/"+(edited.share.empty()?std::string("share"):sharedFolder());
     drawText(g_font_sm,helpX+28,helpContentY+210,"Connection preview",COL_DIM);
     drawScrollTextL(g_font,helpX+28,helpContentY+244,helpWidth-56,address.c_str(),COL_VAL);
-    drawText(g_font_sm,helpX+28,helpY+helpHeight-78,"A  Edit / toggle",COL_DIM);
-    drawText(g_font_sm,helpX+28,helpY+helpHeight-44,"B  Cancel",COL_DIM);
+    drawButtonHint(helpX+28,helpY+helpHeight-66,"A","Edit / toggle");
+    drawButtonHint(helpX+28,helpY+helpHeight-32,"B","Cancel");
     drawFadeIn(); presentUi(); SDL_Delay(8);
   }
   return saved;
@@ -2834,7 +2956,8 @@ static void renderUsbForwarderWait() {
   border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
   drawTextC(g_font_big,SW/2,panelY+42,"Connecting USB storage",COL_SEL);
   drawTextC(g_font,SW/2,panelY+108,"Waiting for the game drive...",COL_TXT);
-  drawTextC(g_font_sm,SW/2,panelY+164,"The game will start automatically    B  Cancel",COL_DIM);
+  drawTextC(g_font_sm,SW/2,panelY+146,"The game will start automatically",COL_DIM);
+  drawFooterText("B  Cancel",panelY+181);
   presentUi();
 }
 
@@ -3157,7 +3280,13 @@ static bool optEnabled(const Opt &o) {
   if(o.type==OT_STATUS) return true;
   if(o.key && !strncmp(o.key,"Wrapper/LSFG",12) && !lsfgDllInstalled())
     return false;
-  return !o.gateKey || strcmp(iniGet(o.gateKey, ""), o.gateOff) != 0;
+  if(!o.gateKey) return true;
+  const char *value=iniGet(o.gateKey,"");
+  /* A leading '=' makes a gate opt-in for one choice; existing gates remain
+     enabled for every value except gateOff. */
+  return o.gateOff&&o.gateOff[0]=='='
+      ? strcmp(value,o.gateOff+1)==0
+      : strcmp(value,o.gateOff)!=0;
 }
 
 static bool localTimeFromMillis(const char *text, struct tm &result) {
@@ -3379,7 +3508,10 @@ static int settingsFooterReserve(){
   return g_launcherPortrait?(highResolutionUi()?104:88):72;
 }
 static int portraitRowInset(){
-  return highResolutionUi()?5:4;
+  /* Keep the selected row aligned with the same one-pixel gutter used by the
+     landscape layout.  A larger portrait-only inset made the highlight look
+     detached from its text after the UI target was rotated. */
+  return 1;
 }
 static void listCol(int *colX,int *colW,int *labelX,int *valX){
   int margin=g_launcherPortrait?(highResolutionUi()?72:36):180;
@@ -3393,13 +3525,20 @@ static int listVis(){
   return v<1?1:v;
 }
 
+static bool settingsRowNeedsStackedText(const char *label,const char *value,
+                                        int labelX,int valX){
+  if(!g_launcherPortrait) return false;
+  const int gap=highResolutionUi()?32:24;
+  return textW(g_font,label)+gap+textW(g_font,value)>valX-labelX;
+}
+
 static void drawSettingsRowText(const char *label,const char *value,
                                 int slotY,int colW,int labelX,int valX,
                                 bool current,SDL_Color labelColor,
                                 SDL_Color valueColor,bool scrollValue,
                                 int rowHeight){
   const int actualRowHeight=rowHeight>0?rowHeight:settingsRowH();
-  if(g_launcherPortrait){
+  if(settingsRowNeedsStackedText(label,value,labelX,valX)){
     const int maxWidth=std::max(40,valX-labelX);
     const int labelHeight=TTF_FontHeight(g_font);
     const int valueHeight=TTF_FontHeight(g_font_sm);
@@ -3421,50 +3560,38 @@ static void drawSettingsRowText(const char *label,const char *value,
   else drawTextR(g_font,valX,y,value,valueColor);
 }
 
-static void drawFooterText(const char *text){
+static void drawFooterText(const char *text,int centerY){
   if(!text||!*text) return;
-  const int maxWidth=SW-32;
-  if(!g_launcherPortrait || textW(g_font_sm,text)<=maxWidth){
-    drawTextC(g_font_sm,SW/2,SH-38,
-              fittedText(g_font_sm,text,maxWidth).c_str(),COL_DIM);
-    return;
-  }
-  std::vector<std::string> parts;
-  std::string input=text;
+  std::vector<std::string> tokens;
+  const std::string input=text;
   size_t start=0;
   while(start<input.size()){
-    size_t split=input.find("   ",start);
-    std::string part=trim(input.substr(start,split==std::string::npos?
-                                      std::string::npos:split-start));
-    if(!part.empty()) parts.push_back(std::move(part));
-    if(split==std::string::npos) break;
-    start=split;
     while(start<input.size()&&input[start]==' ') start++;
+    if(start>=input.size()) break;
+    size_t split=input.size(),next=input.size();
+    for(size_t index=start+1;index<input.size();index++){
+      if(input[index-1]==' '&&input[index]==' '){
+        split=index-1; next=index+1;
+        while(next<input.size()&&input[next]==' ') next++;
+        break;
+      }
+    }
+    std::string token=trim(input.substr(start,split-start));
+    if(!token.empty()) tokens.push_back(std::move(token));
+    start=next;
   }
-  if(parts.size()<2){
-    drawTextC(g_font_sm,SW/2,SH-38,
-              fittedText(g_font_sm,text,maxWidth).c_str(),COL_DIM);
+  if(tokens.size()>=2&&tokens.size()%2==0){
+    std::vector<FootItem> hints;
+    hints.reserve(tokens.size()/2);
+    for(size_t index=0;index+1<tokens.size()&&hints.size()<10;index+=2)
+      hints.push_back({tokens[index].c_str(),tokens[index+1].c_str(),FA_NONE});
+    drawFooterHints(hints.data(),(int)hints.size(),centerY>=0?centerY:SH-26);
     return;
   }
-  size_t best=1; int bestWidth=INT_MAX;
-  for(size_t split=1;split<parts.size();split++){
-    std::string first,second;
-    for(size_t i=0;i<split;i++){ if(!first.empty()) first+="    "; first+=parts[i]; }
-    for(size_t i=split;i<parts.size();i++){ if(!second.empty()) second+="    "; second+=parts[i]; }
-    int width=std::max(textW(g_font_sm,first.c_str()),textW(g_font_sm,second.c_str()));
-    if(width<bestWidth){ bestWidth=width; best=split; }
-  }
-  std::string lines[2];
-  for(size_t i=0;i<parts.size();i++){
-    std::string &line=lines[i<best?0:1];
-    if(!line.empty()) line+="    ";
-    line+=parts[i];
-  }
-  const int lineHeight=TTF_FontHeight(g_font_sm)+8;
-  drawTextC(g_font_sm,SW/2,SH-38-lineHeight,
-            fittedText(g_font_sm,lines[0],maxWidth).c_str(),COL_DIM);
-  drawTextC(g_font_sm,SW/2,SH-38,
-            fittedText(g_font_sm,lines[1],maxWidth).c_str(),COL_DIM);
+  g_footN=0;
+  const int maxWidth=SW-32;
+  const int y=centerY>=0?centerY-TTF_FontHeight(g_font_sm)/2:SH-38;
+  drawTextC(g_font_sm,SW/2,y,fittedText(g_font_sm,text,maxWidth).c_str(),COL_DIM);
 }
 
 static void showHelpCard(const char *section,const char *title,const char *kind,
@@ -3509,8 +3636,9 @@ static void showHelpCard(const char *section,const char *title,const char *kind,
     fillRect(panelX+40,bodyY-18,panelWidth-80,2,(SDL_Color){70,78,92,210});
     drawWrapped(g_font,panelX+40,bodyY,panelWidth-80,32,7,
                 description.c_str(),COL_TXT);
-    drawTextC(g_font_sm,SW/2,panelY+panelHeight-42,
-              "A / B / X  Close       Touch anywhere to close",COL_DIM);
+    FootItem closeHints[]={{"A","Close",FA_NONE},{"B","",FA_NONE},{"X","",FA_NONE}};
+    drawFooterHints(closeHints,3,panelY+panelHeight-50);
+    drawTextC(g_font_sm,SW/2,panelY+panelHeight-24,"Touch anywhere to close",COL_DIM);
     presentUi();
     SDL_Delay(8);
   }
@@ -3534,7 +3662,7 @@ static const char *settingsScreenDescription(int screen) {
     case SCR_EMU: return "Controls DraStic CPU use, ROM loading, saves, the emulated clock, firmware identity, frame skipping, and fast-forward behavior.";
     case SCR_FRAMERATE: return "Controls frame skipping, fast-forward limits, and auto-fire timing. Frame skipping is a performance trade-off and can break visuals in some games.";
     case SCR_NETWORK: return "Controls optional DraStic gameplay features, Slot-2 accessories, Lua, and how in-game save data interacts with savestates or other emulators.";
-    case SCR_CONTROLLER: return "Maps Nintendo DS controls, configures analog stylus and motion input, and assigns unique in-game hotkey combinations.";
+    case SCR_CONTROLLER: return "Maps Nintendo DS controls, configures stick, motion, and USB-mouse stylus input, and assigns unique in-game hotkey combinations.";
     case SCR_FIRMWARE: return "Edits the user information reported by the emulated Nintendo DS firmware, including language, nickname, favorite color, and birthday.";
     default: return "Opens this group of emulator settings.";
   }
@@ -3563,10 +3691,11 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
     if(S.opts[i].key && !strcmp(S.opts[i].key,"Drastic/FirmwareColor")){
       int colorIndex=choiceIdx(S.opts[i]);
       if(colorIndex>=0 && colorIndex<(int)(sizeof(C_firmwareColorRgb)/sizeof(*C_firmwareColorRgb))){
-        TTF_Font *valueFont=g_launcherPortrait?g_font_sm:g_font;
+        const bool stacked=settingsRowNeedsStackedText(S.opts[i].label,v,labelX,valX);
+        TTF_Font *valueFont=stacked?g_font_sm:g_font;
         const int swatchSize=g_launcherPortrait?20:24;
         int valueY=slotY+(rowH-TTF_FontHeight(valueFont))/2;
-        if(g_launcherPortrait){
+        if(stacked){
           const int gap=highResolutionUi()?5:3;
           const int blockHeight=TTF_FontHeight(g_font)+gap+TTF_FontHeight(g_font_sm);
           valueY=slotY+(rowH-blockHeight)/2+TTF_FontHeight(g_font)+gap;
@@ -3783,8 +3912,8 @@ static void editCustomClock(const Opt &option) {
       else snprintf(value,sizeof(value),"%02d",values[row]);
       drawTextR(g_font,panelX+panelW-58,y,value,current?COL_VAL:COL_DIM);
     }
-    drawTextC(g_font_sm,SW/2,panelY+panelH-40,
-              "Left / Right  Change       A  Save       B  Cancel",COL_DIM);
+    drawFooterText("Left / Right  Change       A  Save       B  Cancel",
+                   panelY+panelH-28);
     drawFadeIn();
     presentUi();
     SDL_Delay(8);
@@ -3898,11 +4027,33 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
     SDL_Delay(8);
   }
 }
+static std::string launcherUpdateStatusText() {
+  const LauncherUpdateSnapshot snapshot=LauncherUpdate_GetSnapshot();
+  switch(snapshot.state){
+    case LauncherUpdateState::Checking: return "Checking...";
+    case LauncherUpdateState::UpdateAvailable: return snapshot.release.tag+" available";
+    case LauncherUpdateState::UpToDate: return "Up to date";
+    case LauncherUpdateState::Downloading: {
+      const uint64_t total=snapshot.total?snapshot.total:snapshot.release.assetSize;
+      const uint64_t percent=total?std::min<uint64_t>(100,snapshot.downloaded*100/total):0;
+      return "Downloading "+std::to_string(percent)+"%";
+    }
+    case LauncherUpdateState::ReadyToInstall: return "Ready to install";
+    case LauncherUpdateState::Installing: return "Installing...";
+    case LauncherUpdateState::Installed: return "Ready to exit";
+    case LauncherUpdateState::Cancelled: return "Cancelled";
+    case LauncherUpdateState::Error: return "Check failed";
+    case LauncherUpdateState::Idle: break;
+  }
+  return std::string("Installed ")+installedReleaseTag();
+}
+
 static void launcherSettingsScreen() {
   static int savedSelection=0;
   const int optionCount=(int)(sizeof(S_launcher)/sizeof(Opt));
-  const int rowCount=optionCount+1;
-  int sel=std::max(0,std::min(savedSelection,rowCount-1)),top=0;
+  const int coversRow=optionCount,listCount=optionCount+1;
+  const int updateRow=listCount,selectionCount=listCount+1;
+  int sel=std::max(0,std::min(savedSelection,selectionCount-1)),top=0;
   auto applyChange=[&](){
     applyLauncherAppearance();
     const int requested=atoi(storeGet(g_global,"Wrapper/LauncherRotation","0"));
@@ -3924,25 +4075,35 @@ static void launcherSettingsScreen() {
     while(pollUiEvent(event)){
       pumpStick(event);
       int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
-      int visible=std::min(listVis(),rowCount);
-      if(touchScrollList(touch,sel,top,rowCount,visible)) continue;
+      const int rowH=settingsRowH(),listY=settingsListY();
+      const int visible=std::min(std::max(1,(SH-listY-190)/rowH),listCount);
+      const int buttonWidth=std::min(500,SW-80),buttonHeight=58;
+      const int buttonX=(SW-buttonWidth)/2;
+      const int buttonY=std::min(SH-buttonHeight-104,listY+visible*rowH+24);
+      if(touchScrollList(touch,sel,top,listCount,visible)) continue;
       if(touch==TOUCH_SWIPE_L&&sel<optionCount){ optAdjust(S_launcher[sel],-1); applyChange(); continue; }
       if(touch==TOUCH_SWIPE_R&&sel<optionCount){ optAdjust(S_launcher[sel],1); applyChange(); continue; }
       if(touch==TOUCH_TAP){
         if(ty<topBarH()||ty>=SH-40){ finish(); return; }
-        for(int row=0;row<visible&&top+row<rowCount;row++){
-          int y=settingsListY()+row*settingsRowH();
-          if(ty>=y&&ty<y+settingsRowH()){ sel=top+row; SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&press); break; }
+        if(tx>=buttonX&&tx<buttonX+buttonWidth&&ty>=buttonY&&ty<buttonY+buttonHeight){
+          sel=updateRow;
+          SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&press);
+          continue;
+        }
+        for(int row=0;row<visible&&top+row<listCount;row++){
+          int y=listY+row*rowH;
+          if(ty>=y&&ty<y+rowH){ sel=top+row; SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&press); break; }
         }
         continue;
       }
       if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
-      if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP) sel=(sel+rowCount-1)%rowCount;
-      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN) sel=(sel+1)%rowCount;
+      if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP) sel=(sel+selectionCount-1)%selectionCount;
+      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN) sel=(sel+1)%selectionCount;
       else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_LEFT&&sel<optionCount){ optAdjust(S_launcher[sel],-1); applyChange(); }
       else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_RIGHT&&sel<optionCount){ optAdjust(S_launcher[sel],1); applyChange(); }
       else if(event.cbutton.button==BTN_CONFIRM){
-        if(sel==optionCount){ downloadAllCovers(); beginScreenFx(); }
+        if(sel==updateRow){ runUpdateScreen(); beginScreenFx(); }
+        else if(sel==coversRow){ downloadAllCovers(); beginScreenFx(); }
         else {
           const Opt &option=S_launcher[sel];
           if(option.type==OT_CHOICE&&option.nch>2){ optChoosePopup(option); beginScreenFx(); }
@@ -3952,30 +4113,38 @@ static void launcherSettingsScreen() {
       } else if(event.cbutton.button==BTN_SETTINGS){
         if(sel<optionCount)
           showOptionHelp("Launcher",S_launcher[sel],"Launcher setting");
-        else
+        else if(sel==coversRow)
           showHelpCard("Launcher","Download all covers","Library artwork",
                        "Downloads missing cover artwork for the whole library from SteamGridDB. Existing local covers are kept.",
                        nullptr,"Launcher action");
+        else
+          showHelpCard("Launcher","Check for Updates","Launcher updates",
+                       "Checks the latest published DrasticDS_nx release, displays its notes, verifies the downloaded NRO, and safely replaces this launcher.",
+                       nullptr,"Launcher action");
         beginScreenFx();
       } else if(event.cbutton.button==BTN_CANCEL){ finish(); return; }
-      if(sel<top) top=sel;
-      if(sel>=top+visible) top=sel-visible+1;
+      if(sel<listCount){
+        if(sel<top) top=sel;
+        if(sel>=top+visible) top=sel-visible+1;
+      }
     }
 
     clearUiBackground();
     drawHeader("Launcher",nullptr);
     int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
-    int visible=std::min(listVis(),rowCount);
     const int rowH=settingsRowH(),listY=settingsListY();
+    const int visible=std::min(std::max(1,(SH-listY-190)/rowH),listCount);
     glassPanel(colX-12,listY-10,colW+24,visible*rowH+18);
     const int rowInset=g_launcherPortrait?portraitRowInset():1;
-    float target=(float)(listY+(sel-top)*rowH+rowInset);
-    g_hy=(!g_uiAnimations||g_hy<0)?target:g_hy+(target-g_hy)*0.30f;
-    fillRect(colX,(int)g_hy,colW,rowH-rowInset*2,COL_FOCUS);
-    fillRect(colX,(int)g_hy,5,rowH-rowInset*2,COL_SEL);
-    for(int row=0;row<visible&&top+row<rowCount;row++){
+    if(sel<listCount){
+      float target=(float)(listY+(sel-top)*rowH+rowInset);
+      g_hy=(!g_uiAnimations||g_hy<0)?target:g_hy+(target-g_hy)*0.30f;
+      fillRect(colX,(int)g_hy,colW,rowH-rowInset*2,COL_FOCUS);
+      fillRect(colX,(int)g_hy,5,rowH-rowInset*2,COL_SEL);
+    }
+    for(int row=0;row<visible&&top+row<listCount;row++){
       int index=top+row,slotY=listY+row*rowH; bool current=index==sel;
-      if(index==optionCount){
+      if(index==coversRow){
         drawSettingsRowText("Download all covers","SteamGridDB",slotY,colW,labelX,valX,
                             current,current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM);
       } else {
@@ -3984,9 +4153,258 @@ static void launcherSettingsScreen() {
                             current,current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM);
       }
     }
+    const int buttonWidth=std::min(500,SW-80),buttonHeight=58;
+    const int buttonX=(SW-buttonWidth)/2;
+    const int buttonY=std::min(SH-buttonHeight-104,listY+visible*rowH+24);
+    const bool updateSelected=sel==updateRow;
+    fillRect(buttonX,buttonY,buttonWidth,buttonHeight,updateSelected?COL_FOCUS:(SDL_Color){35,40,50,225});
+    border(buttonX,buttonY,buttonWidth,buttonHeight,2,updateSelected?COL_SEL:COL_DIM);
+    const int fontHeight=TTF_FontHeight(g_font);
+    drawTextC(g_font,SW/2,buttonY+(buttonHeight-fontHeight)/2,"Check for Updates",updateSelected?COL_VAL:COL_TXT);
+    const std::string updateStatus=launcherUpdateStatusText();
+    drawTextC(g_font_sm,SW/2,buttonY+buttonHeight+8,updateStatus.c_str(),updateSelected?COL_VAL:COL_DIM);
     drawFooterText("Left / Right  Change       A  Choose       X  Help       B  Back");
     drawFadeIn(); presentUi(); SDL_Delay(8);
   }
+}
+
+static std::string installedReleaseTag() {
+  const std::string built=LauncherUpdate_BuiltReleaseTag();
+#if defined(DRASTIC_NX_UPDATE_TEST)
+  return built;
+#else
+  const std::string stored=storeGet(g_global,"Wrapper/InstalledReleaseTag","");
+  if(stored.empty()) return built;
+  return LauncherUpdate_IsNewer(stored,built)?stored:built;
+#endif
+}
+
+static std::vector<size_t> utf8Boundaries(const std::string &text) {
+  std::vector<size_t> boundaries{0};
+  for(size_t index=0;index<text.size();){
+    const unsigned char lead=(unsigned char)text[index];
+    size_t length=lead<0x80?1:(lead&0xe0)==0xc0?2:(lead&0xf0)==0xe0?3:(lead&0xf8)==0xf0?4:1;
+    if(index+length>text.size()) length=1;
+    for(size_t part=1;part<length;part++) if(((unsigned char)text[index+part]&0xc0)!=0x80){ length=1; break; }
+    index+=length;
+    boundaries.push_back(index);
+  }
+  return boundaries;
+}
+
+static std::vector<std::string> wrapReleaseNotes(const std::string &notes,int maxWidth) {
+  std::vector<std::string> lines;
+  size_t paragraphStart=0;
+  while(paragraphStart<=notes.size()){
+    size_t paragraphEnd=notes.find('\n',paragraphStart);
+    if(paragraphEnd==std::string::npos) paragraphEnd=notes.size();
+    std::string paragraph=notes.substr(paragraphStart,paragraphEnd-paragraphStart);
+    if(!paragraph.empty()&&paragraph.back()=='\r') paragraph.pop_back();
+    for(char &value:paragraph) if(value=='\t'||(unsigned char)value<0x20) value=' ';
+    while(!paragraph.empty()&&paragraph.back()==' ') paragraph.pop_back();
+    if(paragraph.empty()) lines.emplace_back();
+    else {
+      bool continuation=false;
+      while(!paragraph.empty()){
+        while(!paragraph.empty()&&paragraph.front()==' ') paragraph.erase(paragraph.begin());
+        if(paragraph.empty()) break;
+        const std::string prefix=continuation&&paragraph.rfind("- ",0)!=0?"  ":"";
+        if(textW(g_font_sm,(prefix+paragraph).c_str())<=maxWidth){ lines.push_back(prefix+paragraph); break; }
+        const auto boundaries=utf8Boundaries(paragraph);
+        size_t low=1,high=boundaries.size()-1;
+        while(low<high){
+          size_t middle=(low+high+1)/2;
+          if(textW(g_font_sm,(prefix+paragraph.substr(0,boundaries[middle])).c_str())<=maxWidth) low=middle;
+          else high=middle-1;
+        }
+        size_t split=boundaries[low];
+        size_t space=paragraph.rfind(' ',split);
+        if(space!=std::string::npos&&space>0&&space>=split/3) split=space;
+        lines.push_back(prefix+paragraph.substr(0,split));
+        paragraph.erase(0,split);
+        continuation=true;
+      }
+    }
+    if(paragraphEnd==notes.size()) break;
+    paragraphStart=paragraphEnd+1;
+  }
+  if(lines.empty()) lines.emplace_back("No release notes were provided.");
+  return lines;
+}
+
+static void requestLauncherExitAfterUpdate() {
+  g_exitRequested=true;
+}
+
+static void runUpdateScreen() {
+  if(g_launcherNroPath.empty()){
+    modalMessage("Update check unavailable",{
+      "Could not determine the current launcher NRO path.",
+      "Launch DrasticDS.nro directly from the SD card and try again."
+    });
+    return;
+  }
+  if(!g_griddbReady){
+    modalMessage("Update check unavailable",{
+      "The launcher could not initialize its network connection.",
+      "Check the connection and try again."
+    });
+    return;
+  }
+  LauncherUpdateSnapshot initial=LauncherUpdate_GetSnapshot();
+  if(initial.state==LauncherUpdateState::Idle)
+    LauncherUpdate_StartCheck(installedReleaseTag());
+
+  int scroll=0;
+  bool cancelRequested=false,installedSaved=false;
+  std::string wrappedTag,wrappedBody;
+  std::vector<std::string> wrappedLines;
+  beginScreenFx();
+  for(;;){
+    if(!beginUiFrame()){
+      LauncherUpdate_Cancel();
+      return;
+    }
+    LauncherUpdateSnapshot snapshot=LauncherUpdate_GetSnapshot();
+    if(snapshot.state==LauncherUpdateState::ReadyToInstall){
+      if(g_romfsReady){ romfsExit(); g_romfsReady=false; }
+      LauncherUpdate_InstallDownloaded(g_launcherNroPath);
+      snapshot=LauncherUpdate_GetSnapshot();
+      if(snapshot.state==LauncherUpdateState::Error&&!g_romfsReady&&R_SUCCEEDED(romfsInit()))
+        g_romfsReady=true;
+    }
+    if(snapshot.state==LauncherUpdateState::Installed&&!installedSaved){
+      storeSet(g_global,"Wrapper/InstalledReleaseTag",snapshot.release.tag.c_str());
+      storeSave(g_global,LAUNCHER_INI);
+      g_updateNoticeTag.clear();
+      installedSaved=true;
+    }
+
+    const int panelWidth=SW*7/8,panelHeight=SH*4/5;
+    const int panelX=(SW-panelWidth)/2,panelY=(SH-panelHeight)/2;
+    const int bodyX=panelX+42,bodyY=panelY+126,bodyWidth=panelWidth-84;
+    const int footerHeight=108,bodyBottom=panelY+panelHeight-footerHeight;
+    const int lineHeight=TTF_FontHeight(g_font_sm)+8;
+    const int visibleLines=std::max(1,(bodyBottom-bodyY)/lineHeight);
+    if(snapshot.release.tag!=wrappedTag||snapshot.release.notes!=wrappedBody){
+      wrappedTag=snapshot.release.tag;
+      wrappedBody=snapshot.release.notes;
+      wrappedLines=wrapReleaseNotes(wrappedBody.empty()?"Release notes will appear here.":wrappedBody,bodyWidth-20);
+      scroll=0;
+    }
+    const int maxScroll=std::max(0,(int)wrappedLines.size()-visibleLines);
+    scroll=std::max(0,std::min(scroll,maxScroll));
+
+    SDL_Event event;
+    navRepeat();
+    while(pollUiEvent(event)){
+      pumpStick(event);
+      int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
+      if(touch==TOUCH_SCROLL_UP) scroll=std::min(maxScroll,scroll+std::max(1,g_touchScrollSteps));
+      else if(touch==TOUCH_SCROLL_DOWN) scroll=std::max(0,scroll-std::max(1,g_touchScrollSteps));
+      if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
+      if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP) scroll=std::max(0,scroll-1);
+      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN) scroll=std::min(maxScroll,scroll+1);
+      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_LEFTSHOULDER) scroll=std::max(0,scroll-visibleLines);
+      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) scroll=std::min(maxScroll,scroll+visibleLines);
+      else if(event.cbutton.button==BTN_CANCEL){
+        if(snapshot.state==LauncherUpdateState::Downloading){ LauncherUpdate_Cancel(); cancelRequested=true; }
+        else if(snapshot.state!=LauncherUpdateState::Installed) return;
+      } else if(event.cbutton.button==BTN_CONFIRM){
+        if(snapshot.state==LauncherUpdateState::UpdateAvailable){
+          if(LauncherUpdate_StartDownload(g_launcherNroPath)) cancelRequested=false;
+        } else if(snapshot.state==LauncherUpdateState::Error||snapshot.state==LauncherUpdateState::Cancelled){
+          cancelRequested=false;
+          LauncherUpdate_StartCheck(installedReleaseTag());
+        } else if(snapshot.state==LauncherUpdateState::Installed){
+          requestLauncherExitAfterUpdate();
+          return;
+        }
+      }
+    }
+
+    snapshot=LauncherUpdate_GetSnapshot();
+    clearUiBackground();
+    fillRect(0,0,SW,SH,(SDL_Color){0,0,0,105});
+    glassPanel(panelX,panelY,panelWidth,panelHeight);
+    border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
+    drawTextC(g_font_big,SW/2,panelY+24,"Drastic DS Update",COL_SEL);
+
+    std::string status;
+    switch(snapshot.state){
+      case LauncherUpdateState::Idle: status="Ready to check for updates"; break;
+      case LauncherUpdateState::Checking: status="Checking GitHub for the latest release..."; break;
+      case LauncherUpdateState::UpdateAvailable:
+        status="Version "+snapshot.release.tag+" is available    Installed: "+installedReleaseTag(); break;
+      case LauncherUpdateState::UpToDate:
+        status="You are up to date    Installed: "+installedReleaseTag(); break;
+      case LauncherUpdateState::Downloading:
+        status=cancelRequested?"Cancelling download...":"Downloading "+snapshot.release.assetName; break;
+      case LauncherUpdateState::ReadyToInstall: status="Preparing installation..."; break;
+      case LauncherUpdateState::Installing: status="Installing update..."; break;
+      case LauncherUpdateState::Installed: status="Update installed successfully - relaunch Drastic DS manually"; break;
+      case LauncherUpdateState::Cancelled: status="Update cancelled"; break;
+      case LauncherUpdateState::Error: status=snapshot.error.empty()?"Update failed":snapshot.error; break;
+    }
+    drawScrollTextL(g_font_sm,bodyX,panelY+92,bodyWidth,status.c_str(),
+      snapshot.state==LauncherUpdateState::Error?(SDL_Color){235,125,115,255}:COL_VAL);
+
+    SDL_Rect clip={bodyX,bodyY,bodyWidth,bodyBottom-bodyY};
+    SDL_RenderSetClipRect(g_ren,&clip);
+    for(int row=0;row<visibleLines&&scroll+row<(int)wrappedLines.size();row++)
+      drawText(g_font_sm,bodyX,bodyY+row*lineHeight,wrappedLines[scroll+row].c_str(),COL_TXT);
+    SDL_RenderSetClipRect(g_ren,nullptr);
+    if((int)wrappedLines.size()>visibleLines){
+      const int trackX=panelX+panelWidth-25,trackHeight=bodyBottom-bodyY;
+      fillRect(trackX,bodyY,4,trackHeight,(SDL_Color){40,44,54,255});
+      const int thumbHeight=std::max(18,trackHeight*visibleLines/(int)wrappedLines.size());
+      fillRect(trackX,bodyY+(trackHeight-thumbHeight)*scroll/std::max(1,maxScroll),4,thumbHeight,COL_SEL);
+    }
+
+    if(snapshot.state==LauncherUpdateState::Downloading){
+      const uint64_t total=snapshot.total?snapshot.total:snapshot.release.assetSize;
+      const int percent=total?(int)std::min<uint64_t>(100,snapshot.downloaded*100/total):0;
+      const int barX=bodyX,barY=panelY+panelHeight-82,barWidth=bodyWidth,barHeight=24;
+      border(barX,barY,barWidth,barHeight,2,COL_SEL);
+      fillRect(barX+3,barY+3,(barWidth-6)*percent/100,barHeight-6,COL_HI);
+      char progress[96];
+      snprintf(progress,sizeof(progress),"%d%%    %.1f / %.1f MiB",percent,
+        snapshot.downloaded/(1024.0*1024.0),total/(1024.0*1024.0));
+      drawTextC(g_font_sm,SW/2,barY+30,progress,COL_DIM);
+    } else {
+      const char *controls="B  Back       Up / Down  Scroll       L / R  Page";
+      if(snapshot.state==LauncherUpdateState::UpdateAvailable) controls="A  Download       B  Back       Up / Down  Scroll";
+      else if(snapshot.state==LauncherUpdateState::Error||snapshot.state==LauncherUpdateState::Cancelled) controls="A  Retry       B  Back";
+      else if(snapshot.state==LauncherUpdateState::Installed) controls="A  Exit Drastic DS";
+      drawFooterText(controls,panelY+panelHeight-38);
+    }
+    drawFadeIn();
+    presentUi();
+    SDL_Delay(8);
+  }
+}
+
+static void pollUpdateNotification() {
+  const LauncherUpdateSnapshot snapshot=LauncherUpdate_GetSnapshot();
+  if(snapshot.state==LauncherUpdateState::UpdateAvailable&&!snapshot.release.tag.empty()&&
+     snapshot.release.tag!=g_updateNotifiedTag){
+    g_updateNotifiedTag=snapshot.release.tag;
+    g_updateNoticeTag=snapshot.release.tag;
+    g_updateNoticeUntil=SDL_GetTicks()+9000;
+  }
+}
+
+static void drawUpdateNotification() {
+  if(g_updateNoticeTag.empty()||SDL_TICKS_PASSED(SDL_GetTicks(),g_updateNoticeUntil)){
+    g_updateNoticeTag.clear();
+    return;
+  }
+  const int width=std::min(540,SW-40),height=92,x=SW-width-24,y=SH-height-58;
+  glassPanel(x,y,width,height);
+  border(x,y,width,height,2,COL_SEL);
+  const std::string title="Drastic DS "+g_updateNoticeTag+" is available";
+  drawText(g_font,x+22,y+16,ellipsizedText(g_font,title,width-44).c_str(),COL_VAL);
+  drawText(g_font_sm,x+22,y+54,"Open Settings > Launcher > Check for Updates",COL_TXT);
 }
 
 static void gameSourcesScreen() {
@@ -4287,7 +4705,7 @@ static void modalMessage(const char *title, const std::vector<std::string> &line
       drawTextC(g_font,SW/2,y,line.c_str(),COL_TXT);
       y+=lineHeight;
     }
-    drawTextC(g_font_sm, SW/2, py+ph-42, "Press A to continue", COL_DIM);
+    drawFooterText("A  Continue",py+ph-30);
     presentUi(); SDL_Delay(8);
   }
 }
@@ -4325,11 +4743,12 @@ static bool confirmBox(const char *title, const std::vector<std::string> &lines)
       drawTextC(g_font,SW/2,y,line.c_str(),COL_TXT);
       y+=40;
     }
-    int fh=TTF_FontHeight(g_font);
     fillRect(yesx,bby,bw,bh,(SDL_Color){150,50,50,255}); border(yesx,bby,bw,bh,2,(SDL_Color){215,95,95,255});
-    drawTextC(g_font,yesx+bw/2,bby+(bh-fh)/2,"Yes  (A)",COL_TXT);
+    int yesHintWidth=footerHintWidth("A","Yes");
+    drawButtonHint(yesx+(bw-yesHintWidth)/2,bby+bh/2,"A","Yes");
     fillRect(nox,bby,bw,bh,(SDL_Color){48,54,64,255}); border(nox,bby,bw,bh,2,COL_DIM);
-    drawTextC(g_font,nox+bw/2,bby+(bh-fh)/2,"No  (B)",COL_TXT);
+    int noHintWidth=footerHintWidth("B","No");
+    drawButtonHint(nox+(bw-noHintWidth)/2,bby+bh/2,"B","No");
     presentUi(); SDL_Delay(8);
   }
 }
@@ -4338,6 +4757,26 @@ static bool bundledResourcesPresent() {
   const std::string system=SYSTEM_DIR;
   return regularFileExists(system + "/game_database.xml") &&
          regularFileExists(system + "/usrcheat.dat");
+}
+
+static bool supersededBundledCheatDatabase(const std::string &path) {
+  struct stat status{};
+  if(stat(path.c_str(),&status)!=0||!S_ISREG(status.st_mode)) return false;
+  unsigned char header[96]={};
+  FILE *file=fopen(path.c_str(),"rb");
+  if(!file) return false;
+  const bool valid=fread(header,1,sizeof(header),file)==sizeof(header);
+  fclose(file);
+  if(!valid||memcmp(header,"R4 CheatCode",12)) return false;
+  static const char legacyName[]="CMP NDS Cheat Database 220713";
+  if(status.st_size==13739796&&
+     !memcmp(header+16,legacyName,sizeof(legacyName)-1)) return true;
+  static const char incompatibleName[]=
+      "DeadSkullzJr's NDS(i) Cheat Database (20250812)";
+  static const unsigned char emptyEncoding[4]={0,0,0,0};
+  return status.st_size==55503268&&
+         !memcmp(header+16,incompatibleName,sizeof(incompatibleName)-1)&&
+         !memcmp(header+0x4c,emptyEncoding,sizeof(emptyEncoding));
 }
 
 static bool userSystemFilesPresent() {
@@ -4710,6 +5149,7 @@ static int perGameMenu(Game &g, SDL_GameController *pad) {
   else if(g.legacyUnique&&!g.legacyKey.empty()&&regularFileExists(legacyGp)) storeLoad(g_game,legacyGp.c_str());
   else g_game.kv.clear();
   normalizeCpuThreads(g_game);
+  migrateStylusMode(g_game,false);
   storeRemove(g_game,"Wrapper/CpuBoost");
   const int coverWidth=g_launcherPortrait?(highResolutionUi()?300:240):300;
   const int coverHeight=coverWidth*3/2;
@@ -4935,16 +5375,18 @@ static bool ensureResources() {
   FILE *f = fopen(RES_MARKER, "r");
   if (f) { if (!fgets(cur, sizeof(cur), f)) cur[0] = 0; fclose(f); }
   const bool present = bundledResourcesPresent();
-  const std::string marker=std::string("109-pokemon-save-v1-cheats-v1 ")+BUILD_STAMP;
+  const std::string marker=std::string("109-pokemon-save-v1-cheats-compatible-merged-v3 ")+BUILD_STAMP;
   if(trim(cur)==marker&&present) return true;
   toast("Updating DraStic resources...");
   mkdir(SYSTEM_DIR, 0777);
   const std::string system=SYSTEM_DIR;
   bool ok=extractFromRomfs("romfs:/res/game_database.xml",
                            (system+"/game_database.xml").c_str(),true);
-  if(!regularFileExists(system+"/usrcheat.dat"))
+  const std::string cheatDatabase=system+"/usrcheat.dat";
+  if(!regularFileExists(cheatDatabase)||
+     supersededBundledCheatDatabase(cheatDatabase))
     ok=extractFromRomfs("romfs:/res/usrcheat.dat",
-                        (system+"/usrcheat.dat").c_str(),true)&&ok;
+                        cheatDatabase.c_str(),true)&&ok;
   ok=bundledResourcesPresent()&&ok;
   if(ok) writeAtomicText(RES_MARKER,marker+"\n");
   return ok;
@@ -5178,10 +5620,11 @@ static void renderGrid(int sel,int top,const char*gamedirLabel){
     if(g_showGameTitles) drawTitleCell(x+L.cw/2,L.cw,y+L.chh+6,g.title,cur,cur?COL_VAL:COL_DIM);
   }
   if(n==0) drawTextC(g_font,SW/2,SH/2,"No games found -- open Settings > Library & storage",COL_DIM);
+  drawUpdateNotification();
   FootItem foot[] = {
-    { g_gA, "Launch", FA_LAUNCH }, { g_gY, "Sort", FA_SORT },
-    { g_gX, "Settings", FA_SETTINGS }, { g_gPlus, "Game Menu", FA_OPTIONS },
-    { g_gL, "", FA_PAGEL }, { g_gR, "Page", FA_PAGER }, { g_gB, "Quit", FA_QUIT },
+    { "A", "Launch", FA_LAUNCH }, { "Y", "Sort", FA_SORT },
+    { "X", "Settings", FA_SETTINGS }, { "+", "Game Menu", FA_OPTIONS },
+    { "L", "", FA_PAGEL }, { "R", "Page", FA_PAGER }, { "B", "Quit", FA_QUIT },
   };
   drawFooterHints(foot, 7, SH-26);
   presentUi();
@@ -5227,6 +5670,7 @@ static bool ensureDirectory(const char *path) {
 }
 
 static void cleanupLauncher() {
+  LauncherUpdate_Shutdown();
   if(g_ren) SDL_SetRenderTarget(g_ren,nullptr);
   for(auto &game:g_games){ if(game.cover) SDL_DestroyTexture(game.cover); game.cover=nullptr; }
   clearTextCaches();
@@ -5294,6 +5738,10 @@ static int earlyStartupFailure(const char *message, Result result) {
 int main(int argc, char **argv){
   extern std::string g_forwarderSelfPath;
   if(argc>=1&&argv[0]&&argv[0][0]) g_forwarderSelfPath=argv[0];
+  g_launcherNroPath=launcherNroPath();
+  std::string updateRecoveryError;
+  const bool updateRecoveryOk=g_launcherNroPath.empty()||
+      LauncherUpdate_RecoverInstallation(g_launcherNroPath,updateRecoveryError);
   const Result romfsResult=romfsInit();
   if(R_FAILED(romfsResult))
     return earlyStartupFailure("Could not mount the embedded launcher RomFS.",romfsResult);
@@ -5344,6 +5792,9 @@ int main(int argc, char **argv){
   for(const char *directory:directories) if(!ensureDirectory(directory)) return startupFailure("Could not create the Drastic DS data directories.");
   migrateLegacyEmuHosts();
 
+  if(!updateRecoveryOk)
+    modalMessage("Update recovery failed",{updateRecoveryError,"The installed launcher was left unchanged."});
+
   const bool missingSystemFilesAtStartup=!userSystemFilesPresent();
 
   struct stat configStat{};
@@ -5372,6 +5823,8 @@ int main(int argc, char **argv){
     storeSet(g_global,"Wrapper/AnalogDeadzone","35");
     storeSet(g_global,"Wrapper/ShowGameTitles","true");
     storeSet(g_global,"Wrapper/UiAnimations","true");
+    storeSet(g_global,"Wrapper/CheckUpdatesAtBoot","true");
+    storeSet(g_global,"Wrapper/InstalledReleaseTag",LauncherUpdate_BuiltReleaseTag());
     commitAll();
     if(!storeSave(g_global,LAUNCHER_INI)) return startupFailure("Could not create launcher.ini.");
   } else {
@@ -5431,6 +5884,9 @@ int main(int argc, char **argv){
     if(Game *game=findGameByKey(forwarderKey)){ selectGame(*game); forwarderMatched=true; }
     break;
   }
+  if(!forwarderRequested&&g_griddbReady&&!g_launcherNroPath.empty()&&
+     strcmp(storeGet(g_global,"Wrapper/CheckUpdatesAtBoot","true"),"false")!=0)
+    LauncherUpdate_StartCheck(installedReleaseTag());
   bool forwarderPending=forwarderRequested&&!forwarderMatched&&hasUsbSource;
   const Uint32 forwarderDeadline=forwarderPending?SDL_GetTicks()+6000:0;
   if(forwarderPending&&!usbRefreshAt) usbRefreshAt=SDL_GetTicks()+300;
@@ -5440,6 +5896,7 @@ int main(int argc, char **argv){
   }
 
   while(running&&beginUiFrame()){
+    pollUpdateNotification();
     if(hasUsbSource){
       const Uint32 now=SDL_GetTicks();
       const uint64_t generation=SwitchStorage::UsbStatusGeneration();
@@ -5563,6 +6020,7 @@ int main(int argc, char **argv){
       std::string profile=std::string(GAMECFG_DIR)+"/"+launchKey+".ini";
       if(!regularFileExists(profile)&&launchLegacyUnique&&!launchLegacyKey.empty()) profile=std::string(GAMECFG_DIR)+"/"+launchLegacyKey+".ini";
       Store overrides; storeLoad(overrides,profile.c_str());
+      migrateStylusMode(overrides,false);
       storeRemove(overrides,"Wrapper/CpuBoost");
       for(const auto &entry:overrides.kv) storeSet(effective,entry.k.c_str(),entry.v.c_str());
     }

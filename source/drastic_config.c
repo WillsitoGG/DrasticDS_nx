@@ -123,6 +123,13 @@ static DrasticMicrophoneSource read_microphone_source(void) {
                                      : DRASTIC_MICROPHONE_SIMULATED;
 }
 
+static DrasticStylusMode read_stylus_mode(void) {
+  const char *mode = prefs_get_string("Wrapper/StylusMode", "stick");
+  if (!strcmp(mode, "off")) return DRASTIC_STYLUS_OFF;
+  if (!strcmp(mode, "motion")) return DRASTIC_STYLUS_MOTION;
+  return DRASTIC_STYLUS_STICK;
+}
+
 const char *drastic_config_filter_name(DrasticVideoFilter filter) {
   static const char *names[DRASTIC_FILTER_COUNT] = {
     "nearest", "linear", "quilez", "scanline", "scale2x", "hq2x", "fxaa",
@@ -181,7 +188,10 @@ void drastic_config_load(DrasticRuntimeConfig *config) {
   config->vibration = prefs_get_bool("Wrapper/Vibration", true);
   config->motion = prefs_get_bool("Wrapper/Motion", true);
   config->lua_enabled = prefs_get_bool("Drastic/LuaEnabled", true);
-  config->analog_stylus = prefs_get_bool("Wrapper/AnalogStylus", true);
+  config->stylus_mode = read_stylus_mode();
+  config->mouse_stylus = prefs_get_bool("Wrapper/MouseStylus", true);
+  config->motion_stylus_sensitivity = clamp_int(
+      prefs_get_int("Wrapper/MotionStylusSensitivity", 10), 1, 20);
   config->stylus_x = 128;
   config->stylus_y = 96;
   config->core_config = drastic_config_build_core_config();

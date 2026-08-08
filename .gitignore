@@ -25,3 +25,4 @@ __pycache__/
 **/nds_firmware_modified.bin
 **/game_database.xml
 **/usrcheat.dat
+!third_party/nds-i-cheat-databases/usrcheat.dat

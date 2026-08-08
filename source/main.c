@@ -419,101 +419,31 @@ static int vibration_player_ready;
 static int vibration_handheld_ready;
 static int rumble_active;
 
-typedef struct {
-  HidSixAxisSensorHandle handles[6];
-  int ready[6];
-  u64 last_sample;
-} MotionSensors;
-
-static MotionSensors motion_sensors;
-
-static void initialize_motion_sensors(void) {
-  static const struct {
-    HidNpadIdType id;
-    HidNpadStyleTag style;
-  } sources[6] = {
-    {HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld},
-    {HidNpadIdType_No1, HidNpadStyleTag_NpadFullKey},
-    {HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual},
-    {HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual},
-    {HidNpadIdType_No1, HidNpadStyleTag_NpadJoyLeft},
-    {HidNpadIdType_No1, HidNpadStyleTag_NpadJoyRight},
-  };
-  for (int index = 0; index < 6; index++) {
-    if (index == 2 || index == 3) continue;
-    HidSixAxisSensorHandle temporary = {0};
-    const Result result = hidGetSixAxisSensorHandles(
-        &temporary, 1, sources[index].id, sources[index].style);
-    if (R_FAILED(result)) continue;
-    motion_sensors.handles[index] = temporary;
-    if (R_SUCCEEDED(hidStartSixAxisSensor(motion_sensors.handles[index])))
-      motion_sensors.ready[index] = 1;
-  }
-  HidSixAxisSensorHandle dual[2] = {0};
-  if (R_SUCCEEDED(hidGetSixAxisSensorHandles(
-          dual, 2, HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual))) {
-    for (int index = 0; index < 2; index++) {
-      motion_sensors.handles[2 + index] = dual[index];
-      if (R_SUCCEEDED(hidStartSixAxisSensor(dual[index])))
-        motion_sensors.ready[2 + index] = 1;
-    }
-  }
-}
-
-static void shutdown_motion_sensors(void) {
-  for (int index = 0; index < 6; index++)
-    if (motion_sensors.ready[index])
-      hidStopSixAxisSensor(motion_sensors.handles[index]);
-  memset(&motion_sensors, 0, sizeof(motion_sensors));
-}
-
 static void update_motion(const DrasticRuntimeConfig *config, void *clazz,
-                          u32 styles, u32 attributes) {
+                          const DrasticInputSnapshot *input,
+                          u64 *last_sample, int *last_source) {
   if (!config->motion || !core.updateAccelerometer || !core.updateGyroscope)
     return;
-  int source = -1;
-  int right_joycon = 0;
-  if ((styles & HidNpadStyleTag_NpadHandheld) && motion_sensors.ready[0])
-    source = 0;
-  else if ((styles & HidNpadStyleTag_NpadFullKey) && motion_sensors.ready[1])
-    source = 1;
-  else if (styles & HidNpadStyleTag_NpadJoyDual) {
-    if ((attributes & HidNpadAttribute_IsLeftConnected) &&
-        motion_sensors.ready[2])
-      source = 2;
-    else if ((attributes & HidNpadAttribute_IsRightConnected) &&
-             motion_sensors.ready[3]) {
-      source = 3;
-      right_joycon = 1;
-    }
-  } else if ((styles & HidNpadStyleTag_NpadJoyLeft) &&
-             motion_sensors.ready[4])
-    source = 4;
-  else if ((styles & HidNpadStyleTag_NpadJoyRight) &&
-           motion_sensors.ready[5]) {
-    source = 5;
-    right_joycon = 1;
-  }
-  if (source < 0) return;
-  HidSixAxisSensorState state = {0};
-  if (!hidGetSixAxisSensorStates(motion_sensors.handles[source], &state, 1) ||
-      state.sampling_number == motion_sensors.last_sample)
+  if (!input || !input->motion_sample || input->motion_source < 0 ||
+      (input->motion_sample == *last_sample &&
+       input->motion_source == *last_source))
     return;
-  motion_sensors.last_sample = state.sampling_number;
+  *last_sample = input->motion_sample;
+  *last_source = input->motion_source;
 
   /* Switch HID reports acceleration in g. Map the controller axes to the
    * Android device axes Drastic expects, then apply the configured view
    * rotation exactly as the Android frontend did. */
   const float gravity = 9.80665f;
-  float x = -state.acceleration.y * gravity;
-  float y = state.acceleration.z * gravity;
-  const float z = -state.acceleration.x * gravity;
-  if (right_joycon) { x = -x; y = -y; }
+  float x = -input->motion_acceleration.y * gravity;
+  float y = input->motion_acceleration.z * gravity;
+  const float z = -input->motion_acceleration.x * gravity;
+  if (input->motion_right_joycon) { x = -x; y = -y; }
   float rotated_x, rotated_y;
   drastic_rotation_display_delta_to_source(
       config->rotation, x, y, &rotated_x, &rotated_y);
   core.updateAccelerometer(fake_env, clazz, rotated_x, rotated_y, z);
-  core.updateGyroscope(fake_env, clazz, -state.angular_velocity.x);
+  core.updateGyroscope(fake_env, clazz, -input->motion_angular_velocity.x);
 }
 
 static void send_rumble(const HidVibrationValue values[2]) {
@@ -552,6 +482,7 @@ typedef struct {
   u64 fast_forward;
   u64 swap_screens;
   u64 microphone;
+  u64 motion_stylus_recenter;
   u64 autofire;
   u64 lid;
   u64 save_state;
@@ -573,6 +504,8 @@ typedef struct {
   int state_slot;
   int stylus_speed;
   int lua_rotation_sent;
+  u64 motion_sample_sent;
+  int motion_source_sent;
   u64 analog_touch_button;
 } RuntimeControls;
 
@@ -588,6 +521,7 @@ static void remove_duplicate_hotkeys(RuntimeHotkeys *hotkeys) {
     &hotkeys->fast_forward,
     &hotkeys->swap_screens,
     &hotkeys->microphone,
+    &hotkeys->motion_stylus_recenter,
     &hotkeys->autofire,
     &hotkeys->lid,
     &hotkeys->save_state,
@@ -647,6 +581,9 @@ static void load_runtime_controls(RuntimeControls *controls) {
       prefs_get_string("Wrapper/HotkeySwapScreens", "ZL"));
   controls->hotkeys.microphone = buttons_for_combo(
       prefs_get_string("Wrapper/HotkeyMicrophone", "StickL"));
+  controls->hotkeys.motion_stylus_recenter = buttons_for_combo(
+      prefs_get_string("Wrapper/HotkeyMotionStylusRecenter",
+                       "L+R+StickR"));
   controls->hotkeys.autofire = buttons_for_combo(
       prefs_get_string("Wrapper/HotkeyAutoFire", "None"));
   controls->hotkeys.lid = buttons_for_combo(
@@ -674,6 +611,8 @@ static void load_runtime_controls(RuntimeControls *controls) {
   if (controls->stylus_speed < 1) controls->stylus_speed = 1;
   if (controls->stylus_speed > 20) controls->stylus_speed = 20;
   controls->lua_rotation_sent = 360;
+  controls->motion_sample_sent = 0;
+  controls->motion_source_sent = -1;
 }
 
 static int combo_held(u64 held, u64 combo) {
@@ -712,6 +651,8 @@ static void configure_input_sampler(DrasticInputSamplerConfig *config,
       controls->hotkeys.swap_screens;
   config->hotkeys[DRASTIC_INPUT_HOTKEY_MICROPHONE] =
       controls->hotkeys.microphone;
+  config->hotkeys[DRASTIC_INPUT_HOTKEY_MOTION_STYLUS_RECENTER] =
+      controls->hotkeys.motion_stylus_recenter;
   config->hotkeys[DRASTIC_INPUT_HOTKEY_AUTOFIRE] = controls->hotkeys.autofire;
   config->hotkeys[DRASTIC_INPUT_HOTKEY_LID] = controls->hotkeys.lid;
   config->hotkeys[DRASTIC_INPUT_HOTKEY_SAVE_STATE] =
@@ -819,7 +760,8 @@ static int process_input(DrasticRuntimeConfig *config,
   }
 
   update_rumble(config, clazz);
-  update_motion(config, clazz, input.style_set, input.attributes);
+  update_motion(config, clazz, &input, &controls->motion_sample_sent,
+                &controls->motion_source_sent);
   drastic_input_sampler_update_runtime(sampler, config, true);
   return 0;
 }
@@ -1017,12 +959,12 @@ int main(void) {
 
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
   hidInitializeTouchScreen();
+  hidInitializeMouse();
   vibration_player_ready = R_SUCCEEDED(hidInitializeVibrationDevices(
       vibration_player, 2, HidNpadIdType_No1, HidNpadStyleSet_NpadStandard));
   vibration_handheld_ready = R_SUCCEEDED(hidInitializeVibrationDevices(
       vibration_handheld, 2, HidNpadIdType_Handheld,
       HidNpadStyleSet_NpadStandard));
-  initialize_motion_sensors();
 
   RuntimeControls controls = {
     .state_slot = prefs_get_int("Wrapper/StateSlot", 0),
@@ -1207,7 +1149,6 @@ int main(void) {
   drastic_input_sampler_destroy(input_sampler);
   HidVibrationValue stopped[2] = {0};
   send_rumble(stopped);
-  shutdown_motion_sensors();
   drastic_menu_destroy(menu);
   shutdown_core(clazz, &game);
   /* Stop DraStic-owned Android service workers while their code and any EGL

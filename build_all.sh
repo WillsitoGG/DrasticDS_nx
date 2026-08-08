@@ -20,11 +20,15 @@ ASSETS="$APK_DIR/assets"
 VULKAN_HEADERS="$NVK_SDK/include/vulkan"
 DFX_SOURCE="$ASSETS/shaders"
 BUNDLED_SHADER_SOURCE="$APP/third_party/drastic-ds-shaders"
+BUNDLED_CHEAT_SOURCE=${DRASTIC_USRCHEAT_DATABASE:-"$APP/third_party/nds-i-cheat-databases/usrcheat.dat"}
+BUNDLED_CHEAT_LICENSE="$APP/third_party/nds-i-cheat-databases"
 
 required=(
   "$CORE"
   "$ASSETS/game_database.xml"
-  "$ASSETS/usrcheat.dat"
+  "$BUNDLED_CHEAT_SOURCE"
+  "$BUNDLED_CHEAT_LICENSE/NOTICE.md"
+  "$BUNDLED_CHEAT_LICENSE/COPYING"
   "$DFX_SOURCE/None.dfx"
   "$DFX_SOURCE/Linear.dfx"
   "$DFX_SOURCE/Quilez.dfx"
@@ -209,7 +213,12 @@ cp -f "$HOST_STAGE/DrasticDS_nx_gl.nro" "$ROMFS_STAGE/emu/DrasticDS_nx_gl.nro"
 "$PYTHON3" "$APP/tools/patch_game_database.py" \
   --input "$ASSETS/game_database.xml" \
   --output "$ROMFS_STAGE/res/game_database.xml"
-cp -f "$ASSETS/usrcheat.dat" "$ROMFS_STAGE/res/usrcheat.dat"
+cp -f "$BUNDLED_CHEAT_SOURCE" "$ROMFS_STAGE/res/usrcheat.dat"
+mkdir -p "$ROMFS_STAGE/licenses/nds-i-cheat-databases"
+cp -f "$BUNDLED_CHEAT_LICENSE/NOTICE.md" \
+  "$ROMFS_STAGE/licenses/nds-i-cheat-databases/NOTICE.md"
+cp -f "$BUNDLED_CHEAT_LICENSE/COPYING" \
+  "$ROMFS_STAGE/licenses/nds-i-cheat-databases/COPYING"
 
 echo "==== bundled custom shaders: $BUNDLED_SHADER_COUNT (OpenGL + Vulkan) ===="
 mkdir -p "$ROMFS_STAGE/shaders"
