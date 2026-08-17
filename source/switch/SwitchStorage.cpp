@@ -6,6 +6,7 @@
 #include <smb2/libsmb2.h>
 
 #include <sys/iosupport.h>
+#include <sys/poll.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <fcntl.h>
@@ -16,40 +17,73 @@
 #include <atomic>
 #include <cerrno>
 #include <climits>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 
 namespace SwitchStorage
 {
 namespace
 {
+constexpr size_t kSmbReadAheadMin = 64 * 1024;
+constexpr size_t kSmbReadAheadMax = 512 * 1024;
+constexpr size_t kSmbReadAheadBudget = 8 * 1024 * 1024;
+constexpr size_t kSmbDirectoryCacheLimit = 32;
+
 struct SmbMount;
+struct SmbDevice;
+
+struct CachedDirectoryEntry { std::string name; struct stat info{}; };
+struct CachedDirectory { std::vector<CachedDirectoryEntry> entries; std::chrono::steady_clock::time_point expires; };
 
 struct SmbFile
 {
+	std::shared_ptr<SmbMount>* lifetime = nullptr;
 	SmbMount* mount;
 	smb2fh* handle;
+	uint8_t* readAhead;
+	size_t readAheadCapacity;
+	size_t readAheadOffset;
+	size_t readAheadSize;
+	unsigned sequentialReads;
+	uint64_t position;
+	uint64_t contextGeneration;
+	int flags;
+	bool openedOnce;
+	char path[PATH_MAX]{};
 };
 
 struct SmbDir
 {
+	std::shared_ptr<SmbMount>* lifetime = nullptr;
 	SmbMount* mount;
 	smb2dir* handle;
+	std::vector<CachedDirectoryEntry>* entries;
+	size_t index;
+	uint64_t contextGeneration;
+	bool fromCache;
+	bool complete;
+	char path[PATH_MAX]{};
 };
 
 struct SmbMount
 {
 	SmbShare config;
-	std::string deviceName;
-	std::string rootPath;
+	SmbDevice* device=nullptr;
 	smb2_context* context = nullptr;
 	bool connected = false;
-	devoptab_t devoptab{};
+	std::atomic<SmbConnectionState> state{SmbConnectionState::Disconnected};
+	std::atomic_bool retired{false};
+	uint64_t contextGeneration=0;
+	std::string lastError;
 	std::mutex ioMutex;
+	size_t readAheadBytes = 0;
+	std::unordered_map<std::string,CachedDirectory> directoryCache;
 
 	~SmbMount()
 	{
@@ -62,14 +96,122 @@ struct SmbMount
 	}
 };
 
+struct SmbDevice
+{
+	std::string deviceName;
+	std::string rootPath;
+	devoptab_t devoptab{};
+	std::shared_ptr<SmbMount> mount;
+};
+
+bool EnsureReadAheadBuffer(SmbFile* file, size_t desired)
+{
+	desired = std::clamp(desired, kSmbReadAheadMin, kSmbReadAheadMax);
+	if (file->readAhead && file->readAheadCapacity >= desired)
+		return true;
+	const size_t additional = desired - file->readAheadCapacity;
+	if (file->mount->readAheadBytes > kSmbReadAheadBudget - additional)
+		return false;
+	void* resized = std::realloc(file->readAhead, desired);
+	if (!resized)
+		return false;
+	file->readAhead = static_cast<uint8_t*>(resized);
+	file->readAheadCapacity = desired;
+	file->mount->readAheadBytes += additional;
+	return true;
+}
+
+void ReleaseReadAheadBuffer(SmbFile* file)
+{
+	if (!file->readAhead)
+		return;
+	std::free(file->readAhead);
+	file->readAhead = nullptr;
+	file->mount->readAheadBytes -= file->readAheadCapacity;
+	file->readAheadCapacity = 0;
+	file->readAheadOffset = 0;
+	file->readAheadSize = 0;
+	file->sequentialReads = 0;
+}
+
+int SynchronizeFilePosition(SmbFile* file)
+{
+	if (file->readAheadSize == 0)
+		return 0;
+	uint64_t resultPosition = 0;
+	const int result = smb2_lseek(file->mount->context, file->handle,
+		static_cast<int64_t>(file->position), SEEK_SET, &resultPosition);
+	if (result >= 0)
+	{
+		file->readAheadOffset = 0;
+		file->readAheadSize = 0;
+	}
+	return result;
+}
+
 std::mutex s_mountMutex;
-std::vector<std::unique_ptr<SmbMount>> s_smbMounts;
+std::vector<std::shared_ptr<SmbMount>> s_smbMounts;
+std::vector<std::unique_ptr<SmbDevice>> s_smbDevices;
 bool s_usbInitialized = false;
 std::atomic<uint64_t> s_usbGeneration{0};
+std::mutex s_usbMutex;
+std::vector<UsbHsFsDevice> s_usbDevices;
+std::mutex s_usbCallbackMutex;
+UsbStatusCallback s_usbCallback = nullptr;
+void* s_usbCallbackData = nullptr;
 
-void usbStatusChanged(const UsbHsFsDevice*, u32, void*)
+void usbStatusChanged(const UsbHsFsDevice* devices, u32 count, void*)
 {
-	s_usbGeneration.fetch_add(1, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> lock(s_usbMutex);
+		s_usbDevices.clear();
+		if (devices && count)
+			s_usbDevices.assign(devices, devices + count);
+		s_usbGeneration.fetch_add(1, std::memory_order_release);
+	}
+	std::lock_guard<std::mutex> callbackLock(s_usbCallbackMutex);
+	if (s_usbCallback)
+		s_usbCallback(s_usbCallbackData);
+}
+
+void hashBytes(uint64_t& hash, const void* data, size_t size)
+{
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	for (size_t index = 0; index < size; ++index) { hash ^= bytes[index]; hash *= 1099511628211ULL; }
+}
+template <typename T> void hashInteger(uint64_t& hash, T value)
+{
+	for (size_t index = 0; index < sizeof(T); ++index) { const uint8_t byte = value & 0xff; hashBytes(hash, &byte, 1); value >>= 8; }
+}
+template <size_t Size> void hashText(uint64_t& hash, const char (&text)[Size])
+{
+	hashBytes(hash, text, strnlen(text, Size)); const uint8_t separator = 0; hashBytes(hash, &separator, 1);
+}
+std::string formatUsbId(const char* prefix, uint64_t hash)
+{
+	char text[32]; std::snprintf(text, sizeof(text), "%s-%016llx", prefix, static_cast<unsigned long long>(hash)); return text;
+}
+std::string usbPhysicalId(const UsbHsFsDevice& device)
+{
+	uint64_t hash = 14695981039346656037ULL; hashInteger(hash, device.vid); hashInteger(hash, device.pid); hashText(hash, device.serial_number);
+	if (!device.serial_number[0]) { hashText(hash, device.manufacturer); hashText(hash, device.product_name); hashInteger(hash, device.capacity); }
+	return formatUsbId("usbdev", hash);
+}
+std::string usbVolumeId(const UsbHsFsDevice& device)
+{
+	uint64_t hash = 14695981039346656037ULL; const std::string physical = usbPhysicalId(device); hashBytes(hash, physical.data(), physical.size());
+	hashInteger(hash, device.lun); hashInteger(hash, device.fs_idx); hashInteger(hash, device.fs_type); hashInteger(hash, device.capacity); return formatUsbId("usbvol", hash);
+}
+Location makeUsbLocation(const UsbHsFsDevice& device)
+{
+	Location location; location.id=usbVolumeId(device); location.physicalId=usbPhysicalId(device); location.mountAlias=device.name; location.path=device.name;
+	if (!location.path.empty() && location.path.back()!='/') location.path+='/';
+	location.serialNumber.assign(device.serial_number,strnlen(device.serial_number,sizeof(device.serial_number)));
+	location.vendorId=device.vid; location.productId=device.pid; location.lun=device.lun; location.partition=device.fs_idx;
+	location.filesystemType=device.fs_type; location.capacity=device.capacity;
+	const uint64_t gib=device.capacity/(1024ULL*1024ULL*1024ULL); char label[256];
+	std::snprintf(label,sizeof(label),"%s - %s%s%s (%llu GiB)",device.name,LIBUSBHSFS_FS_TYPE_STR(device.fs_type),device.product_name[0]?" - ":"",device.product_name,static_cast<unsigned long long>(gib));
+	location.label=label; return location;
 }
 
 int fail(_reent* reent, int error)
@@ -99,7 +241,7 @@ bool validId(const std::string& id)
 
 std::string deviceNameForId(const std::string& id)
 {
-	return validId(id) ? "nxsmb_" + id : std::string{};
+	return validId(id) ? "cemusmb_" + id : std::string{};
 }
 
 bool fixPath(const char* source, char* destination, size_t destinationSize)
@@ -175,26 +317,128 @@ void fillStat(struct stat* output, const struct smb2_stat_64& input)
 	output->st_blksize = 65536;
 }
 
-SmbMount* mountFrom(_reent* reent)
+std::shared_ptr<SmbMount> mountFrom(_reent* reent)
 {
-	return reent ? static_cast<SmbMount*>(reent->deviceData) : nullptr;
+	auto* device=reent?static_cast<SmbDevice*>(reent->deviceData):nullptr;
+	if(!device)return {};
+	std::lock_guard<std::mutex> lock(s_mountMutex);
+	auto mount=device->mount;
+	if(!mount||mount->retired.load(std::memory_order_acquire))return {};
+	return mount;
+}
+std::shared_ptr<SmbMount> mountFrom(const SmbFile* file){return file&&file->lifetime?*file->lifetime:std::shared_ptr<SmbMount>{};}
+std::shared_ptr<SmbMount> mountFrom(const SmbDir* directory){return directory&&directory->lifetime?*directory->lifetime:std::shared_ptr<SmbMount>{};}
+bool pinMount(SmbFile* file,std::shared_ptr<SmbMount> mount){file->lifetime=new(std::nothrow)std::shared_ptr<SmbMount>(std::move(mount));if(!file->lifetime)return false;file->mount=file->lifetime->get();return true;}
+bool pinMount(SmbDir* directory,std::shared_ptr<SmbMount> mount){directory->lifetime=new(std::nothrow)std::shared_ptr<SmbMount>(std::move(mount));if(!directory->lifetime)return false;directory->mount=directory->lifetime->get();return true;}
+void releaseMount(SmbFile* file){auto* lifetime=file->lifetime;*file={};delete lifetime;}
+void releaseMount(SmbDir* directory){auto* lifetime=directory->lifetime;*directory={};delete lifetime;}
+bool mountRetired(const SmbMount* mount){return !mount||mount->retired.load(std::memory_order_acquire);}
+
+void disconnectMountUnlocked(SmbMount* mount)
+{
+	++mount->contextGeneration;
+	if(mount->context){if(mount->connected)smb2_disconnect_share(mount->context);smb2_destroy_context(mount->context);mount->context=nullptr;}
+	mount->connected=false;mount->directoryCache.clear();
+}
+
+bool reconnectableError(SmbMount* mount,int result)
+{
+	const int error=result<0?-result:result;
+	if(error==ENOTCONN||error==ECONNRESET||error==ECONNABORTED||error==EPIPE||
+	   error==ETIMEDOUT||error==EHOSTUNREACH||error==ENETDOWN||error==ENETUNREACH)return true;
+	if(result!=-1||!mount||!mount->context)return false;
+	if(smb2_get_fd(mount->context)<0)return true;
+	const char* detail=smb2_get_error(mount->context);
+	return detail&&(std::strstr(detail,"Poll failed")||std::strstr(detail,"Timeout")||
+	               std::strstr(detail,"service failed")||std::strstr(detail,"connection"));
+}
+
+void recordIoFailure(SmbMount* mount,int result)
+{
+	if(mountRetired(mount)||!reconnectableError(mount,result))return;
+	const char* detail=mount->context?smb2_get_error(mount->context):nullptr;
+	mount->lastError=detail&&*detail?detail:"The SMB connection was lost";
+	mount->connected=false;mount->state.store(SmbConnectionState::Failed,std::memory_order_release);
+}
+
+struct SmbConnectResult{bool complete=false;int status=-ECONNABORTED;};
+void smbConnectCallback(smb2_context*,int status,void*,void* data){auto* result=static_cast<SmbConnectResult*>(data);result->status=status;result->complete=true;}
+
+bool reopenFileUnlocked(SmbFile* file)
+{
+	if(!file->mount->context||file->mount->state.load()!=SmbConnectionState::Connected)return false;
+	const int flags=file->openedOnce?file->flags&~(O_CREAT|O_EXCL|O_TRUNC):file->flags;
+	file->handle=smb2_open(file->mount->context,file->path,flags);if(!file->handle)return false;
+	file->openedOnce=true;file->contextGeneration=file->mount->contextGeneration;
+	file->readAheadOffset=file->readAheadSize=0;
+	if(file->position&&file->position<=static_cast<uint64_t>(LLONG_MAX)){
+		uint64_t actual=0;if(smb2_lseek(file->mount->context,file->handle,(int64_t)file->position,SEEK_SET,&actual)<0||actual!=file->position){smb2_close(file->mount->context,file->handle);file->handle=nullptr;return false;}
+	}
+	return true;
+}
+
+bool reconnectMountUnlocked(SmbMount* mount,const std::atomic_bool* cancel,std::string* error)
+{
+	if(mountRetired(mount))return false;
+	mount->state.store(mount->context?SmbConnectionState::Reconnecting:SmbConnectionState::Connecting);
+	disconnectMountUnlocked(mount);
+	mount->context=smb2_init_context();
+	if(!mount->context){if(error)*error="Could not create the SMB client";mount->state.store(SmbConnectionState::Failed);return false;}
+	smb2_set_security_mode(mount->context,SMB2_NEGOTIATE_SIGNING_ENABLED);smb2_set_timeout(mount->context,6);
+	if(!mount->config.user.empty())smb2_set_user(mount->context,mount->config.user.c_str());
+	if(!mount->config.password.empty())smb2_set_password(mount->context,mount->config.password.c_str());
+	if(!mount->config.domain.empty())smb2_set_domain(mount->context,mount->config.domain.c_str());
+	SmbConnectResult connection;
+	int result=smb2_connect_share_async(mount->context,mount->config.server.c_str(),mount->config.share.c_str(),mount->config.user.empty()?nullptr:mount->config.user.c_str(),smbConnectCallback,&connection);
+	const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(6);
+	while(result>=0&&!connection.complete){
+		if(mountRetired(mount)||(cancel&&cancel->load(std::memory_order_acquire))){mount->lastError=mountRetired(mount)?"SMB share was unmounted":"Connection cancelled";mount->state.store(SmbConnectionState::Disconnected);disconnectMountUnlocked(mount);if(error)*error=mount->lastError;return false;}
+		if(std::chrono::steady_clock::now()>=deadline){mount->lastError="SMB connection timed out";mount->state.store(SmbConnectionState::Failed);disconnectMountUnlocked(mount);if(error)*error=mount->lastError;return false;}
+		pollfd descriptor{};descriptor.fd=smb2_get_fd(mount->context);descriptor.events=static_cast<short>(smb2_which_events(mount->context));
+		const int polled=::poll(&descriptor,1,100);if(polled<0){if(errno==EINTR)continue;result=-errno;break;}if(polled>0&&smb2_service(mount->context,descriptor.revents)<0){result=-EIO;break;}
+	}
+	if(result>=0)result=connection.status;
+	if(result<0){const char* detail=smb2_get_error(mount->context);mount->lastError=detail&&*detail?detail:"Could not reconnect to the SMB share";if(error)*error=mount->lastError;mount->state.store(SmbConnectionState::Failed);return false;}
+	mount->connected=true;mount->lastError.clear();mount->state.store(SmbConnectionState::Connected);return true;
+}
+
+bool ensureFileCurrent(SmbFile* file)
+{
+	if(!file||!file->mount||mountRetired(file->mount))return false;
+	if(file->mount->state.load()!=SmbConnectionState::Connected&&!reconnectMountUnlocked(file->mount,nullptr,nullptr)){file->handle=nullptr;return false;}
+	if(file->contextGeneration==file->mount->contextGeneration&&file->handle)return true;
+	file->handle=nullptr;return reopenFileUnlocked(file);
 }
 
 int smbOpen(_reent* reent, void* state, const char* source, int flags, int)
 {
-	auto* mount = mountFrom(reent);
+	auto mount = mountFrom(reent);
 	auto* file = static_cast<SmbFile*>(state);
-	std::memset(file, 0, sizeof(*file));
+	*file={};
 	if (!mount)
 		return fail(reent, ENODEV);
 	char path[PATH_MAX]{};
 	if (!fixPath(source, path, sizeof(path)))
 		return fail(reent, ENAMETOOLONG);
 	std::lock_guard<std::mutex> lock(mount->ioMutex);
+	if(mountRetired(mount.get())||!pinMount(file,mount))return fail(reent,mountRetired(mount.get())?ENODEV:ENOMEM);
+	std::snprintf(file->path,sizeof(file->path),"%s",path);file->flags=flags;
 	file->handle = smb2_open(mount->context, path, flags);
 	if (!file->handle)
-		return fail(reent, EIO);
-	file->mount = mount;
+	{releaseMount(file);return fail(reent, EIO);}
+	file->openedOnce=true;file->contextGeneration=mount->contextGeneration;
+	if (flags & O_APPEND)
+	{
+		uint64_t position = 0;
+		const int result = smb2_lseek(mount->context, file->handle, 0, SEEK_END, &position);
+		if (result < 0)
+		{
+			smb2_close(mount->context, file->handle);
+			releaseMount(file);
+			return fail(reent, -result);
+		}
+		file->position = position;
+	}
 	reent->_errno = 0;
 	return 0;
 }
@@ -202,11 +446,13 @@ int smbOpen(_reent* reent, void* state, const char* source, int flags, int)
 int smbClose(_reent* reent, void* state)
 {
 	auto* file = static_cast<SmbFile*>(state);
-	if (!file || !file->mount || !file->handle)
+	auto mount=mountFrom(file);
+	if (!mount)
 		return fail(reent, EBADF);
-	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
-	const int result = smb2_close(file->mount->context, file->handle);
-	std::memset(file, 0, sizeof(*file));
+	std::lock_guard<std::mutex> lock(mount->ioMutex);
+	ReleaseReadAheadBuffer(file);
+	const int result = file->handle&&file->contextGeneration==mount->contextGeneration&&mount->context?smb2_close(mount->context,file->handle):0;
+	releaseMount(file);
 	if (result < 0)
 		return fail(reent, -result);
 	reent->_errno = 0;
@@ -219,19 +465,57 @@ ssize_t smbRead(_reent* reent, void* state, char* output, size_t length)
 	if (!file || !file->mount || !file->handle)
 		return fail(reent, EBADF);
 	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
+	if(!ensureFileCurrent(file))return fail(reent,ENOTCONN);
 	const size_t maximum = std::max<size_t>(1, smb2_get_max_read_size(file->mount->context));
 	size_t total = 0;
+	if (file->readAheadOffset < file->readAheadSize)
+	{
+		const size_t cached = std::min(length,
+			file->readAheadSize - file->readAheadOffset);
+		std::memcpy(output, file->readAhead + file->readAheadOffset, cached);
+		file->readAheadOffset += cached;
+		file->position += cached;
+		total += cached;
+		if (file->readAheadOffset == file->readAheadSize)
+		{
+			file->readAheadOffset = 0;
+			file->readAheadSize = 0;
+		}
+	}
 	while (total < length)
 	{
-		const size_t amount = std::min(length - total, maximum);
-		const int result = smb2_read(file->mount->context, file->handle,
-		                             reinterpret_cast<uint8_t*>(output + total), amount);
-		if (result < 0)
-			return total ? static_cast<ssize_t>(total) : fail(reent, -result);
+		const size_t remaining = length - total;
+		const size_t target = std::min(kSmbReadAheadMax,
+			kSmbReadAheadMin << std::min(file->sequentialReads, 3u));
+		const bool useReadAhead = remaining < target && EnsureReadAheadBuffer(file, target);
+		const size_t amount = std::min(useReadAhead ? target : remaining, maximum);
+		uint8_t* destination = useReadAhead ? file->readAhead : reinterpret_cast<uint8_t*>(output + total);
+		const int result = smb2_read(file->mount->context, file->handle, destination, amount);
+		if (result < 0){recordIoFailure(file->mount,result);return total ? static_cast<ssize_t>(total) : fail(reent, -result);}
 		if (result == 0)
 			break;
-		total += static_cast<size_t>(result);
-		if (static_cast<size_t>(result) < amount)
+		if (useReadAhead)
+		{
+			file->sequentialReads = std::min(file->sequentialReads + 1, 3u);
+			file->readAheadOffset = 0;
+			file->readAheadSize = static_cast<size_t>(result);
+			const size_t copied = std::min(remaining, file->readAheadSize);
+			std::memcpy(output + total, file->readAhead, copied);
+			file->readAheadOffset = copied;
+			file->position += copied;
+			total += copied;
+			if (file->readAheadOffset == file->readAheadSize)
+			{
+				file->readAheadOffset = 0;
+				file->readAheadSize = 0;
+			}
+			break;
+		}
+		const size_t bytesRead = static_cast<size_t>(result);
+		file->sequentialReads = 0;
+		file->position += bytesRead;
+		total += bytesRead;
+		if (bytesRead < amount)
 			break;
 	}
 	reent->_errno = 0;
@@ -244,6 +528,12 @@ ssize_t smbWrite(_reent* reent, void* state, const char* input, size_t length)
 	if (!file || !file->mount || !file->handle)
 		return fail(reent, EBADF);
 	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
+	if(!ensureFileCurrent(file))return fail(reent,ENOTCONN);
+	file->mount->directoryCache.clear();
+	const int synchronized = SynchronizeFilePosition(file);
+	if (synchronized < 0)
+		return fail(reent, -synchronized);
+	if(file->flags&O_APPEND){uint64_t end=0;const int positioned=smb2_lseek(file->mount->context,file->handle,0,SEEK_END,&end);if(positioned<0)return fail(reent,-positioned);file->position=end;}
 	const size_t maximum = std::max<size_t>(1, smb2_get_max_write_size(file->mount->context));
 	size_t total = 0;
 	while (total < length)
@@ -251,11 +541,11 @@ ssize_t smbWrite(_reent* reent, void* state, const char* input, size_t length)
 		const size_t amount = std::min(length - total, maximum);
 		const int result = smb2_write(file->mount->context, file->handle,
 		                              reinterpret_cast<const uint8_t*>(input + total), amount);
-		if (result < 0)
-			return total ? static_cast<ssize_t>(total) : fail(reent, -result);
+		if (result < 0){recordIoFailure(file->mount,result);return total ? static_cast<ssize_t>(total) : fail(reent, -result);}
 		if (result == 0)
 			return total ? static_cast<ssize_t>(total) : fail(reent, EIO);
 		total += static_cast<size_t>(result);
+		file->position += static_cast<size_t>(result);
 	}
 	reent->_errno = 0;
 	return static_cast<ssize_t>(total);
@@ -270,13 +560,64 @@ off_t smbSeek(_reent* reent, void* state, off_t position, int origin)
 		return static_cast<off_t>(-1);
 	}
 	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
+	if(!ensureFileCurrent(file)){fail(reent,ENOTCONN);return static_cast<off_t>(-1);}
 	uint64_t resultPosition = 0;
-	const int result = smb2_lseek(file->mount->context, file->handle, position, origin, &resultPosition);
-	if (result < 0 || resultPosition > static_cast<uint64_t>(LLONG_MAX))
+	if (origin == SEEK_SET || origin == SEEK_CUR)
 	{
-		fail(reent, result < 0 ? -result : EOVERFLOW);
+		if (file->position > static_cast<uint64_t>(LLONG_MAX))
+		{
+			fail(reent, EOVERFLOW);
+			return static_cast<off_t>(-1);
+		}
+		const int64_t base = origin == SEEK_SET ? 0 : static_cast<int64_t>(file->position);
+		if (position > 0 && base > LLONG_MAX - position)
+		{
+			fail(reent, EOVERFLOW);
+			return static_cast<off_t>(-1);
+		}
+		const int64_t target = base + position;
+		if (target < 0)
+		{
+			fail(reent, EINVAL);
+			return static_cast<off_t>(-1);
+		}
+		if (file->readAheadSize > 0)
+		{
+			const uint64_t cacheStart = file->position - file->readAheadOffset;
+			const uint64_t cacheEnd = cacheStart + file->readAheadSize;
+			if (static_cast<uint64_t>(target) >= cacheStart && static_cast<uint64_t>(target) <= cacheEnd)
+			{
+				file->readAheadOffset = static_cast<size_t>(static_cast<uint64_t>(target) - cacheStart);
+				file->position = static_cast<uint64_t>(target);
+				reent->_errno = 0;
+				return static_cast<off_t>(target);
+			}
+		}
+		const int result = smb2_lseek(file->mount->context, file->handle, target, SEEK_SET, &resultPosition);
+		if (result < 0)
+		{
+			fail(reent, -result);
+			return static_cast<off_t>(-1);
+		}
+	}
+	else
+	{
+		const int result = smb2_lseek(file->mount->context, file->handle, position, origin, &resultPosition);
+		if (result < 0)
+		{
+			fail(reent, -result);
+			return static_cast<off_t>(-1);
+		}
+	}
+	if (resultPosition > static_cast<uint64_t>(LLONG_MAX))
+	{
+		fail(reent, EOVERFLOW);
 		return static_cast<off_t>(-1);
 	}
+	file->readAheadOffset = 0;
+	file->readAheadSize = 0;
+	file->sequentialReads = 0;
+	file->position = resultPosition;
 	reent->_errno = 0;
 	return static_cast<off_t>(resultPosition);
 }
@@ -287,6 +628,7 @@ int smbFstat(_reent* reent, void* state, struct stat* output)
 	if (!file || !file->mount || !file->handle || !output)
 		return fail(reent, EBADF);
 	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
+	if(!ensureFileCurrent(file))return fail(reent,ENOTCONN);
 	struct smb2_stat_64 info{};
 	const int result = smb2_fstat(file->mount->context, file->handle, &info);
 	if (result < 0)
@@ -298,7 +640,7 @@ int smbFstat(_reent* reent, void* state, struct stat* output)
 
 int smbStat(_reent* reent, const char* source, struct stat* output)
 {
-	auto* mount = mountFrom(reent);
+	auto mount = mountFrom(reent);
 	if (!mount || !output)
 		return fail(reent, EINVAL);
 	if (isRootPath(source))
@@ -313,6 +655,13 @@ int smbStat(_reent* reent, const char* source, struct stat* output)
 	if (!fixPath(source, path, sizeof(path)))
 		return fail(reent, ENAMETOOLONG);
 	std::lock_guard<std::mutex> lock(mount->ioMutex);
+	if(mountRetired(mount.get())||!mount->context)return fail(reent,ENODEV);
+	const std::string full(path);const size_t slash=full.find_last_of('/');const std::string parent=slash==std::string::npos?std::string{}:full.substr(0,slash);const std::string name=slash==std::string::npos?full:full.substr(slash+1);
+	const auto cached=mount->directoryCache.find(parent);
+	if(cached!=mount->directoryCache.end()&&cached->second.expires>std::chrono::steady_clock::now()){
+		const auto found=std::find_if(cached->second.entries.begin(),cached->second.entries.end(),[&](const CachedDirectoryEntry& entry){return entry.name==name;});
+		if(found!=cached->second.entries.end()){*output=found->info;reent->_errno=0;return 0;}
+	}
 	struct smb2_stat_64 info{};
 	const int result = smb2_stat(mount->context, path, &info);
 	if (result < 0)
@@ -325,14 +674,16 @@ int smbStat(_reent* reent, const char* source, struct stat* output)
 template <typename Operation>
 int pathOperation(_reent* reent, const char* source, Operation operation)
 {
-	auto* mount = mountFrom(reent);
+	auto mount = mountFrom(reent);
 	if (!mount)
 		return fail(reent, ENODEV);
 	char path[PATH_MAX]{};
 	if (!fixPath(source, path, sizeof(path)))
 		return fail(reent, ENAMETOOLONG);
 	std::lock_guard<std::mutex> lock(mount->ioMutex);
-	const int result = operation(mount, path);
+	if(mountRetired(mount.get())||!mount->context)return fail(reent,ENODEV);
+	mount->directoryCache.clear();
+	const int result = operation(mount.get(), path);
 	if (result < 0)
 		return fail(reent, -result);
 	reent->_errno = 0;
@@ -362,7 +713,7 @@ int smbRmdir(_reent* reent, const char* path)
 
 int smbRename(_reent* reent, const char* source, const char* destination)
 {
-	auto* mount = mountFrom(reent);
+	auto mount = mountFrom(reent);
 	if (!mount)
 		return fail(reent, ENODEV);
 	char oldPath[PATH_MAX]{}, newPath[PATH_MAX]{};
@@ -370,6 +721,8 @@ int smbRename(_reent* reent, const char* source, const char* destination)
 	    !fixPath(destination, newPath, sizeof(newPath)))
 		return fail(reent, ENAMETOOLONG);
 	std::lock_guard<std::mutex> lock(mount->ioMutex);
+	if(mountRetired(mount.get())||!mount->context)return fail(reent,ENODEV);
+	mount->directoryCache.clear();
 	const int result = smb2_rename(mount->context, oldPath, newPath);
 	if (result < 0)
 		return fail(reent, -result);
@@ -379,14 +732,14 @@ int smbRename(_reent* reent, const char* source, const char* destination)
 
 DIR_ITER* smbDirOpen(_reent* reent, DIR_ITER* state, const char* source)
 {
-	auto* mount = mountFrom(reent);
+	auto mount = mountFrom(reent);
 	auto* directory = state ? static_cast<SmbDir*>(state->dirStruct) : nullptr;
 	if (!mount || !directory)
 	{
 		fail(reent, EINVAL);
 		return nullptr;
 	}
-	std::memset(directory, 0, sizeof(*directory));
+	*directory={};
 	char path[PATH_MAX]{};
 	if (!fixPath(source, path, sizeof(path)))
 	{
@@ -394,13 +747,43 @@ DIR_ITER* smbDirOpen(_reent* reent, DIR_ITER* state, const char* source)
 		return nullptr;
 	}
 	std::lock_guard<std::mutex> lock(mount->ioMutex);
+	if(mountRetired(mount.get())||!pinMount(directory,mount)){fail(reent,mountRetired(mount.get())?ENODEV:ENOMEM);return nullptr;}
+	std::snprintf(directory->path,sizeof(directory->path),"%s",path);
+	const auto cached=mount->directoryCache.find(path);
+	if(cached!=mount->directoryCache.end()&&cached->second.expires>std::chrono::steady_clock::now()){
+		directory->entries=new(std::nothrow)std::vector<CachedDirectoryEntry>(cached->second.entries);
+		if(!directory->entries){releaseMount(directory);fail(reent,ENOMEM);return nullptr;}
+		directory->fromCache=true;directory->complete=true;reent->_errno=0;return state;
+	}
 	directory->handle = smb2_opendir(mount->context, path);
 	if (!directory->handle)
 	{
 		fail(reent, EIO);
+		releaseMount(directory);return nullptr;
+	}
+	directory->contextGeneration=mount->contextGeneration;
+	directory->entries = new (std::nothrow) std::vector<CachedDirectoryEntry>();
+	if (!directory->entries)
+	{
+		smb2_closedir(mount->context, directory->handle);
+		releaseMount(directory);
+		fail(reent, ENOMEM);
 		return nullptr;
 	}
-	directory->mount = mount;
+	while (const struct smb2dirent* entry = smb2_readdir(mount->context, directory->handle))
+	{
+		CachedDirectoryEntry cached{};
+		cached.name=entry->name;
+		fillStat(&cached.info, entry->st);
+		directory->entries->push_back(cached);
+	}
+	directory->complete=true;
+	const auto now=std::chrono::steady_clock::now();
+	for(auto iterator=mount->directoryCache.begin();iterator!=mount->directoryCache.end();)
+		if(iterator->second.expires<=now)iterator=mount->directoryCache.erase(iterator);else ++iterator;
+	while(mount->directoryCache.size()>=kSmbDirectoryCacheLimit){auto oldest=std::min_element(mount->directoryCache.begin(),mount->directoryCache.end(),[](const auto &left,const auto &right){return left.second.expires<right.second.expires;});if(oldest==mount->directoryCache.end())break;mount->directoryCache.erase(oldest);}
+	mount->directoryCache.insert_or_assign(path,CachedDirectory{*directory->entries,now+std::chrono::seconds(3)});
+	directory->index = 0;
 	reent->_errno = 0;
 	return state;
 }
@@ -408,10 +791,9 @@ DIR_ITER* smbDirOpen(_reent* reent, DIR_ITER* state, const char* source)
 int smbDirReset(_reent* reent, DIR_ITER* state)
 {
 	auto* directory = state ? static_cast<SmbDir*>(state->dirStruct) : nullptr;
-	if (!directory || !directory->mount || !directory->handle)
+	if (!directory || !directory->mount || (!directory->handle&&!directory->fromCache) || !directory->entries)
 		return fail(reent, EBADF);
-	std::lock_guard<std::mutex> lock(directory->mount->ioMutex);
-	smb2_rewinddir(directory->mount->context, directory->handle);
+	directory->index = 0;
 	reent->_errno = 0;
 	return 0;
 }
@@ -419,14 +801,13 @@ int smbDirReset(_reent* reent, DIR_ITER* state)
 int smbDirNext(_reent* reent, DIR_ITER* state, char* name, struct stat* output)
 {
 	auto* directory = state ? static_cast<SmbDir*>(state->dirStruct) : nullptr;
-	if (!directory || !directory->mount || !directory->handle || !name || !output)
+	if (!directory || !directory->mount || (!directory->handle&&!directory->fromCache) || !directory->entries || !name || !output)
 		return fail(reent, EBADF);
-	std::lock_guard<std::mutex> lock(directory->mount->ioMutex);
-	const struct smb2dirent* entry = smb2_readdir(directory->mount->context, directory->handle);
-	if (!entry)
+	if (directory->index >= directory->entries->size())
 		return fail(reent, ENOENT);
-	std::snprintf(name, NAME_MAX, "%s", entry->name);
-	fillStat(output, entry->st);
+	const CachedDirectoryEntry& entry = (*directory->entries)[directory->index++];
+	std::snprintf(name, NAME_MAX, "%s", entry.name.c_str());
+	*output = entry.info;
 	reent->_errno = 0;
 	return 0;
 }
@@ -434,24 +815,27 @@ int smbDirNext(_reent* reent, DIR_ITER* state, char* name, struct stat* output)
 int smbDirClose(_reent* reent, DIR_ITER* state)
 {
 	auto* directory = state ? static_cast<SmbDir*>(state->dirStruct) : nullptr;
-	if (!directory || !directory->mount || !directory->handle)
+	auto mount=mountFrom(directory);
+	if (!mount || !directory->entries)
 		return fail(reent, EBADF);
-	std::lock_guard<std::mutex> lock(directory->mount->ioMutex);
-	smb2_closedir(directory->mount->context, directory->handle);
-	std::memset(directory, 0, sizeof(*directory));
+	std::lock_guard<std::mutex> lock(mount->ioMutex);
+	if(directory->handle&&directory->contextGeneration==mount->contextGeneration&&mount->context)smb2_closedir(mount->context,directory->handle);
+	delete directory->entries;
+	releaseMount(directory);
 	reent->_errno = 0;
 	return 0;
 }
 
 int smbStatvfs(_reent* reent, const char* source, struct statvfs* output)
 {
-	auto* mount = mountFrom(reent);
+	auto mount = mountFrom(reent);
 	if (!mount || !output)
 		return fail(reent, EINVAL);
 	char path[PATH_MAX]{};
 	if (!fixPath(source, path, sizeof(path)))
 		return fail(reent, ENAMETOOLONG);
 	std::lock_guard<std::mutex> lock(mount->ioMutex);
+	if(mountRetired(mount.get())||!mount->context)return fail(reent,ENODEV);
 	struct smb2_statvfs info{};
 	const int result = smb2_statvfs(mount->context, path, &info);
 	if (result < 0)
@@ -478,6 +862,11 @@ int smbTruncate(_reent* reent, void* state, off_t length)
 	if (!file || !file->mount || !file->handle)
 		return fail(reent, EBADF);
 	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
+	if(!ensureFileCurrent(file))return fail(reent,ENOTCONN);
+	file->mount->directoryCache.clear();
+	const int synchronized = SynchronizeFilePosition(file);
+	if (synchronized < 0)
+		return fail(reent, -synchronized);
 	const int result = smb2_ftruncate(file->mount->context, file->handle, length);
 	if (result < 0)
 		return fail(reent, -result);
@@ -491,6 +880,7 @@ int smbSync(_reent* reent, void* state)
 	if (!file || !file->mount || !file->handle)
 		return fail(reent, EBADF);
 	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
+	if(!ensureFileCurrent(file))return fail(reent,ENOTCONN);
 	const int result = smb2_fsync(file->mount->context, file->handle);
 	if (result < 0)
 		return fail(reent, -result);
@@ -551,23 +941,19 @@ std::string SmbBrowsePath(const SmbShare& share)
 
 bool InitializeUsb(std::string* error)
 {
-	std::lock_guard<std::mutex> lock(s_mountMutex);
-	if (s_usbInitialized)
-		return true;
-	usbHsFsSetFileSystemMountFlags(UsbHsFsMountFlags_None);
-	const Result result = usbHsFsInitialize(0);
-	if (R_FAILED(result))
 	{
-		if (error)
+		std::lock_guard<std::mutex> lock(s_mountMutex);
+		if (s_usbInitialized) return true;
+		usbHsFsSetFileSystemMountFlags(UsbHsFsMountFlags_None);
+		const Result result=usbHsFsInitialize(0);
+		if (R_FAILED(result))
 		{
-			char message[64];
-			std::snprintf(message, sizeof(message), "USB initialization failed (0x%08x)", result);
-			*error = message;
+			if (error) { char message[64]; std::snprintf(message,sizeof(message),"USB initialization failed (0x%08x)",result); *error=message; }
+			return false;
 		}
-		return false;
+		s_usbInitialized=true; usbHsFsSetPopulateCallback(usbStatusChanged,nullptr);
 	}
-	s_usbInitialized = true;
-	usbHsFsSetPopulateCallback(usbStatusChanged, nullptr);
+	std::array<UsbHsFsDevice,32> devices{}; const u32 count=usbHsFsListMountedDevices(devices.data(),devices.size()); usbStatusChanged(devices.data(),count,nullptr);
 	return true;
 }
 
@@ -576,96 +962,92 @@ uint64_t UsbStatusGeneration()
 	return s_usbGeneration.load(std::memory_order_acquire);
 }
 
-bool MountSmb(const SmbShare& share, std::string* error)
+void SetUsbStatusCallback(UsbStatusCallback callback, void* userData)
 {
-	std::lock_guard<std::mutex> lock(s_mountMutex);
+	std::lock_guard<std::mutex> lock(s_usbCallbackMutex);
+	s_usbCallback=callback;
+	s_usbCallbackData=callback?userData:nullptr;
+}
+
+UsbSnapshot GetUsbSnapshot()
+{
+	UsbSnapshot snapshot;
+	{
+		std::lock_guard<std::mutex> lock(s_mountMutex);
+		if(!s_usbInitialized) return snapshot;
+	}
+	std::lock_guard<std::mutex> lock(s_usbMutex);
+	snapshot.generation=s_usbGeneration.load(std::memory_order_acquire);
+	for(const auto& device:s_usbDevices)
+		if(device.name[0]) snapshot.locations.emplace_back(makeUsbLocation(device));
+	return snapshot;
+}
+
+std::string ResolveUsbPath(const std::string& id)
+{
+	for(const auto& location:GetUsbSnapshot().locations)
+		if(location.id==id) return location.path;
+	return {};
+}
+
+bool SafelyEjectUsb(const std::string& id, std::string* error)
+{
+	UsbHsFsDevice target{}; bool found=false; { std::lock_guard<std::mutex> lock(s_usbMutex); for(const auto& device:s_usbDevices) if(usbVolumeId(device)==id||usbPhysicalId(device)==id){ target=device; found=true; break; } }
+	if(!found){ if(error)*error="The USB drive is no longer connected"; return false; }
+	if(!usbHsFsUnmountDevice(&target,true)){ if(error)*error="Could not safely eject the USB drive; close files using it and try again"; return false; }
+	return true;
+}
+
+bool MountSmb(const SmbShare& share, std::string* error, const std::atomic_bool* cancel)
+{
 	if (!validId(share.id) || share.server.empty() || share.share.empty())
 	{
 		if (error)
 			*error = "SMB share settings are incomplete";
 		return false;
 	}
-	for (const auto& mount : s_smbMounts)
-	{
-		if (mount->config.id == share.id)
-			return true;
-	}
+	std::shared_ptr<SmbMount> existing;
+	{ std::lock_guard<std::mutex> lock(s_mountMutex); for(const auto& mount:s_smbMounts) if(mount->config.id==share.id){existing=mount;break;} }
+	if(existing){std::lock_guard<std::mutex> lock(existing->ioMutex);if(mountRetired(existing.get()))return false;if(existing->state.load()==SmbConnectionState::Connected&&existing->config.server==share.server&&existing->config.share==share.share&&existing->config.user==share.user&&existing->config.password==share.password&&existing->config.domain==share.domain)return true;existing->config=share;return reconnectMountUnlocked(existing.get(),cancel,error);}
+	if(cancel&&cancel->load(std::memory_order_relaxed)){ if(error)*error="Connection cancelled"; return false; }
 
-	auto mount = std::make_unique<SmbMount>();
+	auto mount = std::make_shared<SmbMount>();
 	mount->config = share;
-	mount->deviceName = deviceNameForId(share.id);
-	mount->rootPath = mount->deviceName + ":/";
-	mount->context = smb2_init_context();
-	if (!mount->context)
-	{
-		if (error)
-			*error = "Could not create the SMB client";
-		return false;
-	}
-	smb2_set_security_mode(mount->context, SMB2_NEGOTIATE_SIGNING_ENABLED);
-	smb2_set_timeout(mount->context, 6);
-	if (!share.user.empty())
-		smb2_set_user(mount->context, share.user.c_str());
-	if (!share.password.empty())
-		smb2_set_password(mount->context, share.password.c_str());
-	if (!share.domain.empty())
-		smb2_set_domain(mount->context, share.domain.c_str());
-	const int connected = smb2_connect_share(mount->context, share.server.c_str(),
-	                                         share.share.c_str(),
-	                                         share.user.empty() ? nullptr : share.user.c_str());
-	if (connected < 0)
-	{
-		if (error)
-		{
-			const char* detail = smb2_get_error(mount->context);
-			*error = detail && *detail ? detail : "Could not connect to the SMB share";
-		}
-		return false;
-	}
-	mount->connected = true;
-
-	mount->devoptab.name = mount->deviceName.c_str();
-	mount->devoptab.structSize = sizeof(SmbFile);
-	mount->devoptab.open_r = smbOpen;
-	mount->devoptab.close_r = smbClose;
-	mount->devoptab.write_r = smbWrite;
-	mount->devoptab.read_r = smbRead;
-	mount->devoptab.seek_r = smbSeek;
-	mount->devoptab.fstat_r = smbFstat;
-	mount->devoptab.stat_r = smbStat;
-	mount->devoptab.unlink_r = smbUnlink;
-	mount->devoptab.rename_r = smbRename;
-	mount->devoptab.mkdir_r = smbMkdir;
-	mount->devoptab.dirStateSize = sizeof(SmbDir);
-	mount->devoptab.diropen_r = smbDirOpen;
-	mount->devoptab.dirreset_r = smbDirReset;
-	mount->devoptab.dirnext_r = smbDirNext;
-	mount->devoptab.dirclose_r = smbDirClose;
-	mount->devoptab.statvfs_r = smbStatvfs;
-	mount->devoptab.ftruncate_r = smbTruncate;
-	mount->devoptab.fsync_r = smbSync;
-	mount->devoptab.deviceData = mount.get();
-	mount->devoptab.rmdir_r = smbRmdir;
-	mount->devoptab.lstat_r = smbStat;
-	if (AddDevice(&mount->devoptab) < 0)
+	// Network negotiation is cancellable and occurs without the registry lock.
+	if(!reconnectMountUnlocked(mount.get(),cancel,error))return false;
+	auto device=std::make_unique<SmbDevice>();device->deviceName=deviceNameForId(share.id);device->rootPath=device->deviceName+":/";device->mount=mount;mount->device=device.get();
+	device->devoptab.name=device->deviceName.c_str();device->devoptab.structSize=sizeof(SmbFile);
+	device->devoptab.open_r=smbOpen;device->devoptab.close_r=smbClose;device->devoptab.write_r=smbWrite;device->devoptab.read_r=smbRead;device->devoptab.seek_r=smbSeek;device->devoptab.fstat_r=smbFstat;device->devoptab.stat_r=smbStat;device->devoptab.unlink_r=smbUnlink;device->devoptab.rename_r=smbRename;device->devoptab.mkdir_r=smbMkdir;device->devoptab.dirStateSize=sizeof(SmbDir);device->devoptab.diropen_r=smbDirOpen;device->devoptab.dirreset_r=smbDirReset;device->devoptab.dirnext_r=smbDirNext;device->devoptab.dirclose_r=smbDirClose;device->devoptab.statvfs_r=smbStatvfs;device->devoptab.ftruncate_r=smbTruncate;device->devoptab.fsync_r=smbSync;device->devoptab.deviceData=device.get();device->devoptab.rmdir_r=smbRmdir;device->devoptab.lstat_r=smbStat;
+	std::lock_guard<std::mutex> lock(s_mountMutex);
+	for(const auto& raced:s_smbMounts) if(raced->config.id==share.id) return true;
+	if (AddDevice(&device->devoptab) < 0)
 	{
 		if (error)
 			*error = "No free filesystem slot is available for the SMB share";
 		return false;
 	}
-	s_smbMounts.emplace_back(std::move(mount));
+	s_smbMounts.emplace_back(std::move(mount));s_smbDevices.emplace_back(std::move(device));
 	return true;
 }
 
 bool UnmountSmb(const std::string& id)
 {
+	std::shared_ptr<SmbMount> removed;
+	{
 	std::lock_guard<std::mutex> lock(s_mountMutex);
 	const auto iterator = std::find_if(s_smbMounts.begin(), s_smbMounts.end(),
 	                                  [&](const auto& mount) { return mount->config.id == id; });
 	if (iterator == s_smbMounts.end())
 		return true;
-	RemoveDevice((*iterator)->rootPath.c_str());
+	auto mount=*iterator;auto* device=mount->device;
+	mount->retired.store(true,std::memory_order_release);mount->state.store(SmbConnectionState::Disconnected);
+	if(device){device->mount.reset();RemoveDevice(device->rootPath.c_str());}
+	removed=std::move(*iterator);
 	s_smbMounts.erase(iterator);
+	}
+	// Fence any callback which pinned the mount before retirement, then destroy
+	// its remote context outside the global registry mutex.
+	std::lock_guard<std::mutex> ioLock(removed->ioMutex);disconnectMountUnlocked(removed.get());
 	return true;
 }
 
@@ -676,35 +1058,20 @@ bool IsSmbMounted(const std::string& id)
 	                   [&](const auto& mount) { return mount->config.id == id; });
 }
 
+SmbConnectionState GetSmbConnectionState(const std::string& id)
+{
+	std::lock_guard<std::mutex> lock(s_mountMutex); for(const auto& mount:s_smbMounts) if(mount->config.id==id) return mount->state.load(); return SmbConnectionState::Disconnected;
+}
+
+bool ReconnectSmb(const std::string& id, std::string* error, const std::atomic_bool* cancel)
+{
+	std::shared_ptr<SmbMount> mount;{std::lock_guard<std::mutex> lock(s_mountMutex);const auto it=std::find_if(s_smbMounts.begin(),s_smbMounts.end(),[&](const auto& candidate){return candidate->config.id==id;});if(it==s_smbMounts.end()){if(error)*error="SMB share is not registered";return false;}mount=*it;}
+	std::lock_guard<std::mutex> lock(mount->ioMutex);return reconnectMountUnlocked(mount.get(),cancel,error);
+}
+
 std::vector<Location> ListUsbLocations()
 {
-	std::vector<Location> locations;
-	std::lock_guard<std::mutex> lock(s_mountMutex);
-	if (!s_usbInitialized)
-		return locations;
-	std::array<UsbHsFsDevice, 32> devices{};
-	const u32 count = usbHsFsListMountedDevices(devices.data(), devices.size());
-	locations.reserve(count);
-	for (u32 index = 0; index < count; ++index)
-	{
-		const auto& device = devices[index];
-		Location location;
-		location.path = device.name;
-		if (location.path.empty())
-			continue;
-		if (location.path.back() != '/')
-			location.path += '/';
-		const uint64_t gib = device.capacity / (1024ULL * 1024ULL * 1024ULL);
-		char label[256];
-		std::snprintf(label, sizeof(label), "%s - %s%s%s (%llu GiB)", device.name,
-		              LIBUSBHSFS_FS_TYPE_STR(device.fs_type),
-		              device.product_name[0] ? " - " : "",
-		              device.product_name,
-		              static_cast<unsigned long long>(gib));
-		location.label = label;
-		locations.emplace_back(std::move(location));
-	}
-	return locations;
+	return GetUsbSnapshot().locations;
 }
 
 std::vector<SmbShare> LoadSmbShares(const std::string& iniPath)
@@ -752,15 +1119,25 @@ void InitializeFromConfig(const std::string& iniPath, bool initializeUsb,
 
 void Shutdown()
 {
+	SetUsbStatusCallback(nullptr,nullptr);
+	std::vector<std::shared_ptr<SmbMount>> mounts;
+	bool shutdownUsb=false;
+	{
 	std::lock_guard<std::mutex> lock(s_mountMutex);
-	for (auto& mount : s_smbMounts)
-		RemoveDevice(mount->rootPath.c_str());
-	s_smbMounts.clear();
-	if (s_usbInitialized)
+	for (auto& mount : s_smbMounts){
+		if(mount->device){RemoveDevice(mount->device->rootPath.c_str());mount->device->mount.reset();}
+		mount->retired.store(true,std::memory_order_release);
+	}
+	mounts.swap(s_smbMounts);shutdownUsb=s_usbInitialized;s_usbInitialized=false;
+	}
+	for(const auto &mount:mounts){std::lock_guard<std::mutex> lock(mount->ioMutex);disconnectMountUnlocked(mount.get());}
+	// Device tombstones remain alive until process teardown so Newlib callbacks
+	// already dispatched for retired registrations cannot dereference freed data.
+	if (shutdownUsb)
 	{
 		usbHsFsSetPopulateCallback(nullptr, nullptr);
 		usbHsFsExit();
-		s_usbInitialized = false;
+		std::lock_guard<std::mutex> lock(s_usbMutex);s_usbDevices.clear();s_usbGeneration.fetch_add(1,std::memory_order_release);
 	}
 }
 } // namespace SwitchStorage

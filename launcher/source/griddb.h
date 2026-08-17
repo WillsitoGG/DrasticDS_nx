@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -29,7 +30,8 @@ int griddb_fetch_artworks(const std::string &apiKey, long gameId,
 int griddb_download_image(const std::string &url, const std::string &outPath);
 
 int griddb_fetch_cover(const std::string &apiKey, const std::string &title,
-                       const std::string &outPath);
+                       const std::string &outPath,
+                       const std::atomic<bool> *cancel=nullptr);
 
 int griddb_fetch_icons(const std::string &key, const std::string &title, const std::string &outDir, int maxCount);
 

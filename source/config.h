@@ -33,14 +33,6 @@
 #define ANDROID_MODEL "Switch"
 #define ANDROID_DEVICE_NAME "Nintendo Switch"
 
-#define DRASTIC_RENDERER_GL 0
-#define DRASTIC_RENDERER_VK 1
-#ifdef USE_VULKAN
-#define DRASTIC_RENDERER DRASTIC_RENDERER_VK
-#else
-#define DRASTIC_RENDERER DRASTIC_RENDERER_GL
-#endif
-
 extern int screen_width;
 extern int screen_height;
 extern int panel_width;

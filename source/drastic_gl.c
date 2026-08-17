@@ -1,5 +1,3 @@
-#ifndef USE_VULKAN
-
 #include <switch.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -12,6 +10,20 @@
 #include "drastic_custom_shader.h"
 #include "drastic_dfx.h"
 #include "drastic_dfx_gl_generated.h"
+
+#define drastic_renderer_init drastic_gl_renderer_init
+#define drastic_renderer_present drastic_gl_renderer_present
+#define drastic_renderer_suspend drastic_gl_renderer_suspend
+#define drastic_renderer_resume drastic_gl_renderer_resume
+#define drastic_renderer_shutdown drastic_gl_renderer_shutdown
+#define drastic_renderer_frame_count drastic_gl_renderer_frame_count
+#define drastic_renderer_lsfg_available drastic_gl_renderer_lsfg_available
+#define drastic_renderer_lsfg_enabled drastic_gl_renderer_lsfg_enabled
+#define drastic_renderer_lsfg_request_enabled \
+  drastic_gl_renderer_lsfg_request_enabled
+#define drastic_renderer_set_custom_shader \
+  drastic_gl_renderer_set_custom_shader
+#define drastic_renderer_last_error drastic_gl_renderer_last_error
 #include "drastic_renderer.h"
 #include "drastic_rotation.h"
 #include "drastic_smaa_area_rgb_bin.h"
@@ -974,5 +986,3 @@ bool drastic_renderer_lsfg_request_enabled(bool enabled) {
   (void)enabled;
   return false;
 }
-
-#endif

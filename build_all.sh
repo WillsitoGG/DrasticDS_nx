@@ -13,11 +13,16 @@ JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 APP="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$APP")"
 APK_DIR=${DRASTIC_APK_DIR:-"$ROOT/com.dsemu.drastic_r2.6.0.4a-109_minAPI14(arm64-v8a)(nodpi)_drasticds.com"}
-NVK_SDK=${NVK_SDK_DIR:-"$ROOT/nvk-switch-sdk"}
-BUILD_CACHE=${DRASTIC_BUILD_CACHE_DIR:-"$ROOT/.drasticds-nx-cache"}
+MESA_SDK=${MESA_SDK_DIR:-${NVK_SDK_DIR:-"$ROOT/mesa-switch-unified-sdk"}}
+# Accept either the installed Switch prefix itself or the root produced by
+# extracting mesa-*-switch-unified-horizon-sdk.zip.
+if [[ -d "$MESA_SDK/opt/devkitpro/portlibs/switch" ]]; then
+  MESA_SDK="$MESA_SDK/opt/devkitpro/portlibs/switch"
+fi
+BUILD_CACHE=${DRASTIC_BUILD_CACHE_DIR:-"$APP/.drasticds-nx-cache"}
 CORE="$APK_DIR/lib/arm64-v8a/libdrastic_arm64.so"
 ASSETS="$APK_DIR/assets"
-VULKAN_HEADERS="$NVK_SDK/include/vulkan"
+VULKAN_HEADERS="$MESA_SDK/include/vulkan"
 DFX_SOURCE="$ASSETS/shaders"
 BUNDLED_SHADER_SOURCE="$APP/third_party/drastic-ds-shaders"
 BUNDLED_CHEAT_SOURCE=${DRASTIC_USRCHEAT_DATABASE:-"$APP/third_party/nds-i-cheat-databases/usrcheat.dat"}
@@ -60,19 +65,29 @@ required=(
   "$VULKAN_HEADERS/vulkan.h"
   "$VULKAN_HEADERS/vulkan_core.h"
   "$VULKAN_HEADERS/vulkan_vi.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codecs_common.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codec_av1std.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codec_av1std_decode.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codec_av1std_encode.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codec_h264std.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codec_h264std_decode.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codec_h264std_encode.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codec_h265std.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codec_h265std_decode.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codec_h265std_encode.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codec_vp9std.h"
-  "$NVK_SDK/include/vk_video/vulkan_video_codec_vp9std_decode.h"
-  "$NVK_SDK/lib/libnvk.a"
+  "$MESA_SDK/include/vk_video/vulkan_video_codecs_common.h"
+  "$MESA_SDK/include/vk_video/vulkan_video_codec_av1std.h"
+  "$MESA_SDK/include/vk_video/vulkan_video_codec_av1std_decode.h"
+  "$MESA_SDK/include/vk_video/vulkan_video_codec_av1std_encode.h"
+  "$MESA_SDK/include/vk_video/vulkan_video_codec_h264std.h"
+  "$MESA_SDK/include/vk_video/vulkan_video_codec_h264std_decode.h"
+  "$MESA_SDK/include/vk_video/vulkan_video_codec_h264std_encode.h"
+  "$MESA_SDK/include/vk_video/vulkan_video_codec_h265std.h"
+  "$MESA_SDK/include/vk_video/vulkan_video_codec_h265std_decode.h"
+  "$MESA_SDK/include/vk_video/vulkan_video_codec_h265std_encode.h"
+  "$MESA_SDK/include/vk_video/vulkan_video_codec_vp9std.h"
+  "$MESA_SDK/include/vk_video/vulkan_video_codec_vp9std_decode.h"
+  "$MESA_SDK/lib/libEGL.a"
+  "$MESA_SDK/lib/libGL.a"
+  "$MESA_SDK/lib/libGLESv2.a"
+  "$MESA_SDK/lib/libglapi.a"
+  "$MESA_SDK/lib/libvulkan.a"
+  "$MESA_SDK/lib/libmesa_util.a"
+  "$MESA_SDK/lib/libmesa_util_c11.a"
+  "$MESA_SDK/lib/libmesa_util_simd.a"
+  "$MESA_SDK/lib/libblake3.a"
+  "$MESA_SDK/lib/libxmlconfig.a"
+  "$MESA_SDK/share/drirc.d/00-zink-defaults.conf"
 )
 for file in "${required[@]}"; do
   [[ -f "$file" ]] || {
@@ -96,6 +111,9 @@ PYTHON3=${PYTHON3:-$(command -v python3 || true)}
   echo "python3 is required to generate the Drastic filter programs." >&2
   exit 1
 }
+echo "==== DraStic launcher parity gates ===="
+"$PYTHON3" "$APP/tools/check_launcher_parity.py"
+"$PYTHON3" "$APP/tools/check_launcher_localization.py"
 GLSLANG=${GLSLANG_VALIDATOR:-$(command -v glslangValidator || true)}
 if [[ -z "$GLSLANG" && -x /ucrt64/bin/glslangValidator.exe ]]; then
   GLSLANG=/ucrt64/bin/glslangValidator.exe
@@ -111,11 +129,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-NVK_STAGE="$WORK/vulkan"
-HOST_STAGE="$WORK/hosts"
 ROMFS_STAGE="$WORK/romfs"
 DFX_STAGE="$WORK/dfx"
-mkdir -p "$NVK_STAGE/lib" "$HOST_STAGE" "$ROMFS_STAGE" "$DFX_STAGE"
+mkdir -p "$ROMFS_STAGE" "$DFX_STAGE"
 cp -f "$APP/launcher/romfs/logo.png" "$ROMFS_STAGE/logo.png"
 
 echo "==== clean previous outputs ===="
@@ -123,23 +139,7 @@ make -C "$APP" clean >/dev/null
 make -C "$APP/launcher" clean >/dev/null
 make -C "$APP/launcher/fwd" clean >/dev/null
 
-echo "==== stage supplied Mesa NVK driver ===="
-nvk_archives=(
-  libnvk.a libvulkan_lite_runtime.a libvulkan_runtime.a
-  libvulkan_lite_instance.a libvulkan_instance.a libvulkan_util.a
-  libvulkan_wsi.a libnak.a libnak_rs.a libvtn.a libxmlconfig.a
-  libnil.a liblibnil_format_table.a libnouveau_mme.a libnouveau_ws.a
-  libnvidia_headers_c.a libnir.a libcompiler.a libcompiler_c_helpers.a
-  libmesa_util.a libmesa_util_simd.a libblake3.a libmesa_util_c11.a
-)
-for archive in "${nvk_archives[@]}"; do
-  source_path="$NVK_SDK/lib/$archive"
-  [[ -f "$source_path" ]] || {
-    echo "Missing NVK archive: $archive" >&2
-    exit 1
-  }
-  cp -f "$source_path" "$NVK_STAGE/lib/$archive"
-done
+echo "==== use supplied unified Mesa SDK (NVK + NVC0 + Zink) ===="
 
 echo "==== Drastic Android post-FX programs ===="
 "$PYTHON3" "$APP/tools/build_dfx.py" \
@@ -193,23 +193,16 @@ storage_include_args=(
   LIBUSBHSFS_INCLUDE="$LIBUSBHSFS_INCLUDE_DIR"
 )
 
-echo "==== Drastic host: Vulkan (NVK) ===="
+echo "==== unified DraStic host: Vulkan + NVC0 + Zink ===="
 make -C "$APP" -j"$JOBS" "${storage_include_args[@]}" \
-  "${dfx_args[@]}" RENDERER=VK VULKAN_STAGE="$NVK_STAGE" \
-  VULKAN_INCLUDE="$NVK_SDK/include"
-cp -f "$APP/DrasticDS_nx.nro" "$HOST_STAGE/DrasticDS_nx_vk.nro"
-make -C "$APP" clean >/dev/null
-
-echo "==== Drastic host: OpenGL ===="
-make -C "$APP" -j"$JOBS" "${storage_include_args[@]}" "${dfx_args[@]}"
-cp -f "$APP/DrasticDS_nx.nro" "$HOST_STAGE/DrasticDS_nx_gl.nro"
-make -C "$APP" clean >/dev/null
+  "${dfx_args[@]}" MESA_SDK="$MESA_SDK" \
+  VULKAN_INCLUDE="$MESA_SDK/include"
 
 echo "==== assemble temporary ROMFS ===="
 mkdir -p "$ROMFS_STAGE/cores" "$ROMFS_STAGE/emu" "$ROMFS_STAGE/res"
 cp -f "$CORE" "$ROMFS_STAGE/cores/libdrastic_arm64.so"
-cp -f "$HOST_STAGE/DrasticDS_nx_vk.nro" "$ROMFS_STAGE/emu/DrasticDS_nx_vk.nro"
-cp -f "$HOST_STAGE/DrasticDS_nx_gl.nro" "$ROMFS_STAGE/emu/DrasticDS_nx_gl.nro"
+cp -f "$APP/DrasticDS_nx.nro" "$ROMFS_STAGE/emu/DrasticDS_nx.nro"
+make -C "$APP" clean >/dev/null
 "$PYTHON3" "$APP/tools/patch_game_database.py" \
   --input "$ASSETS/game_database.xml" \
   --output "$ROMFS_STAGE/res/game_database.xml"
@@ -245,5 +238,5 @@ echo
 echo "Done. Copy this one file to the SD card:"
 ls -la "$APP/DrasticDS.nro"
 echo
-echo "The launcher creates sdmc:/switch/drastic/, extracts both renderers on demand,"
-echo "and installs the bundled OpenGL/Vulkan custom shader packs."
+echo "The launcher creates sdmc:/switch/drastic/, extracts one unified host on demand,"
+echo "and selects Vulkan, native OpenGL or Zink at runtime."

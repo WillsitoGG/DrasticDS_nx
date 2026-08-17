@@ -10,8 +10,6 @@
 #ifndef DRASTIC_NX_LSFG_BRIDGE_H
 #define DRASTIC_NX_LSFG_BRIDGE_H
 
-#ifdef USE_VULKAN
-
 #include <stdbool.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
@@ -55,5 +53,4 @@ bool lsfg_nx_present(LsfgNxRuntime *runtime, VkQueue queue,
 }
 #endif
 
-#endif /* USE_VULKAN */
 #endif /* DRASTIC_NX_LSFG_BRIDGE_H */

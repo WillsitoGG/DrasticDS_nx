@@ -12,6 +12,19 @@ typedef void (*DrasticCoreRenderFrame)(void *env, void *clazz,
                                        int texture_top, int texture_bottom,
                                        unsigned char swap);
 
+typedef enum DrasticRendererBackend {
+  DRASTIC_RENDERER_BACKEND_GL,
+  DRASTIC_RENDERER_BACKEND_VULKAN,
+} DrasticRendererBackend;
+
+/* Selects the backend before the Android core is loaded.  Both native NVC0
+ * and Zink use the OpenGL renderer; Mesa's EGL driver is selected separately
+ * through the environment before the first eglInitialize call. */
+void drastic_renderer_select(const char *name);
+DrasticRendererBackend drastic_renderer_backend(void);
+bool drastic_renderer_is_vulkan(void);
+const char *drastic_renderer_backend_name(void);
+
 bool drastic_renderer_init(const DrasticRuntimeConfig *config);
 void drastic_renderer_present(const DrasticRuntimeConfig *config,
                               DrasticCoreRenderFrame core_render,

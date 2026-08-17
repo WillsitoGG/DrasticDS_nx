@@ -2,6 +2,7 @@
 
 #include <switch.h>
 #include <curl/curl.h>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
@@ -15,6 +16,10 @@
 static constexpr size_t MAX_BODY = 24u * 1024 * 1024;
 static bool g_networkReady = false;
 struct Buf { std::string data; };
+static thread_local const std::atomic<bool> *g_requestCancel=nullptr;
+static int request_progress(void*,curl_off_t,curl_off_t,curl_off_t,curl_off_t){
+  return g_requestCancel&&g_requestCancel->load(std::memory_order_relaxed)?1:0;
+}
 static size_t write_cb(void *p, size_t sz, size_t n, void *u) {
   Buf *b = (Buf *)u;
   if (n != 0 && sz > std::numeric_limits<size_t>::max() / n) return 0;
@@ -53,6 +58,8 @@ static bool http_get(const std::string &url, const std::string &bearer,
   curl_easy_setopt(c, CURLOPT_TIMEOUT, 25L);
   curl_easy_setopt(c, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)MAX_BODY);
   curl_easy_setopt(c, CURLOPT_USERAGENT, "DrasticDS-nx/0.1");
+  curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, request_progress);
   CURLcode rc = curl_easy_perform(c);
   long hc = 0;
   curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &hc);
@@ -323,13 +330,16 @@ int griddb_download_image(const std::string &url, const std::string &outPath) {
   return !url.empty() && http_download(url, outPath) ? GRIDDB_OK : GRIDDB_ERROR;
 }
 
-int griddb_fetch_cover(const std::string &key, const std::string &title, const std::string &outPath) {
+int griddb_fetch_cover(const std::string &key, const std::string &title,
+                       const std::string &outPath,const std::atomic<bool> *cancel) {
+  struct CancelScope{const std::atomic<bool>* previous;explicit CancelScope(const std::atomic<bool>* next):previous(g_requestCancel){g_requestCancel=next;}~CancelScope(){g_requestCancel=previous;}} scope(cancel);
+  if(cancel&&cancel->load(std::memory_order_relaxed))return GRIDDB_ERROR;
   std::vector<GridDbGameResult> games;
   int result = griddb_search_games(key, title, games);
-  if (result != GRIDDB_OK) return result;
+  if (result != GRIDDB_OK||(cancel&&cancel->load(std::memory_order_relaxed))) return result;
   std::vector<GridDbArtwork> artworks;
   result = griddb_fetch_artworks(key, games.front().id, artworks);
-  if (result != GRIDDB_OK) return result;
+  if (result != GRIDDB_OK||(cancel&&cancel->load(std::memory_order_relaxed))) return result;
   return griddb_download_image(artworks.front().url, outPath);
 }
 

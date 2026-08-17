@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -21,7 +22,7 @@
 #include <unistd.h>
 
 #ifndef DRASTIC_NX_VERSION
-#define DRASTIC_NX_VERSION "1.0.7"
+#define DRASTIC_NX_VERSION "1.0.9"
 #endif
 
 namespace
@@ -42,6 +43,24 @@ namespace
 	std::atomic_bool s_cancel{false};
 	std::atomic_uint64_t s_downloaded{0};
 	std::atomic_uint64_t s_total{0};
+	std::atomic<LauncherUpdateWakeCallback> s_wakeCallback{nullptr};
+	std::atomic<void*> s_wakeUserdata{nullptr};
+	std::atomic<std::int64_t> s_lastProgressWakeNs{0};
+
+	void WakeUi(bool throttle = false)
+	{
+		if (throttle)
+		{
+			const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count();
+			auto previous = s_lastProgressWakeNs.load(std::memory_order_relaxed);
+			if (now - previous < 100000000LL ||
+				!s_lastProgressWakeNs.compare_exchange_strong(previous, now, std::memory_order_relaxed))
+				return;
+		}
+		if (const auto callback = s_wakeCallback.load(std::memory_order_acquire))
+			callback(s_wakeUserdata.load(std::memory_order_acquire));
+	}
 
 	bool StartsWith(std::string_view value, std::string_view prefix)
 	{
@@ -454,6 +473,7 @@ namespace
 		sha256ContextUpdate(&download.hash, pointer, bytes);
 		download.written += bytes;
 		s_downloaded.store(download.written, std::memory_order_relaxed);
+		WakeUi(true);
 		return bytes;
 	}
 
@@ -463,6 +483,7 @@ namespace
 			s_total.store(static_cast<std::uint64_t>(total), std::memory_order_relaxed);
 		if (current >= 0)
 			s_downloaded.store(static_cast<std::uint64_t>(current), std::memory_order_relaxed);
+		WakeUi(true);
 		return s_cancel.load(std::memory_order_relaxed) ? 1 : 0;
 	}
 
@@ -683,31 +704,37 @@ bool LauncherUpdate_StartCheck(const std::string& installedTag)
 		s_release = {};
 		s_error.clear();
 	}
+	WakeUi();
 	s_worker = std::thread([installedTag] {
 		LauncherReleaseInfo release;
 		std::string error;
 		const bool success = FetchLatestRelease(release, error);
-		std::scoped_lock lock(s_mutex);
-		if (!success)
 		{
-			s_error = std::move(error);
-			s_state = s_cancel.load(std::memory_order_relaxed)
-				? LauncherUpdateState::Cancelled : LauncherUpdateState::Error;
-			return;
-		}
-		s_release = std::move(release);
-		if (LauncherUpdate_IsNewer(s_release.tag, installedTag))
-		{
-			if (s_release.assetUrl.empty())
+			std::scoped_lock lock(s_mutex);
+			if (!success)
 			{
-				s_error = "The latest release does not contain a downloadable NRO asset.";
-				s_state = LauncherUpdateState::Error;
+				s_error = std::move(error);
+				s_state = s_cancel.load(std::memory_order_relaxed)
+					? LauncherUpdateState::Cancelled : LauncherUpdateState::Error;
 			}
 			else
-				s_state = LauncherUpdateState::UpdateAvailable;
+			{
+				s_release = std::move(release);
+				if (LauncherUpdate_IsNewer(s_release.tag, installedTag))
+				{
+					if (s_release.assetUrl.empty())
+					{
+						s_error = "The latest release does not contain a downloadable NRO asset.";
+						s_state = LauncherUpdateState::Error;
+					}
+					else
+						s_state = LauncherUpdateState::UpdateAvailable;
+				}
+				else
+					s_state = LauncherUpdateState::UpToDate;
+			}
 		}
-		else
-			s_state = LauncherUpdateState::UpToDate;
+		WakeUi();
 	});
 	return true;
 }
@@ -730,18 +757,22 @@ bool LauncherUpdate_StartDownload(const std::string& launcherPath)
 		s_error.clear();
 		s_state = LauncherUpdateState::Downloading;
 	}
+	WakeUi();
 	s_worker = std::thread([release = std::move(release), launcherPath] {
 		std::string error;
 		const bool success = DownloadRelease(release, launcherPath, error);
-		std::scoped_lock lock(s_mutex);
-		if (success)
-			s_state = LauncherUpdateState::ReadyToInstall;
-		else
 		{
-			s_error = std::move(error);
-			s_state = s_cancel.load(std::memory_order_relaxed)
-				? LauncherUpdateState::Cancelled : LauncherUpdateState::Error;
+			std::scoped_lock lock(s_mutex);
+			if (success)
+				s_state = LauncherUpdateState::ReadyToInstall;
+			else
+			{
+				s_error = std::move(error);
+				s_state = s_cancel.load(std::memory_order_relaxed)
+					? LauncherUpdateState::Cancelled : LauncherUpdateState::Error;
+			}
 		}
+		WakeUi();
 	});
 	return true;
 }
@@ -754,6 +785,7 @@ bool LauncherUpdate_InstallDownloaded(const std::string& launcherPath)
 			return false;
 		s_state = LauncherUpdateState::Installing;
 	}
+	WakeUi();
 	JoinWorker();
 	std::string error;
 	const bool success = ReplaceLauncher(launcherPath, launcherPath + ".update.tmp", error);
@@ -767,6 +799,7 @@ bool LauncherUpdate_InstallDownloaded(const std::string& launcherPath)
 			s_state = LauncherUpdateState::Error;
 		}
 	}
+	WakeUi();
 	return success;
 }
 
@@ -787,6 +820,12 @@ LauncherUpdateSnapshot LauncherUpdate_GetSnapshot()
 	snapshot.downloaded = s_downloaded.load(std::memory_order_relaxed);
 	snapshot.total = s_total.load(std::memory_order_relaxed);
 	return snapshot;
+}
+
+void LauncherUpdate_SetWakeCallback(LauncherUpdateWakeCallback callback, void* userdata)
+{
+	s_wakeUserdata.store(userdata, std::memory_order_release);
+	s_wakeCallback.store(callback, std::memory_order_release);
 }
 
 void LauncherUpdate_Shutdown()
@@ -841,4 +880,3 @@ bool LauncherUpdate_RecoverInstallation(const std::string& launcherPath, std::st
 	}
 	return true;
 }
-

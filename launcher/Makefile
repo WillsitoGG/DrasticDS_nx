@@ -1,8 +1,8 @@
 #---------------------------------------------------------------------------------
 # Drastic DS launcher -- the complete SDL GUI adapted for Nintendo DS.
-# It writes drastic.ini and chainloads DrasticDS_nx_gl.nro / _vk.nro via
-# envSetNextLoad. Kept OUT of the emulator source tree so its SDL2/Mesa link
-# never executes the Drastic core. Based on the devkitPro SDL2 template.
+# It writes drastic.ini and chainloads one unified Vulkan/OpenGL host via
+# envSetNextLoad. The host selects NVK, native NVC0 or Zink at runtime. Kept OUT of the emulator
+# source tree so its SDL2/Mesa link never executes the Drastic core.
 #---------------------------------------------------------------------------------
 .SUFFIXES:
 
@@ -25,7 +25,7 @@ ROMFS_DIR	?=	$(CURDIR)/romfs	# build_all.sh overrides this with a temporary dire
 
 APP_TITLE	:=	Drastic DS
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.0.7
+APP_VERSION	:=	1.0.9
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE

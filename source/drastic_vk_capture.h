@@ -1,8 +1,6 @@
 #ifndef DRASTIC_NX_VK_CAPTURE_H
 #define DRASTIC_NX_VK_CAPTURE_H
 
-#ifdef USE_VULKAN
-
 #include <GLES2/gl2.h>
 #include <stdint.h>
 
@@ -18,7 +16,5 @@ void drastic_vk_capture_gl_tex_sub_image_2d(
     GLenum target, GLint level, GLint xoffset, GLint yoffset,
     GLsizei width, GLsizei height, GLenum format, GLenum type,
     const void *pixels);
-
-#endif
 
 #endif

@@ -1,4 +1,5 @@
 /build/
+/.drasticds-nx-cache/
 /launcher/build/
 /launcher/dependencies/build/
 /launcher/romfs/cores/

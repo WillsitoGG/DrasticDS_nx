@@ -11,8 +11,9 @@ patches it, and runs it inside a minimal Android-like
 environment natively.
 
 Everything ships as a **single `DrasticDS.nro`**: it bundles the build-supplied
-Drastic core, game database and cheat table, both renderer backends (OpenGL +
-Vulkan/NVK), 17 ready-to-use custom shaders, and an SDL cover-art launcher.
+Drastic core, game database and cheat table, one runtime-selectable Mesa host
+for Vulkan/NVK, native OpenGL/NVC0 and OpenGL-on-NVK through Zink, 56
+ready-to-use custom shaders, and an SDL cover-art launcher.
 Nintendo DS BIOS and firmware are never packed into the NRO.
 
 ### How to install
@@ -26,15 +27,14 @@ Nintendo DS BIOS and firmware are never packed into the NRO.
    `/switch/drastic/games/`, or add another SD, USB, or SMB library folder from
    **Settings > Library & storage**.
 
-The launcher creates the rest of the folder tree and extracts the selected
-renderer and bundled application resources on demand:
+The launcher creates the rest of the folder tree and extracts the unified host
+and bundled application resources on demand:
 
 ```text
 /switch/DrasticDS.nro
 /switch/drastic/
-  .emu/                   <- hidden renderer hosts, extracted when selected
-    DrasticDS_nx_gl.nro   <- OpenGL host
-    DrasticDS_nx_vk.nro   <- Vulkan/NVK host
+  .emu/                   <- hidden runtime host, extracted when first needed
+    DrasticDS_nx.nro      <- Vulkan/NVK + OpenGL/NVC0 + Zink
   cache/
   cheats/                 <- custom Action Replay files
   cores/                  <- Drastic ARM64 core, auto-extracted
@@ -139,24 +139,17 @@ swapchain takes precedence over Low-latency Vulkan. Also enable Game Mode on
 the connected TV or monitor when playing docked.
 
 Nearest, linear, Quilez, scanline, Scale2x, HQ2x, FXAA, FXAA HQ, and SMAA use
-Drastic's original Android post-FX programs on both renderers. OpenGL executes
-the generated GLES programs directly. Vulkan executes SPIR-V generated from
-the same `.dfx`/`.dsd`.
+Drastic's original Android post-FX programs on every backend. Native NVC0 and
+Zink execute the generated GLES programs directly. Vulkan executes SPIR-V
+generated from the same `.dfx`/`.dsd`.
 
 ### Custom shaders
 
-The original DraStic Android `.dfx` format is supported by both renderers,
+The original DraStic Android `.dfx` format is supported by every backend,
 including multi-pass chains, headers/includes, framebuffer targets, output
 scaling, named samplers, and raw lookup textures. Copy a shader's complete
 folder tree to `/switch/drastic/shaders/`, then choose **Custom shader** under
 **Settings > Graphics** or from the dedicated in-game custom-shader preview.
-
-The NRO already contains 17 presets from jdgleaver's `drastic_ds_shaders`
-collection: LCD1x, Sharp Bilinear, zFast LCD, NDS/DS Lite/DSi colour variants,
-Natural Vision, and their combinations. On first launch they are installed to
-`/switch/drastic/shaders/Bundled/`, including both the original OpenGL sources
-and ready-to-use Vulkan packs. A newer NRO refreshes only this managed folder;
-custom shaders stored elsewhere under `shaders/` are left untouched.
 
 OpenGL compiles `.dfx`/`.dsd` sources directly when selected. Vulkan has no
 runtime GLSL compiler, so each custom shader needs an adjacent SPIR-V pack.
@@ -179,22 +172,21 @@ Install the devkitPro Switch toolchain and portlibs:
 
 ```sh
 pacman -S devkitA64 switch-tools libnx switch-sdl2 switch-sdl2_ttf \
-          switch-sdl2_image switch-curl switch-mesa switch-libdrm_nouveau \
+          switch-sdl2_image switch-curl \
           switch-zlib switch-zstd cmake ninja git python \
           mingw-w64-ucrt-x86_64-glslang
 ```
 
-The default sibling layout expected by `build_all.sh` is:
-
 ```text
 DrasticDS/
   com.dsemu.drastic_r2.6.0.4a-109_minAPI14(arm64-v8a)(nodpi)_drasticds.com/
-  vulkandrv/builddir-switch/
+  mesa-switch-unified-sdk/
   DrasticDS_nx/
 ```
 
 ```sh
-bash ./build_all.sh
+JOBS=16 DRASTIC_APK_DIR=/path/to/extracted-apk \
+  MESA_SDK_DIR=/path/to/mesa-switch-unified-sdk bash ./build_all.sh
 ```
 
 ### Credits
@@ -226,8 +218,4 @@ condone piracy.
 
 Unless noted otherwise, the wrapper source is under the MIT License (see
 `LICENSE`). The vendored LSFG-VK subset under `third_party/lsfg-vk` is
-GPL-3.0-or-later. The shader sources under
-`third_party/drastic-ds-shaders` are GPL-2.0-or-later, with additional
-public-domain notices retained where applicable; their source and GPL text are
-packed beside the generated Vulkan programs. `Lossless.dll` remains
-proprietary and must be supplied by the user.
+GPL-3.0-or-later.

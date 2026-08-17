@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	Drastic DS
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.0.7
+APP_VERSION	:=	1.0.9
 BUILD		:=	build
 SOURCES		:=	source source/hooks source/switch
 DATA		:=	data
@@ -26,6 +26,7 @@ endif
 STORAGE_BUILD ?= $(TOPDIR)/launcher/dependencies/build
 LIBSMB2_INCLUDE ?= $(STORAGE_BUILD)/_deps/libsmb2-src/include
 LIBUSBHSFS_INCLUDE ?= $(STORAGE_BUILD)/_deps/libusbhsfs-src/include
+MESA_SDK ?= $(TOPDIR)/mesa-switch-sdk
 
 #---------------------------------------------------------------------------------
 # options for code generation
@@ -39,16 +40,13 @@ ifneq ($(strip $(DFX_GENERATED)),)
 DEFINES	+=	-DDRASTIC_DFX_GENERATED
 endif
 
-# --- renderer select: GL (default) or VK (Mesa NVK) ------------------------
-# GL and Vulkan are mutually exclusive (switch-mesa's libEGL/GLES and the NVK
-# archives both bundle mesa util/nir/compiler object code -> can't co-link).
-#   make             -> OpenGL (switch-mesa GLES, unchanged)
-#   make RENDERER=VK -> Vulkan (Mesa NVK, vendored flat under vulkan/)
-RENDERER ?= GL
-ifeq ($(RENDERER),VK)
-DEFINES	+=	-DUSE_VULKAN -DVK_USE_PLATFORM_VI_NN
-VULKAN_STAGE ?= $(TOPDIR)/vulkan
-VULKAN_INCLUDE ?= third_party/vulkan-headers/include
+# --- unified renderer host --------------------------------------------------
+# The Horizon Mesa SDK provides native NVC0 OpenGL, Zink-on-NVK and loaderless
+# Vulkan in one coherent static build.  All renderer implementations are linked
+# once and the host selects Vulkan or EGL at runtime from drastic.ini.
+DEFINES	+=	-DUSE_VULKAN -DUSE_OPENGL -DUSE_UNIFIED_RENDERER \
+			-DVK_USE_PLATFORM_VI_NN
+VULKAN_INCLUDE ?= $(MESA_SDK)/include
 SOURCES	+=	source/lsfg \
 			third_party/lsfg-vk/lsfg-vk-common/src/helpers \
 			third_party/lsfg-vk/lsfg-vk-common/src/vulkan \
@@ -61,18 +59,12 @@ INCLUDES	+=	source/lsfg \
 			third_party/lsfg-vk/lsfg-vk-common/include \
 			third_party/lsfg-vk/lsfg-vk-backend/include \
 			third_party/lsfg-vk/lsfg-vk-backend/src
-else
-DEFINES	+=	-DUSE_OPENGL
-endif
 
 CFLAGS	:=	-Wall -Wextra $(OPTIMIZATION) -DNDEBUG -ffunction-sections -fdata-sections \
 			-fno-ident -ffile-prefix-map=$(CURDIR)=. \
 			-fmacro-prefix-map=$(CURDIR)=. $(ARCH) $(DEFINES)
 CFLAGS	+=	$(INCLUDE)
-CXXFLAGS	:= $(CFLAGS) -Wno-missing-field-initializers
-ifeq ($(RENDERER),VK)
-CXXFLAGS	+= -std=gnu++20
-endif
+CXXFLAGS	:= $(CFLAGS) -Wno-missing-field-initializers -std=gnu++20
 
 ASFLAGS	:=	$(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) $(OPTIMIZATION) -Wl,-Map,$(notdir $*.map) \
@@ -81,30 +73,20 @@ LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) $(OPTIMIZATION) -Wl,-Ma
 STORAGE_LIBS := $(STORAGE_BUILD)/_deps/libsmb2-build/lib/libsmb2.a \
 				$(STORAGE_BUILD)/_deps/libusbhsfs-build/liblibusbhsfs.a
 
-# nx supplies audren, HID, applet, and filesystem services. Drastic's OpenSL ES
+# nx supplies audren, HID, applet, and filesystem services. DraStic's OpenSL ES
 # ABI is implemented directly by the audren-backed source/opensles.c layer.
-ifeq ($(RENDERER),VK)
-# Mesa NVK: 23 vendored static archives (vulkan/lib) linked in one --start-group
-# (circular NVK<->runtime<->nir<->compiler deps). -l:libX.a links by exact file
-# name (avoids the -lvulkan GROUP-script + the double-prefixed liblibnil...a).
-# -lz/-lzstd resolve crc32/ZSTD_*; the DRM/nouveau_ws path is dead-stripped so no
-# -ldrm_nouveau. -lstdc++/libgcc unwinder are needed by NAK's bundled Rust.
-LIBDIRS	:= $(VULKAN_STAGE) $(PORTLIBS) $(LIBNX)
-LIBS	:= -Wl,--start-group \
-		-l:libnvk.a -l:libvulkan_lite_runtime.a -l:libvulkan_runtime.a \
-		-l:libvulkan_lite_instance.a -l:libvulkan_instance.a \
-		-l:libvulkan_util.a -l:libvulkan_wsi.a \
-		-l:libnak.a -l:libnak_rs.a -l:libvtn.a -l:libxmlconfig.a \
-		-l:libnil.a -l:liblibnil_format_table.a -l:libnouveau_mme.a \
-		-l:libnouveau_ws.a -l:libnvidia_headers_c.a \
-		-l:libnir.a -l:libcompiler.a -l:libcompiler_c_helpers.a \
-		-l:libmesa_util.a -l:libmesa_util_simd.a -l:libblake3.a -l:libmesa_util_c11.a \
-		-Wl,--end-group $(STORAGE_LIBS) -lminizip -lz -lzstd -lnx -lstdc++ -lm
-else
-# EGL/GLESv2/glapi/drm_nouveau: switch-mesa/nouveau GL.
-LIBDIRS	:= $(PORTLIBS) $(LIBNX)
-LIBS	:= $(STORAGE_LIBS) -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lminizip -lz -lnx -lstdc++ -lm
-endif
+# Unified EGL embeds both NVC0 and Zink, while the Vulkan renderer calls the
+# same loaderless NVK archive directly. Keep the complete static dependency set
+# in one rescan group so both runtime paths resolve from a single executable.
+LIBDIRS	:= $(MESA_SDK) $(PORTLIBS) $(LIBNX)
+LIBS	:= -Wl,-u,vk_icdGetInstanceProcAddr \
+		-Wl,-u,vk_icdNegotiateLoaderICDInterfaceVersion -pthread \
+		-Wl,--start-group $(STORAGE_LIBS) -lminizip \
+		-l:libGLESv2.a -l:libEGL.a -l:libvulkan.a -l:libglapi.a \
+		-l:libmesa_util_c11.a -l:libblake3.a -l:libmesa_util.a \
+		-l:libmesa_util_simd.a -l:libxmlconfig.a \
+		-lelf -lexpat -lzstd -lz -lnx -lstdc++ -lm \
+		-Wl,--end-group
 
 #---------------------------------------------------------------------------------
 ifneq ($(BUILD),$(notdir $(CURDIR)))
@@ -180,6 +162,7 @@ clean:
 	@rm -fr $(BUILD) $(TARGET).nro $(TARGET).nacp $(TARGET).elf \
 		$(TARGET)_gl.nro $(TARGET)_gl.elf $(TARGET)_gl.map \
 		$(TARGET)_vk.nro $(TARGET)_vk.elf $(TARGET)_vk.map \
+		$(TARGET)_zink.nro $(TARGET)_zink.elf $(TARGET)_zink.map \
 		DrasticDS.nro vulkan
 	@rm -f *.o
 

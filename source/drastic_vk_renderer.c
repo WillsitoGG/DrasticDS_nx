@@ -1,5 +1,3 @@
-#ifdef USE_VULKAN
-
 #include <switch.h>
 #include <vulkan/vulkan.h>
 
@@ -29,6 +27,20 @@
 #include "dfx_smaa_weight_vert_bin.h"
 #include "drastic_dfx.h"
 #include "drastic_custom_shader.h"
+
+#define drastic_renderer_init drastic_vk_renderer_init
+#define drastic_renderer_present drastic_vk_renderer_present
+#define drastic_renderer_suspend drastic_vk_renderer_suspend
+#define drastic_renderer_resume drastic_vk_renderer_resume
+#define drastic_renderer_shutdown drastic_vk_renderer_shutdown
+#define drastic_renderer_frame_count drastic_vk_renderer_frame_count
+#define drastic_renderer_lsfg_available drastic_vk_renderer_lsfg_available
+#define drastic_renderer_lsfg_enabled drastic_vk_renderer_lsfg_enabled
+#define drastic_renderer_lsfg_request_enabled \
+  drastic_vk_renderer_lsfg_request_enabled
+#define drastic_renderer_set_custom_shader \
+  drastic_vk_renderer_set_custom_shader
+#define drastic_renderer_last_error drastic_vk_renderer_last_error
 #include "drastic_renderer.h"
 #include "drastic_rotation.h"
 #include "drastic_vk_capture.h"
@@ -2641,5 +2653,3 @@ bool drastic_renderer_lsfg_request_enabled(bool enabled) {
                    __ATOMIC_RELEASE);
   return true;
 }
-
-#endif

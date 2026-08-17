@@ -74,7 +74,7 @@ static void parse_file(const char *path) {
 static void seed_defaults(void) {
   seed("Wrapper/CoreSo", DATA_ROOT "/cores/" SO_NAME);
   seed("Drastic/RomPath", pending_rom[0] ? pending_rom : DEFAULT_ROM_PATH);
-  seed("Wrapper/Renderer", DRASTIC_RENDERER == DRASTIC_RENDERER_VK ? "vk" : "gl");
+  seed("Wrapper/Renderer", "vk");
   seed("Wrapper/Layout", "horizontal");
   seed("Wrapper/SwapScreens", "false");
   seed("Wrapper/Rotation", "0");

@@ -51,7 +51,10 @@ extern "C" ssize_t readv(int fd, const struct iovec* vectors, int count)
 	return total;
 }
 
-#ifndef USE_VULKAN
+// The unified Mesa archive supplies the Rust toolchain's writev bridge for
+// both core renderer hosts. The SDL launcher does not link Mesa, so keep the
+// local implementation only there.
+#if !defined(USE_VULKAN) && !defined(USE_OPENGL)
 extern "C" ssize_t writev(int fd, const struct iovec* vectors, int count)
 {
 	if (!validateVectors(vectors, count))

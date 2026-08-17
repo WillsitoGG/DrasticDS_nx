@@ -57,9 +57,7 @@ static int configure_core_jit(so_module *mod) {
   return drastic_jit_install(mod);
 }
 
-#ifdef USE_VULKAN
 u32 __nx_nv_transfermem_size = 16 * 1024 * 1024;
-#endif
 
 void __libnx_initheap(void) {
   void *address;
@@ -859,6 +857,20 @@ int main(void) {
   bool cpu_boost_active = true;
   setup_directories();
   prefs_init(PREFS_PATH);
+  const char *configured_renderer =
+      prefs_get_string("Wrapper/Renderer", "vk");
+  drastic_renderer_select(configured_renderer);
+  /* The unified Horizon Mesa EGL archive contains both native NVC0 and Zink.
+   * Select the configured backend before the process creates its first EGL
+   * display; an EGLDisplay keeps that backend for its entire lifetime. */
+  if (!drastic_renderer_is_vulkan()) {
+    const bool use_zink = !strcmp(configured_renderer, "zink");
+    setenv("MESA_SWITCH_GL_DRIVER", use_zink ? "zink" : "nvc0", 1);
+    setenv("MESA_LOADER_DRIVER_OVERRIDE", use_zink ? "zink" : "nouveau", 1);
+  } else {
+    unsetenv("MESA_SWITCH_GL_DRIVER");
+    unsetenv("MESA_LOADER_DRIVER_OVERRIDE");
+  }
   /* Drastic builds mirrored ARM7/ARM9 address-space views from Android ashmem.
    * The Switch shim provides those aliases and the lazy 4 GiB fastmem window. */
   fastmem_set_mode(FASTMEM_MODE_ON);
@@ -926,12 +938,10 @@ int main(void) {
     const char *renderer_error = drastic_renderer_last_error();
     if (renderer_error && renderer_error[0])
       fatal_error("Could not initialize the %s renderer:\n%s",
-                  DRASTIC_RENDERER == DRASTIC_RENDERER_VK
-                      ? "Vulkan" : "OpenGL",
+                  drastic_renderer_backend_name(),
                   renderer_error);
     fatal_error("Could not initialize the %s renderer.",
-                DRASTIC_RENDERER == DRASTIC_RENDERER_VK
-                    ? "Vulkan" : "OpenGL");
+                drastic_renderer_backend_name());
   }
   fatal_error_set_graphics_active(1);
   overlay_init(runtime.rotation);

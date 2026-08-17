@@ -2,8 +2,6 @@
 
 #include "lsfg_bridge.h"
 
-#ifdef USE_VULKAN
-
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
@@ -356,5 +354,3 @@ extern "C" bool lsfg_nx_present(LsfgNxRuntime *runtime, VkQueue queue,
     *result = VK_ERROR_INITIALIZATION_FAILED;
     return true;
 }
-
-#endif /* USE_VULKAN */

@@ -38,6 +38,8 @@ struct LauncherUpdateSnapshot
 	std::uint64_t total{};
 };
 
+using LauncherUpdateWakeCallback = void (*)(void* userdata);
+
 const char* LauncherUpdate_BuiltReleaseTag();
 bool LauncherUpdate_IsNewer(const std::string& candidate, const std::string& installed);
 
@@ -46,6 +48,7 @@ bool LauncherUpdate_StartDownload(const std::string& launcherPath);
 bool LauncherUpdate_InstallDownloaded(const std::string& launcherPath);
 void LauncherUpdate_Cancel();
 LauncherUpdateSnapshot LauncherUpdate_GetSnapshot();
+void LauncherUpdate_SetWakeCallback(LauncherUpdateWakeCallback callback, void* userdata);
 void LauncherUpdate_Shutdown();
 
 bool LauncherUpdate_RecoverInstallation(const std::string& launcherPath, std::string& error);

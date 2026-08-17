@@ -44,6 +44,7 @@
 #include "hooks.h"
 #include "dl_emu.h"
 #include "opensles.h"
+#include "drastic_renderer.h"
 #include "drastic_vk_capture.h"
 
 // crt/newlib-provided symbols forwarded by address
@@ -255,17 +256,9 @@ static int c_isxdigit(int c) { return isxdigit(c); }
 static int c_tolower(int c) { return tolower(c); }
 static int c_toupper(int c) { return toupper(c); }
 
-#ifdef USE_VULKAN
-#define DRASTIC_GL_IMPORT(name) ((uintptr_t)&ret0)
-#define DRASTIC_GL_BIND_TEXTURE_IMPORT \
-  ((uintptr_t)&drastic_vk_capture_gl_bind_texture)
-#define DRASTIC_GL_TEX_SUB_IMAGE_IMPORT \
-  ((uintptr_t)&drastic_vk_capture_gl_tex_sub_image_2d)
-#else
 #define DRASTIC_GL_IMPORT(name) ((uintptr_t)&name)
 #define DRASTIC_GL_BIND_TEXTURE_IMPORT ((uintptr_t)&glBindTexture)
 #define DRASTIC_GL_TEX_SUB_IMAGE_IMPORT ((uintptr_t)&glTexSubImage2D)
-#endif
 
 // ---------------------------------------------------------------------------
 // import table
@@ -706,6 +699,88 @@ size_t dynlib_numfunctions = sizeof(dynlib_functions) / sizeof(*dynlib_functions
 #define _CTYPE_X 0x40  // hex digit
 #define _CTYPE_B 0x80  // printable space (blank)
 
+static EGLBoolean vk_egl_initialize(EGLDisplay display, EGLint *major,
+                                    EGLint *minor) {
+  (void)display;
+  if (major) *major = 0;
+  if (minor) *minor = 0;
+  return EGL_FALSE;
+}
+
+static EGLBoolean vk_egl_choose_config(EGLDisplay display,
+                                       const EGLint *attributes,
+                                       EGLConfig *configs, EGLint config_size,
+                                       EGLint *count) {
+  (void)display;
+  (void)attributes;
+  (void)configs;
+  (void)config_size;
+  if (count) *count = 0;
+  return EGL_FALSE;
+}
+
+static EGLBoolean vk_egl_get_config_attrib(EGLDisplay display,
+                                           EGLConfig config,
+                                           EGLint attribute, EGLint *value) {
+  (void)display;
+  (void)config;
+  (void)attribute;
+  if (value) *value = 0;
+  return EGL_FALSE;
+}
+
+static EGLBoolean vk_egl_query_surface(EGLDisplay display, EGLSurface surface,
+                                       EGLint attribute, EGLint *value) {
+  (void)display;
+  (void)surface;
+  (void)attribute;
+  if (value) *value = 0;
+  return EGL_FALSE;
+}
+
+static const char *vk_egl_query_string(EGLDisplay display, EGLint name) {
+  (void)display;
+  (void)name;
+  return "";
+}
+
+static EGLint vk_egl_get_error(void) { return EGL_SUCCESS; }
+
+static void set_import_address(const char *name, uintptr_t address) {
+  for (size_t index = 0; index < dynlib_numfunctions; index++) {
+    if (!strcmp(dynlib_functions[index].symbol, name)) {
+      dynlib_functions[index].func = address;
+      return;
+    }
+  }
+}
+
+static void select_vulkan_graphics_imports(void) {
+  /* The Vulkan presenter receives the completed DS screens through the two
+   * texture upload hooks.  Every other Android GLES/EGL entry point remains a
+   * benign stub, matching the former dedicated Vulkan host without exporting
+   * duplicate Mesa symbols from a second executable. */
+  for (size_t index = 0; index < dynlib_numfunctions; index++) {
+    const char *name = dynlib_functions[index].symbol;
+    if ((name[0] == 'g' && name[1] == 'l' &&
+         name[2] >= 'A' && name[2] <= 'Z') ||
+        !strncmp(name, "egl", 3))
+      dynlib_functions[index].func = (uintptr_t)&ret0;
+  }
+
+  set_import_address("glBindTexture",
+                     (uintptr_t)&drastic_vk_capture_gl_bind_texture);
+  set_import_address("glTexSubImage2D",
+                     (uintptr_t)&drastic_vk_capture_gl_tex_sub_image_2d);
+  set_import_address("eglInitialize", (uintptr_t)&vk_egl_initialize);
+  set_import_address("eglChooseConfig", (uintptr_t)&vk_egl_choose_config);
+  set_import_address("eglGetConfigAttrib",
+                     (uintptr_t)&vk_egl_get_config_attrib);
+  set_import_address("eglQuerySurface", (uintptr_t)&vk_egl_query_surface);
+  set_import_address("eglQueryString", (uintptr_t)&vk_egl_query_string);
+  set_import_address("eglGetError", (uintptr_t)&vk_egl_get_error);
+}
+
 void update_imports(void) {
   // fill the legacy _ctype_ table from the C locale: index [c+1] for char c,
   // [0] left as the EOF guard (0).
@@ -722,4 +797,5 @@ void update_imports(void) {
     g_ctype_table[c + 1] = m;
   }
   g_ctype_table[0] = 0;
+  if (drastic_renderer_is_vulkan()) select_vulkan_graphics_imports();
 }

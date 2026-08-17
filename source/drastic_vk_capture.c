@@ -1,5 +1,3 @@
-#ifdef USE_VULKAN
-
 #include "drastic_vk_capture.h"
 
 #include <stddef.h>
@@ -87,5 +85,3 @@ void drastic_vk_capture_gl_tex_sub_image_2d(
     }
   }
 }
-
-#endif
