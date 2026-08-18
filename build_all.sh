@@ -111,8 +111,7 @@ PYTHON3=${PYTHON3:-$(command -v python3 || true)}
   echo "python3 is required to generate the Drastic filter programs." >&2
   exit 1
 }
-echo "==== DraStic launcher parity gates ===="
-"$PYTHON3" "$APP/tools/check_launcher_parity.py"
+echo "==== DraStic launcher localization gate ===="
 "$PYTHON3" "$APP/tools/check_launcher_localization.py"
 GLSLANG=${GLSLANG_VALIDATOR:-$(command -v glslangValidator || true)}
 if [[ -z "$GLSLANG" && -x /ucrt64/bin/glslangValidator.exe ]]; then

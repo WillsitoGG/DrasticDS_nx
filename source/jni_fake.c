@@ -367,7 +367,7 @@ static int drastic_real_path(const char *virtual_path, char *output,
     snprintf(output, output_size, "%s", virtual_path);
   else {
     /* USB and SMB mounts use libnx fsdev paths such as ums0:/ and
-     * drastic_smb_x:/; preserve those device-qualified ROM paths. */
+     * nxsmb_x:/; preserve those device-qualified ROM paths. */
     const char *colon = strchr(virtual_path, ':');
     if (!colon || colon == virtual_path || colon[1] != '/') return 0;
     for (const char *cursor = virtual_path; cursor < colon; cursor++)

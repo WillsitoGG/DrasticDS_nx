@@ -241,7 +241,7 @@ bool validId(const std::string& id)
 
 std::string deviceNameForId(const std::string& id)
 {
-	return validId(id) ? "cemusmb_" + id : std::string{};
+	return validId(id) ? "nxsmb_" + id : std::string{};
 }
 
 bool fixPath(const char* source, char* destination, size_t destinationSize)

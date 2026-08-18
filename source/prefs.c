@@ -71,9 +71,13 @@ static void parse_file(const char *path) {
   fclose(file);
 }
 
-static void seed_defaults(void) {
+static void seed_critical_defaults(void) {
   seed("Wrapper/CoreSo", DATA_ROOT "/cores/" SO_NAME);
   seed("Drastic/RomPath", pending_rom[0] ? pending_rom : DEFAULT_ROM_PATH);
+}
+
+static void seed_defaults(void) {
+  seed_critical_defaults();
   seed("Wrapper/Renderer", "vk");
   seed("Wrapper/Layout", "horizontal");
   seed("Wrapper/SwapScreens", "false");
@@ -229,6 +233,7 @@ void prefs_init(const char *path) {
   memset(entries, 0, sizeof(entries));
   entry_count = 0;
   snprintf(ini_path, sizeof(ini_path), "%s", path ? path : PREFS_PATH);
+  seed_critical_defaults();
   parse_file(ini_path);
   prefs_remove("Wrapper/CpuBoost");
   prefs_remove("Wrapper/LSFGDllPath");

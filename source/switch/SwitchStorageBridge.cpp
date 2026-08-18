@@ -80,7 +80,18 @@ extern "C" bool switchStorageInitializeForPath(const char* iniPath, char* gamePa
 		return fail("The game path buffer is invalid");
 
 	const bool usbPath = std::strncmp(gamePath, "ums", 3) == 0;
-	const bool smbPath = std::strncmp(gamePath, "nxsmb_", 6) == 0;
+	const auto smbShares = SwitchStorage::LoadSmbShares(iniPath ? iniPath : "");
+	const SwitchStorage::SmbShare* smbShare = nullptr;
+	for (const auto& share : smbShares)
+	{
+		const std::string root = SwitchStorage::SmbRootPath(share.id);
+		if (!root.empty() && std::strncmp(gamePath, root.c_str(), root.size()) == 0)
+		{
+			smbShare = &share;
+			break;
+		}
+	}
+	const bool smbPath = smbShare != nullptr;
 	if (!usbPath && !smbPath)
 		return true;
 
@@ -98,16 +109,7 @@ extern "C" bool switchStorageInitializeForPath(const char* iniPath, char* gamePa
 		s_socketInitialized = R_SUCCEEDED(socketInitializeDefault());
 		if (!s_socketInitialized)
 			return fail("Network initialization failed");
-		bool mounted = false;
-		for (const auto& share : SwitchStorage::LoadSmbShares(iniPath ? iniPath : ""))
-		{
-			const std::string root = SwitchStorage::SmbRootPath(share.id);
-			if (root.empty() || std::strncmp(gamePath, root.c_str(), root.size()) != 0)
-				continue;
-			mounted = SwitchStorage::MountSmb(share, &error);
-			break;
-		}
-		if (!mounted)
+		if (!SwitchStorage::MountSmb(*smbShare, &error))
 		{
 			SwitchStorage::Shutdown();
 			socketExit();

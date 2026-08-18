@@ -61,6 +61,7 @@ static const char *LSFG_DIR   = "sdmc:/switch/drastic/lsfg";
 static const char *EMU_HOST_DIR = "sdmc:/switch/drastic/.emu";
 static const char *LSFG_DLL_FILE =
     "sdmc:/switch/drastic/lsfg/Lossless.dll";
+static const char *CORE_SO_PATH = "/switch/drastic/cores/libdrastic_arm64.so";
 struct KV { std::string k, v; };
 struct Store {
   std::vector<KV> kv;
@@ -2100,6 +2101,38 @@ static bool hasGameExtension(const char *n) {
 static std::string toEmu(const std::string &path) {
   return path.rfind("sdmc:", 0) == 0 ? path.substr(5) : path;
 }
+static bool launcherOnlyWrapperKey(const std::string &key) {
+  if(key.rfind("Wrapper/GamePath",0)==0) return true;
+  static const char *keys[]={
+    "Wrapper/GameDir","Wrapper/SteamGridDBKey","Wrapper/UiSounds",
+    "Wrapper/Theme","Wrapper/Language","Wrapper/LauncherRotation",
+    "Wrapper/GridColumns","Wrapper/GridRows","Wrapper/ShowGameTitles",
+    "Wrapper/ShowRegionFlags","Wrapper/ShowCustomSettingsBadges",
+    "Wrapper/UiAnimations","Wrapper/CheckUpdatesAtBoot",
+    "Wrapper/InstalledReleaseTag","Wrapper/SortMode","Wrapper/PlaySeq"
+  };
+  return std::any_of(std::begin(keys),std::end(keys),[&](const char *candidate){return key==candidate;});
+}
+static bool runtimeOwnedKey(const std::string &key) {
+  return key=="Wrapper/CoreSo"||key=="Wrapper/LauncherPath"||
+         key=="Wrapper/GameKey"||key=="Wrapper/GameConfigPath"||
+         key=="Wrapper/CpuBoost"||key=="Drastic/RomPath";
+}
+static bool runtimeConfigKey(const std::string &key) {
+  if(key.rfind("Drastic/",0)==0) return true;
+  if(key.rfind("Storage/Smb",0)==0) return true;
+  return key.rfind("Wrapper/",0)==0&&!launcherOnlyWrapperKey(key);
+}
+static Store makeRuntimeConfig(const Store &global,const std::string &romPath) {
+  Store runtime;
+  // Required launch paths stay first even if a future runtime file grows.
+  storeSet(runtime,"Wrapper/CoreSo",CORE_SO_PATH);
+  storeSet(runtime,"Drastic/RomPath",romPath.c_str());
+  for(const auto &entry:global.kv)
+    if(runtimeConfigKey(entry.k)&&!runtimeOwnedKey(entry.k))
+      storeSet(runtime,entry.k.c_str(),entry.v.c_str());
+  return runtime;
+}
 static std::string join(const std::string &b, const std::string &n) { std::string r=b; if(!r.empty()&&r.back()=='/') r.pop_back(); return r+"/"+n; }
 static std::string foldedKey(std::string key);
 static bool pathAtOrBelow(const std::string &path,const std::string &root);
@@ -2453,25 +2486,30 @@ static void rememberPreviousPath(LibraryIdentityRecord &record,const std::string
   record.previousPaths.push_back(normalized);if(record.previousPaths.size()>MAX_PREVIOUS_LIBRARY_PATHS)record.previousPaths.erase(record.previousPaths.begin(),record.previousPaths.end()-MAX_PREVIOUS_LIBRARY_PATHS);
 }
 
-static void loadLibraryIdentities(){
+static bool loadLibraryIdentities(){
   g_libraryIdentities.clear();std::unordered_set<std::string> ids;
-  const int count=std::clamp(atoi(storeGet(g_global,"Library/IdentityCount","0")),0,16384);
+  const bool migrateFromGlobal=!storeHas(g_metadata,"Library/IdentityCount")&&
+                               storeHas(g_global,"Library/IdentityCount");
+  Store &identityStore=migrateFromGlobal?g_global:g_metadata;
+  const int count=std::clamp(atoi(storeGet(identityStore,"Library/IdentityCount","0")),0,16384);
   for(int index=0;index<count;index++){
     const std::string prefix="Library/Identity"+std::to_string(index);LibraryIdentityRecord record;
-    record.id=storeGet(g_global,(prefix+"Id").c_str(),"");record.fingerprint=storeGet(g_global,(prefix+"Fingerprint").c_str(),"");record.baseIdentity=storeGet(g_global,(prefix+"BaseIdentity").c_str(),"");record.canonicalPath=storeGet(g_global,(prefix+"Path").c_str(),"");record.currentPath=storeGet(g_global,(prefix+"CurrentPath").c_str(),"");record.retired=!strcmp(storeGet(g_global,(prefix+"Retired").c_str(),"false"),"true");
-    const int previous=std::clamp(atoi(storeGet(g_global,(prefix+"PreviousPathCount").c_str(),"0")),0,(int)MAX_PREVIOUS_LIBRARY_PATHS);
-    for(int item=0;item<previous;item++){std::string path=normalizeLocationPath(storeGet(g_global,(prefix+"PreviousPath"+std::to_string(item)).c_str(),""));if(!path.empty())record.previousPaths.push_back(std::move(path));}
+    record.id=storeGet(identityStore,(prefix+"Id").c_str(),"");record.fingerprint=storeGet(identityStore,(prefix+"Fingerprint").c_str(),"");record.baseIdentity=storeGet(identityStore,(prefix+"BaseIdentity").c_str(),"");record.canonicalPath=storeGet(identityStore,(prefix+"Path").c_str(),"");record.currentPath=storeGet(identityStore,(prefix+"CurrentPath").c_str(),"");record.retired=!strcmp(storeGet(identityStore,(prefix+"Retired").c_str(),"false"),"true");
+    const int previous=std::clamp(atoi(storeGet(identityStore,(prefix+"PreviousPathCount").c_str(),"0")),0,(int)MAX_PREVIOUS_LIBRARY_PATHS);
+    for(int item=0;item<previous;item++){std::string path=normalizeLocationPath(storeGet(identityStore,(prefix+"PreviousPath"+std::to_string(item)).c_str(),""));if(!path.empty())record.previousPaths.push_back(std::move(path));}
     const bool valid=!record.id.empty()&&record.id.size()<=96&&std::all_of(record.id.begin(),record.id.end(),[](unsigned char c){return std::isalnum(c)||c=='-'||c=='_';});
     if(valid&&!record.fingerprint.empty()&&ids.insert(record.id).second)g_libraryIdentities.push_back(std::move(record));
   }
+  return migrateFromGlobal;
 }
 
 static void saveLibraryIdentities(){
-  storeRemovePrefix(g_global,"Library/Identity");storeSet(g_global,"Library/IdentityCount",std::to_string(g_libraryIdentities.size()).c_str());
+  storeRemovePrefix(g_global,"Library/Identity");
+  storeRemovePrefix(g_metadata,"Library/Identity");storeSet(g_metadata,"Library/IdentityCount",std::to_string(g_libraryIdentities.size()).c_str());
   for(size_t index=0;index<g_libraryIdentities.size();index++){
     const auto &record=g_libraryIdentities[index];const std::string prefix="Library/Identity"+std::to_string(index);
-    storeSet(g_global,(prefix+"Id").c_str(),record.id.c_str());storeSet(g_global,(prefix+"Fingerprint").c_str(),record.fingerprint.c_str());storeSet(g_global,(prefix+"BaseIdentity").c_str(),record.baseIdentity.c_str());storeSet(g_global,(prefix+"Path").c_str(),record.canonicalPath.c_str());storeSet(g_global,(prefix+"CurrentPath").c_str(),record.currentPath.c_str());storeSet(g_global,(prefix+"Retired").c_str(),record.retired?"true":"false");storeSet(g_global,(prefix+"PreviousPathCount").c_str(),std::to_string(record.previousPaths.size()).c_str());
-    for(size_t item=0;item<record.previousPaths.size();item++)storeSet(g_global,(prefix+"PreviousPath"+std::to_string(item)).c_str(),record.previousPaths[item].c_str());
+    storeSet(g_metadata,(prefix+"Id").c_str(),record.id.c_str());storeSet(g_metadata,(prefix+"Fingerprint").c_str(),record.fingerprint.c_str());storeSet(g_metadata,(prefix+"BaseIdentity").c_str(),record.baseIdentity.c_str());storeSet(g_metadata,(prefix+"Path").c_str(),record.canonicalPath.c_str());storeSet(g_metadata,(prefix+"CurrentPath").c_str(),record.currentPath.c_str());storeSet(g_metadata,(prefix+"Retired").c_str(),record.retired?"true":"false");storeSet(g_metadata,(prefix+"PreviousPathCount").c_str(),std::to_string(record.previousPaths.size()).c_str());
+    for(size_t item=0;item<record.previousPaths.size();item++)storeSet(g_metadata,(prefix+"PreviousPath"+std::to_string(item)).c_str(),record.previousPaths[item].c_str());
   }
   g_libraryIdentitiesDirty=false;
 }
@@ -2619,6 +2657,7 @@ static bool gameFileExists(const char *dir, const Game &game, const char *extens
     game.hasCfg = gameFileExists(GAMECFG_DIR, game, ".ini");
   }
   g_metadata=std::move(refreshedMetadata);
+  saveLibraryIdentities();
   storeSave(g_metadata,METADATA_INI);
   storeSave(g_titles,TITLES_INI);
   storeSave(g_recent,RECENT_INI);
@@ -2708,7 +2747,7 @@ static void stopGameScan(){
   auto state=g_libraryScan;if(!state)return;state->cancel=true;
   if(state->worker.joinable())state->worker.join();
   g_libraryScan.reset();
-  if(g_libraryIdentitiesDirty){saveLibraryIdentities();storeSave(g_global,LAUNCHER_INI);}
+  if(g_libraryIdentitiesDirty){saveLibraryIdentities();storeSave(g_metadata,METADATA_INI);storeSave(g_global,LAUNCHER_INI);}
 }
 static void startGameScan(std::vector<std::string> sources,bool replace=true){
   stopGameScan();if(replace)cancelQueuedCoverDecodes();g_reservedLibraryIds.clear();for(const auto &record:g_libraryIdentities)if(!record.retired)g_reservedLibraryIds.insert(record.id);
@@ -3178,26 +3217,52 @@ static std::string gameLocationLabel(const Game &game) {
   return path;
 }
 
-static void replaceSavedPathPrefix(const std::string &oldPath,const std::string &newPath) {
+static bool replacePathPrefix(std::string &path,const std::string &oldPath,const std::string &newPath) {
   const std::string normalizedOld=normalizeLocationPath(oldPath);
   const std::string normalizedNew=normalizeLocationPath(newPath);
+  const std::string normalizedPath=normalizeLocationPath(path);
   const std::string oldIdentity=pathIdentity(normalizedOld);
+  const std::string identity=pathIdentity(normalizedPath);
+  if(oldIdentity.empty()||identity.size()<oldIdentity.size()||
+     identity.compare(0,oldIdentity.size(),oldIdentity)!=0) return false;
+  if(identity.size()!=oldIdentity.size()&&oldIdentity.back()!='/'&&
+     identity[oldIdentity.size()]!='/') return false;
+  const std::string replaced=identity.size()==oldIdentity.size()?normalizedNew:
+      normalizeLocationPath(normalizedNew+normalizedPath.substr(normalizedOld.size()));
+  if(pathIdentity(replaced)==identity) return false;
+  path=replaced;return true;
+}
+
+static void replaceSavedPathPrefix(const std::string &oldPath,const std::string &newPath) {
   auto replace=[&](std::vector<std::string> &paths){
-    for(auto &path:paths){
-      const std::string normalizedPath=normalizeLocationPath(path);
-      const std::string identity=pathIdentity(normalizedPath);
-      if(identity==oldIdentity) path=normalizedNew;
-      else if(identity.size()>oldIdentity.size() && identity.compare(0,oldIdentity.size(),oldIdentity)==0 && identity[oldIdentity.size()]=='/')
-        path=normalizeLocationPath(normalizedNew+normalizedPath.substr(normalizedOld.size()));
-    }
+    for(auto &path:paths) replacePathPrefix(path,oldPath,newPath);
   };
   auto sources=loadGameSources(); replace(sources); saveGameSources(sources);
   auto favorites=loadFavoriteFolders(); replace(favorites); saveFavoriteFolders(favorites);
-  if(!g_fileClipboard.path.empty() && pathAtOrBelow(g_fileClipboard.path,normalizedOld)){
-    const std::string clipboardPath=normalizeLocationPath(g_fileClipboard.path);
-    g_fileClipboard.path=normalizeLocationPath(normalizedNew+clipboardPath.substr(normalizedOld.size()));
-  }
+  if(!g_fileClipboard.path.empty()) replacePathPrefix(g_fileClipboard.path,oldPath,newPath);
   g_rescanAfterSettings=true;
+}
+
+static bool migrateV109SmbPaths() {
+  bool changed=false,identitiesChanged=false;
+  for(const auto &share:loadSmbSharesFromStore()){
+    const std::string oldRoot="cemusmb_"+share.id+":/";
+    const std::string newRoot=SwitchStorage::SmbRootPath(share.id);
+    if(newRoot.empty()||pathIdentity(oldRoot)==pathIdentity(newRoot))continue;
+    for(auto &entry:g_global.kv){
+      const bool gamePath=entry.k.rfind("Wrapper/GamePath",0)==0;
+      const bool favoritePath=entry.k.rfind("Browser/Favorite",0)==0;
+      if((gamePath||favoritePath)&&replacePathPrefix(entry.v,oldRoot,newRoot))changed=true;
+    }
+    for(auto &record:g_libraryIdentities){
+      identitiesChanged|=replacePathPrefix(record.canonicalPath,oldRoot,newRoot);
+      identitiesChanged|=replacePathPrefix(record.currentPath,oldRoot,newRoot);
+      for(auto &path:record.previousPaths)
+        identitiesChanged|=replacePathPrefix(path,oldRoot,newRoot);
+    }
+  }
+  g_libraryIdentitiesDirty|=identitiesChanged;
+  return changed||identitiesChanged;
 }
 
 static void removeSavedPathsBelow(const std::string &root) {
@@ -3726,6 +3791,14 @@ static bool isUsbStoragePath(const std::string &path) {
   if(tolower((unsigned char)path[0])!='u'||tolower((unsigned char)path[1])!='m'||tolower((unsigned char)path[2])!='s') return false;
   for(size_t index=3;index<colon;index++) if(!isdigit((unsigned char)path[index])) return false;
   return true;
+}
+
+static bool isConfiguredSmbStoragePath(
+    const std::string &path,const std::vector<SwitchStorage::SmbShare> &shares) {
+  return std::any_of(shares.begin(),shares.end(),[&](const auto &share){
+    const std::string root=SwitchStorage::SmbRootPath(share.id);
+    return !root.empty()&&pathAtOrBelow(path,root);
+  });
 }
 
 static std::string usbIdForPath(const std::string &path){
@@ -6909,11 +6982,24 @@ int main(int argc, char **argv){
   storeLoad(g_titles,TITLES_INI);
   storeLoad(g_recent,RECENT_INI);
   storeLoad(g_metadata,METADATA_INI);
-  loadLibraryIdentities();
+  const bool legacyIdentityStore=storeHas(g_global,"Library/IdentityCount");
+  const bool migrateIdentities=loadLibraryIdentities();
+  if(legacyIdentityStore)storeRemovePrefix(g_global,"Library/Identity");
+  const bool smbPathsMigrated=migrateV109SmbPaths();
+  if(migrateIdentities||g_libraryIdentitiesDirty){
+    saveLibraryIdentities();
+    if(!storeSave(g_metadata,METADATA_INI))
+      return startupFailure("Could not migrate the library identity cache.");
+  }
+  bool runtimeKeysRemoved=false;
+  for(const char *key:{"Wrapper/CoreSo","Drastic/RomPath"})if(storeHas(g_global,key)){
+    storeRemove(g_global,key);runtimeKeysRemoved=true;
+  }
   loadLibraryOrganization();
   const int previousSettingsVersion=atoi(storeGet(
       g_global,"Wrapper/LauncherSettingsVersion","0"));
-  bool settingsMigrated=migrateLauncherSettings(g_global);
+  bool settingsMigrated=migrateLauncherSettings(g_global)||legacyIdentityStore||
+                        smbPathsMigrated||runtimeKeysRemoved;
   if(previousSettingsVersion<3&&!migrateFastForwardProfiles())
     return startupFailure("Could not migrate per-game fast-forward settings.");
   settingsMigrated=normalizeLsfgStore(g_global)||settingsMigrated;
@@ -6967,18 +7053,25 @@ int main(int argc, char **argv){
   startCoverDecodeWorker();
   std::vector<std::string> gamePaths=loadGameSources();
   bool hasUsbSource=hasConfiguredUsbSource(gamePaths);
+  const bool startupHasUsbSource=hasUsbSource;
+  const std::vector<SwitchStorage::SmbShare> startupSmbShares=loadSmbSharesFromStore();
   std::atomic<bool> storageInitDone{false},storageInitCancel{false};
-  std::thread storageInitWorker([&]{
+  std::thread storageInitWorker([&,startupHasUsbSource,startupSmbShares]{
     SwitchStorage::SetUsbStatusCallback(usbStatusWake,nullptr);
-    if(hasUsbSource&&!storageInitCancel.load())SwitchStorage::InitializeUsb();
-    for(const auto &share:loadSmbSharesFromStore()){
+    if(startupHasUsbSource&&!storageInitCancel.load())SwitchStorage::InitializeUsb();
+    for(const auto &share:startupSmbShares){
       if(storageInitCancel.load())break;
       if(share.autoMount){std::string error;SwitchStorage::MountSmb(share,&error,&storageInitCancel);}
     }
     storageInitDone=true;wakeUiFromWorker(0x53544f52);
   });
   uint64_t usbGeneration=0;Uint32 usbRefreshAt=0;bool storageIntegrated=false;
-  startGameScan(gamePaths,true);
+  std::vector<std::string> initialGamePaths;
+  for(const std::string &source:gamePaths)
+    if(!isUsbStoragePath(source)&&source.rfind(UNAVAILABLE_USB_PREFIX,0)!=0&&
+       !isConfiguredSmbStoragePath(source,startupSmbShares))
+      initialGamePaths.push_back(source);
+  startGameScan(std::move(initialGamePaths),true);
 
   int sel=0,top=0,rows=1;
   bool running=true,launch=false,userExit=false;
@@ -6986,7 +7079,6 @@ int main(int argc, char **argv){
   bool launchLegacyUnique=false;
   auto selectGame=[&](Game &game){
     recordPlayed(game);
-    storeSet(g_global,"Drastic/RomPath",toEmu(game.path).c_str());
     launchKey=game.key;
     launchPathKey=game.pathKey;
     launchLegacyKey=game.legacyKey;
@@ -7025,7 +7117,9 @@ int main(int argc, char **argv){
       if(storageInitWorker.joinable())storageInitWorker.join();
       storageIntegrated=true;
       usbGeneration=SwitchStorage::UsbStatusGeneration();gamePaths=loadGameSources();refreshConfiguredUsbSources(gamePaths);
-      for(const std::string &source:gamePaths)if(isUsbStoragePath(source)||source.rfind("nxsmb_",0)==0)pendingMountedSources.push_back(source);
+      for(const std::string &source:gamePaths)
+        if(isUsbStoragePath(source)||isConfiguredSmbStoragePath(source,startupSmbShares))
+          pendingMountedSources.push_back(source);
     }
     if(forwarderPending)if(Game *game=findGameByKey(forwarderKey)){selectGame(*game);forwarderPending=false;}
     if(!running)break;
@@ -7163,7 +7257,7 @@ int main(int argc, char **argv){
   bool willChain=false;
   std::string emulatorNro;
   if(launch&&envHasNextLoad()){
-    Store effective=g_global;
+    Store effective=makeRuntimeConfig(g_global,toEmu(launchPath));
     if(!launchKey.empty()){
       std::string profile=std::string(GAMECFG_DIR)+"/"+launchKey+".ini";
       if(!regularFileExists(profile)&&!launchPathKey.empty())profile=std::string(GAMECFG_DIR)+"/"+launchPathKey+".ini";
@@ -7171,7 +7265,9 @@ int main(int argc, char **argv){
       Store overrides; storeLoad(overrides,profile.c_str());
       migrateStylusMode(overrides,false);
       storeRemove(overrides,"Wrapper/CpuBoost");
-      for(const auto &entry:overrides.kv) storeSet(effective,entry.k.c_str(),entry.v.c_str());
+      for(const auto &entry:overrides.kv)
+        if(runtimeConfigKey(entry.k)&&!runtimeOwnedKey(entry.k))
+          storeSet(effective,entry.k.c_str(),entry.v.c_str());
     }
     normalizeLsfgStore(effective);
     normalizeCpuThreads(effective);
@@ -7194,10 +7290,7 @@ int main(int argc, char **argv){
     bool haveResources=ensureResources();
     bool haveSystemFiles=userSystemFilesPresent();
     appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
-    if(haveCore){
-      storeSet(g_global,"Wrapper/CoreSo","/switch/drastic/cores/libdrastic_arm64.so");
-      storeSet(effective,"Wrapper/CoreSo","/switch/drastic/cores/libdrastic_arm64.so");
-    }
+    storeSet(effective,"Wrapper/CoreSo",CORE_SO_PATH);
     storeSet(effective,"Drastic/RomPath",toEmu(launchPath).c_str());
     if(!launchKey.empty()){
       storeSet(effective,"Wrapper/GameKey",launchKey.c_str());
