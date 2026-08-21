@@ -1,0 +1,4 @@
+DrasticDS_nx 1.0.9 – Direct Forwarder Fix
+Hardware-tested historical NRO SHA-256: 91ebec3eab02001609d12fe267fdb190fdffa1ad690ccb48ba63a03e3d321542
+Tuned source blob: eda8278a5bdb98d847a16070b1ed6bdb5ec474bb
+Hardware validation belongs to that historical binary. Fresh rebuilds from the same source record their own SHA-256 separately.
