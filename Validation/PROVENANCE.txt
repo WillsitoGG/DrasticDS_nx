@@ -2,7 +2,7 @@ DrasticDS_nx 1.0.9 – Direct Forwarder Fix
 Upstream source commit: b587105edd831bb149c0aef681363cbb3c12e9b3
 Patched launcher/source/main.cpp blob: eda8278a5bdb98d847a16070b1ed6bdb5ec474bb
 Official 1.0.9 NRO SHA-256: d540714fc33c8c41ee33678df52369e426a6b09262a963fdee18c02fc5653679
-Current rebuilt NRO SHA-256: 0fe4a47bebcfada502e51f32a410226590bf8663e0bb0b0c7e05a9ceaf5167fa
+Current rebuilt NRO SHA-256: 778820e98097087c28fb20698072abcb08aef8a0538a511dd4d4b57c003bba25
 Hardware-tested historical NRO SHA-256: 91ebec3eab02001609d12fe267fdb190fdffa1ad690ccb48ba63a03e3d321542
 Build identity: fresh rebuild from the exact hardware-tested source; not byte-identical to the historical binary
 Normal launcher: unchanged
