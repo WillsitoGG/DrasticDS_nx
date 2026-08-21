@@ -1,0 +1,35 @@
+name: Build WillsitoGG Direct Forwarder Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:20260219
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: willsito-tuning
+      - name: Verify exact tuned source
+        shell: bash
+        run: bash scripts/verify-direct-forwarder.sh
+      - name: Build and validate DrasticDS_nx 1.0.9 Direct Forwarder Fix
+        shell: bash
+        run: bash scripts/build-direct-forwarder-fix.sh
+      - name: Upload validated build
+        uses: actions/upload-artifact@v4
+        with:
+          name: drasticds-1.0.9-direct-forwarder-fix
+          path: |
+            drastic-willsito-build-output/DrasticDS.nro
+            drastic-willsito-build-output/SHA256SUMS.txt
+            drastic-willsito-build-output/OFFICIAL_NRO_SHA256.txt
+            drastic-willsito-build-output/OFFICIAL_RELEASE.txt
+            drastic-willsito-build-output/DrasticDS_nstool.txt
+            drastic-willsito-build-output/PROVENANCE.txt
+          if-no-files-found: error

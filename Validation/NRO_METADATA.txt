@@ -1,0 +1,25 @@
+Validation tool: nstool
+Validated tuned asset: DrasticDS.nro
+
+NRO Header:
+NroSize=0xa03000
+.text Offset=0x0 Size=0x787000
+.ro Offset=0x787000 Size=0x222000
+.data Offset=0x9a9000 Size=0x5a000
+.bss Size=0x3e000
+
+ASET Header:
+Icon Offset=0x38 Size=0x22b9
+NACP Offset=0x22f1 Size=0x4000
+RomFS Offset=0x62f1 Size=0x48f8280
+
+NACP:
+Name=Drastic DS
+Publisher=naga
+DisplayVersion=1.0.9
+
+RomFS:
+DirNum=64
+FileNum=307
+
+The original nstool validation emitted warnings only because prod.keys/title.keys were not supplied; those keys are not required for the structural NRO metadata recorded here.

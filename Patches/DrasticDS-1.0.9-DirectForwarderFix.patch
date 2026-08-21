@@ -1,0 +1,151 @@
+diff --git a/launcher/source/main.cpp b/launcher/source/main.cpp
+index 2942a1c..eda8278 100644
+--- a/launcher/source/main.cpp
++++ b/launcher/source/main.cpp
+@@ -7051,15 +7051,29 @@ int main(int argc, char **argv){
+   if(!ensureBundledShaders())
+     return startupFailure("Could not install the bundled custom shaders.");
+   startCoverDecodeWorker();
++  // Standard NSP forwarders place the selected ROM directly in argv[1].
++  // Detect that mode before storage/library startup so a direct launch never
++  // needs to render the launcher grid or its USB-connection waiting screen.
++  std::string positionalForwarderPath;
++  if(argc>=2&&argv[1]&&argv[1][0]){
++    const std::string candidate=normalizeLocationPath(argv[1]);
++    if(!candidate.empty()&&hasGameExtension(candidate.c_str()))
++      positionalForwarderPath=candidate;
++  }
++  const bool silentDirectForwarder=!positionalForwarderPath.empty();
++
+   std::vector<std::string> gamePaths=loadGameSources();
+   bool hasUsbSource=hasConfiguredUsbSource(gamePaths);
+-  const bool startupHasUsbSource=hasUsbSource;
++  const bool directForwarderUsesUsb=silentDirectForwarder&&isUsbStoragePath(positionalForwarderPath);
++  const bool startupHasUsbSource=(hasUsbSource&&!silentDirectForwarder)||directForwarderUsesUsb;
+   const std::vector<SwitchStorage::SmbShare> startupSmbShares=loadSmbSharesFromStore();
+   std::atomic<bool> storageInitDone{false},storageInitCancel{false};
+   std::thread storageInitWorker([&,startupHasUsbSource,startupSmbShares]{
+     SwitchStorage::SetUsbStatusCallback(usbStatusWake,nullptr);
+     if(startupHasUsbSource&&!storageInitCancel.load())SwitchStorage::InitializeUsb();
+-    for(const auto &share:startupSmbShares){
++    // A positional SD/USB forwarder does not need the normal launcher library
++    // or SMB auto-mount path. Avoid unrelated startup work before chainloading.
++    if(!silentDirectForwarder) for(const auto &share:startupSmbShares){
+       if(storageInitCancel.load())break;
+       if(share.autoMount){std::string error;SwitchStorage::MountSmb(share,&error,&storageInitCancel);}
+     }
+@@ -7071,7 +7085,8 @@ int main(int argc, char **argv){
+     if(!isUsbStoragePath(source)&&source.rfind(UNAVAILABLE_USB_PREFIX,0)!=0&&
+        !isConfiguredSmbStoragePath(source,startupSmbShares))
+       initialGamePaths.push_back(source);
+-  startGameScan(std::move(initialGamePaths),true);
++  if(!silentDirectForwarder)
++    startGameScan(std::move(initialGamePaths),true);
+ 
+   int sel=0,top=0,rows=1;
+   bool running=true,launch=false,userExit=false;
+@@ -7093,12 +7108,56 @@ int main(int argc, char **argv){
+     userExit=true;running=false;return true;
+   };
+ 
+-  bool forwarderRequested=false,forwarderMatched=false;
+-  std::string forwarderKey;
+-  for(int argument=1;argument+1<argc;argument++) if(!strcmp(argv[argument],"-g")){
++  auto prepareDirectForwarderGame=[&](const std::string &directPath) -> bool {
++    struct stat info{};
++    if(stat(directPath.c_str(),&info)!=0||!S_ISREG(info.st_mode)) return false;
++
++    Game game;
++    game.path=directPath;
++    const size_t slash=directPath.find_last_of("/\\");
++    game.file=slash==std::string::npos?directPath:directPath.substr(slash+1);
++    game.legacyKey=sanitize(game.file);
++    readNdsMetadata(directPath,game.headerTitle,game.gameCode);
++    game.pathKey=makeGameKey(game.file,directPath,game.gameCode);
++    game.added=(long long)info.st_mtime;
++    game.modified=game.added;
++    game.fileSize=(long long)info.st_size;
++
++    const char *cached=storeGet(g_metadata,game.pathKey.c_str(),"");
++    long long cachedSize=0,cachedTime=0;
++    unsigned long long cachedFingerprint=0;
++    int consumed=0;
++    if(sscanf(cached,"%lld,%lld,%llx%n",&cachedSize,&cachedTime,
++              &cachedFingerprint,&consumed)==3&&cached[consumed]==0&&
++       cachedSize==game.fileSize&&cachedTime==game.modified)
++      game.fingerprint=(uint64_t)cachedFingerprint;
++    if(!game.fingerprint) game.fingerprint=fingerprintGameFile(directPath,info);
++    game.key=stableGameKey(game.gameCode,game.fingerprint);
++    game.played=atoll(gameStoreGet(g_recent,game,"0"));
++    game.hasCfg=regularFileExists(std::string(GAMECFG_DIR)+"/"+game.key+".ini")||
++                regularFileExists(std::string(GAMECFG_DIR)+"/"+game.pathKey+".ini");
++    // Basename uniqueness is deliberately not guessed without a library scan.
++    // Stable-key and path-key profiles remain fully supported.
++    game.legacyUnique=false;
++    selectGame(game);
++    return true;
++  };
++
++  bool forwarderRequested=silentDirectForwarder;
++  bool forwarderMatched=false;
++  bool forwarderDirectPath=silentDirectForwarder;
++  std::string forwarderKey=positionalForwarderPath;
++  auto findForwarderGame=[&]() -> Game* {
++    return findGameByKey(forwarderKey);
++  };
++  if(forwarderDirectPath)
++    forwarderMatched=prepareDirectForwarderGame(forwarderKey);
++
++  // Preserve NaGaa's built-in -g <gameKey> behavior unchanged.
++  if(!forwarderRequested) for(int argument=1;argument+1<argc;argument++) if(!strcmp(argv[argument],"-g")){
+     forwarderRequested=true;
+     forwarderKey=argv[argument+1];
+-    if(Game *game=findGameByKey(forwarderKey)){ selectGame(*game); forwarderMatched=true; }
++    if(Game *game=findForwarderGame()){ selectGame(*game); forwarderMatched=true; }
+     break;
+   }
+   if(!forwarderRequested&&g_griddbReady&&!g_launcherNroPath.empty()&&
+@@ -7121,7 +7180,13 @@ int main(int argc, char **argv){
+         if(isUsbStoragePath(source)||isConfiguredSmbStoragePath(source,startupSmbShares))
+           pendingMountedSources.push_back(source);
+     }
+-    if(forwarderPending)if(Game *game=findGameByKey(forwarderKey)){selectGame(*game);forwarderPending=false;}
++    if(forwarderPending){
++      if(forwarderDirectPath){
++        if(prepareDirectForwarderGame(forwarderKey)) forwarderPending=false;
++      }else if(Game *game=findForwarderGame()){
++        selectGame(*game);forwarderPending=false;
++      }
++    }
+     if(!running)break;
+     pollUpdateNotification();
+     if(hasUsbSource&&storageIntegrated){
+@@ -7144,9 +7209,13 @@ int main(int argc, char **argv){
+         sel=0;
+         if(!selected.empty()) for(size_t index=0;index<g_libraryView.size();index++) if(g_libraryView[index]->key==selected){ sel=(int)index; break; }
+         top=0;
+-        if(forwarderPending) if(Game *game=findGameByKey(forwarderKey)){
+-          selectGame(*game);
+-          forwarderPending=false;
++        if(forwarderPending){
++          if(forwarderDirectPath){
++            if(prepareDirectForwarderGame(forwarderKey)) forwarderPending=false;
++          }else if(Game *game=findForwarderGame()){
++            selectGame(*game);
++            forwarderPending=false;
++          }
+         }
+       }
+       if(!running) break;
+@@ -7164,7 +7233,10 @@ int main(int argc, char **argv){
+         }
+       }
+       if(!running) break;
+-      renderUsbForwarderWait();
++      // Built-in -g shortcuts keep the informative launcher wait screen.
++      // Raw positional forwarders stay completely silent: no grid and no
++      // "connecting USB storage" frame is ever presented before the game.
++      if(!forwarderDirectPath) renderUsbForwarderWait();
+     Uint32 nextDeadline=forwarderDeadline;
+     if(usbRefreshAt&&(!nextDeadline||SDL_TICKS_PASSED(nextDeadline,usbRefreshAt)))nextDeadline=usbRefreshAt;
+     waitForNextUiFrame(true,nextDeadline);

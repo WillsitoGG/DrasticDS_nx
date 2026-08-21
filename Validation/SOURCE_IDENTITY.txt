@@ -1,0 +1,11 @@
+Upstream repository: NaGaa95/DrasticDS_nx
+Upstream source commit: b587105edd831bb149c0aef681363cbb3c12e9b3
+Upstream launcher/source/main.cpp diff blob prefix: 2942a1c
+
+Validated tuned repository: WillsitoGG/DrasticDS_nx
+Validated tuned commit: c983d2f6291bbf9dac03b14dc8e7720ba516d05c
+Validated tuned launcher/source/main.cpp Git blob: eda8278a5bdb98d847a16070b1ed6bdb5ec474bb
+
+The tuned blob is byte-identical to the historical file WillsitoGG/NSW_Tunning:Source/DrasticDS_main_patched.cpp that was manually tested by WillsitoGG before the upstream PR was submitted.
+
+Upstream source delta: 1 file, launcher/source/main.cpp, 84 additions / 12 deletions.
