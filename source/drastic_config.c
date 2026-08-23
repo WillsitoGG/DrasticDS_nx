@@ -173,6 +173,8 @@ void drastic_config_load(DrasticRuntimeConfig *config) {
   config->rotation = clamp_int(prefs_get_int("Wrapper/Rotation", 0), 0, 3);
   config->screen_gap = clamp_int(prefs_get_int("Wrapper/ScreenGap", 8), 0, 128);
   config->integer_scale = prefs_get_bool("Wrapper/IntegerScale", false);
+  config->custom_aspect_lock =
+      prefs_get_bool("Wrapper/CustomAspectLock", true);
   config->vulkan_low_latency =
       prefs_get_bool("Wrapper/VulkanLowLatency", false);
   config->video_filter = read_filter();
@@ -196,8 +198,8 @@ void drastic_config_load(DrasticRuntimeConfig *config) {
   config->stylus_y = 96;
   config->core_config = drastic_config_build_core_config();
   static const float defaults[2][4] = {
-    {0.30f, 0.04f, 0.40f, 0.40f},
-    {0.30f, 0.56f, 0.40f, 0.40f},
+    {0.03f, 0.20666667f, 0.44f, 0.58666667f},
+    {0.53f, 0.20666667f, 0.44f, 0.58666667f},
   };
   static const char *keys[2][4] = {
     {"Wrapper/CustomTopX", "Wrapper/CustomTopY",
@@ -244,6 +246,34 @@ static int remap_screen(const DrasticRuntimeConfig *config, int screen) {
   return config->swap_screens ? 1 - screen : screen;
 }
 
+static void enforce_custom_native_aspect(DrasticScreenRect *rect,
+                                         int rotation,
+                                         int canvas_width,
+                                         int canvas_height) {
+  if (!rect || canvas_width <= 0 || canvas_height <= 0) return;
+  const float physical_aspect = (rotation & 1) ? 3.0f / 4.0f : 4.0f / 3.0f;
+  const float normalized_aspect =
+      physical_aspect * (float)canvas_height / (float)canvas_width;
+  if (normalized_aspect <= 0.0f) return;
+
+  const float center_x = rect->x + rect->width * 0.5f;
+  const float center_y = rect->y + rect->height * 0.5f;
+  const float height_from_width = rect->width / normalized_aspect;
+  const float width_from_height = rect->height * normalized_aspect;
+  const float width_cost = fabsf(height_from_width - rect->height) * canvas_height;
+  const float height_cost = fabsf(width_from_height - rect->width) * canvas_width;
+  float height = width_cost <= height_cost ? height_from_width : rect->height;
+  const float minimum_height = fmaxf(0.08f, 0.08f / normalized_aspect);
+  const float maximum_height = fminf(1.0f, 1.0f / normalized_aspect);
+  height = clamp_float(height, minimum_height, maximum_height);
+  rect->height = height;
+  rect->width = height * normalized_aspect;
+  rect->x = clamp_float(center_x - rect->width * 0.5f,
+                        0.0f, 1.0f - rect->width);
+  rect->y = clamp_float(center_y - rect->height * 0.5f,
+                        0.0f, 1.0f - rect->height);
+}
+
 static void set_rect(DrasticRuntimeConfig *config, int index, int screen,
                      float x, float y, float width, float height) {
   config->screens[index].x = x;
@@ -262,7 +292,9 @@ void drastic_config_calculate_layout(DrasticRuntimeConfig *config,
 
   if (config->layout == DRASTIC_LAYOUT_CUSTOM) {
     for (int screen = 0; screen < 2; screen++) {
-      const DrasticScreenRect *custom = &config->custom_screens[screen];
+      DrasticScreenRect *custom = &config->custom_screens[screen];
+      if (config->custom_aspect_lock)
+        enforce_custom_native_aspect(custom, config->rotation, width, height);
       set_rect(config, screen, screen,
                custom->x * width, custom->y * height,
                custom->width * width, custom->height * height);

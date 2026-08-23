@@ -411,7 +411,7 @@ static const char *iniGet(const char *key, const char *def) {
 static void iniSet(const char *key, const char *val) { storeSet(*g_active, key, val); }
 
 enum OType { OT_CHOICE, OT_RANGE, OT_SCALED_RANGE, OT_SUBMENU, OT_TEXT,
-             OT_HOTKEY, OT_STATUS, OT_SHADER, OT_DATETIME };
+             OT_HOTKEY, OT_STATUS, OT_SHADER, OT_DATETIME, OT_ACTION };
 struct Choice { const char *label, *val; };
 struct Opt {
   const char *label;
@@ -440,6 +440,7 @@ struct Opt {
 #define O_STATUS(l)            { l, nullptr, OT_STATUS, nullptr,0, 0,0,0, nullptr, 0, nullptr, nullptr, 1, nullptr }
 #define O_SHADER(l,k,d)        { l, k, OT_SHADER, nullptr,0, 0,0,0, d, 0, nullptr, nullptr, 1, nullptr }
 #define O_DATETIMEG(l,k,d,gk,go) { l, k, OT_DATETIME, nullptr,0, 0,0,0, d, 0, gk, go, 1, nullptr }
+#define O_ACTION(l,k)           { l, k, OT_ACTION, nullptr,0, 0,0,0, nullptr, 0, nullptr, nullptr, 1, nullptr }
 
 static char g_autoFirmwareLanguage[32] = "Auto (English)";
 
@@ -480,7 +481,7 @@ static const Choice C_lsfgFlow[] = { {"Quarter (recommended)","0.25"},
 static const Choice C_layout[]   = { {"Vertical","vertical"}, {"Horizontal","horizontal"},
                                      {"Top screen only","top"}, {"Touch screen only","bottom"},
                                      {"Hybrid (top large)","hybrid_top"}, {"Hybrid (touch large)","hybrid_bottom"},
-                                     {"Custom (in-game editor)","custom"} };
+                                     {"Custom","custom"} };
 static const Choice C_rotation[] = { {"0 degrees","0"}, {"90 degrees","1"}, {"180 degrees","2"}, {"270 degrees","3"} };
   static const Choice C_filter[]   = { {"Nearest","nearest"}, {"Linear","linear"},
                                      {"Quilez smooth","quilez"}, {"Scanline","scanline"},
@@ -544,6 +545,8 @@ static const Opt S_graphics[] = {
   O_CHOICEG("Low-latency Vulkan", "Wrapper/VulkanLowLatency", C_bool,
             "false", "Wrapper/Renderer", "=vk"),
   O_CHOICE("Screen layout",     "Wrapper/Layout", C_layout, "horizontal"),
+  O_ACTION("Custom layout editor...", "Wrapper/CustomLayoutEditor"),
+  O_CHOICE("Lock native aspect ratio", "Wrapper/CustomAspectLock", C_bool, "true"),
   O_CHOICE("Swap DS screens",   "Wrapper/SwapScreens", C_bool, "false"),
   O_CHOICE("Rotation",          "Wrapper/Rotation", C_rotation, "0"),
   O_RANGE ("Screen gap",        "Wrapper/ScreenGap", 0, 128, 2, "8"),
@@ -691,7 +694,11 @@ static const SettingHelpEntry SETTING_HELP[] = {
   {"Wrapper/VulkanLowLatency", "Latency / performance",
    "Reduces queued Vulkan presentation work so new controller input reaches the display sooner. It can reduce performance headroom, so it is disabled by default."},
   {"Wrapper/Layout", "Screen layout",
-   "Arranges the two Nintendo DS screens. Hybrid modes enlarge one screen, single-screen modes hide the other, and Custom uses positions saved by the in-game layout editor."},
+   "Arranges the two Nintendo DS screens. Hybrid modes enlarge one screen, single-screen modes hide the other, and Custom uses positions saved by either layout editor."},
+  {"Wrapper/CustomLayoutEditor", "Screen layout",
+   "Opens a preview editor for global or per-game custom screen positions. Saving selects the Custom layout."},
+  {"Wrapper/CustomAspectLock", "Screen layout",
+   "Keeps each Nintendo DS screen at its native 4:3 shape, or 3:4 when rotated, while resizing a custom layout."},
   {"Wrapper/SwapScreens", "Screen layout",
    "Exchanges the displayed positions of the top and touch screens. Touch input continues to follow the emulated touch screen."},
   {"Wrapper/Rotation", "Screen layout",
@@ -1545,7 +1552,8 @@ static void makeFlags(){ g_flag[1]=makeFlagTex(1,36,24); g_flag[2]=makeFlagTex(2
 
 static SDL_Texture *g_gA=nullptr,*g_gB=nullptr,*g_gX=nullptr,*g_gY=nullptr,
                    *g_gPlus=nullptr,*g_gMinus=nullptr,*g_gLeftRight=nullptr,
-                   *g_gUpDown=nullptr,*g_gL=nullptr,*g_gR=nullptr;
+                   *g_gUpDown=nullptr,*g_gL=nullptr,*g_gR=nullptr,
+                   *g_gLayoutMove=nullptr,*g_gLayoutResize=nullptr;
 // Supersampling keeps the downscaled glyphs crisp.
 static const int GLYPH_SS = 3;
 static SDL_Texture *makeGlyph(const char *label, bool pill){
@@ -1580,9 +1588,77 @@ static SDL_Texture *makeGlyph(const char *label, bool pill){
   SDL_SetRenderTarget(g_ren,previous);
   return t;
 }
+static SDL_Texture *makeLayoutControlGlyph(bool resize){
+  if(!g_font_sm||!g_font_big) return nullptr;
+  const int S=GLYPH_SS,base=TTF_FontHeight(g_font_sm)+6;
+  // These hints contain detailed stick/D-pad silhouettes, so render them a
+  // little larger than the single-letter face-button glyphs.  Resize only
+  // needs the right-stick symbol; showing its implementation combo here made
+  // the footer crowded and the stick itself too small to read.
+  const int H=base*S*6/5,W=resize?H:H*19/10;
+  SDL_Texture *texture=SDL_CreateTexture(g_ren,SDL_PIXELFORMAT_RGBA8888,
+                                         SDL_TEXTUREACCESS_TARGET,W,H);
+  if(!texture) return nullptr;
+  SDL_SetTextureBlendMode(texture,SDL_BLENDMODE_BLEND);
+  SDL_Texture *previous=SDL_GetRenderTarget(g_ren);
+  SDL_SetRenderTarget(g_ren,texture);
+  SDL_SetRenderDrawColor(g_ren,0,0,0,0);SDL_RenderClear(g_ren);
+  const SDL_Color edge={14,16,22,255},hi={92,99,114,255},
+                  face={52,57,68,255},ink={246,248,252,255};
+
+  auto textCentered=[&](const char *label,int centerX,int centerY,int maxHeight){
+    SDL_Surface *surface=TTF_RenderUTF8_Blended(g_font_big,label,ink);
+    if(!surface) return;
+    SDL_Texture *labelTexture=SDL_CreateTextureFromSurface(g_ren,surface);
+    if(labelTexture) SDL_SetTextureBlendMode(labelTexture,SDL_BLENDMODE_BLEND);
+    int width=surface->w,height=surface->h;
+    if(height>0&&height>maxHeight){width=width*maxHeight/height;height=maxHeight;}
+    SDL_Rect destination={centerX-width/2,centerY-height/2,width,height};
+    SDL_FreeSurface(surface);
+    if(labelTexture){
+      SDL_RenderCopy(g_ren,labelTexture,nullptr,&destination);
+      SDL_DestroyTexture(labelTexture);
+    }
+  };
+  auto stick=[&](int centerX,const char *label){
+    const int baseY=H*58/100,baseRadius=H*36/100;
+    fillCircle(centerX,baseY,baseRadius,edge);
+    fillCircle(centerX,baseY,baseRadius-S*2,hi);
+    fillCircle(centerX,baseY,baseRadius-S*4,face);
+    fillRect(centerX-S*2,H*25/100,S*4,H*22/100,edge);
+    const int knobY=H*29/100,knobRadius=H*22/100;
+    fillCircle(centerX,knobY,knobRadius,edge);
+    fillCircle(centerX,knobY,knobRadius-S*2,face);
+    textCentered(label,centerX,knobY,H*27/100);
+  };
+  auto dpad=[&](int centerX){
+    const int centerY=H/2,longSide=H*74/100,shortSide=H*28/100;
+    fillRect(centerX-shortSide/2,centerY-longSide/2,
+             shortSide,longSide,edge);
+    fillRect(centerX-longSide/2,centerY-shortSide/2,
+             longSide,shortSide,edge);
+    const int inset=S*2;
+    fillRect(centerX-(shortSide-inset*2)/2,centerY-longSide/2+inset,
+             shortSide-inset*2,longSide-inset*2,face);
+    fillRect(centerX-longSide/2+inset,centerY-(shortSide-inset*2)/2,
+             longSide-inset*2,shortSide-inset*2,face);
+    fillCircle(centerX,centerY,H*9/100,hi);
+  };
+
+  if(resize){
+    stick(W/2,"R");
+  } else {
+    stick(H*45/100,"L");
+    textCentered("/",H*96/100,H/2,H*34/100);
+    dpad(H*147/100);
+  }
+  SDL_SetRenderTarget(g_ren,previous);
+  return texture;
+}
 static void destroyGlyphs(){
   SDL_Texture **glyphs[]={&g_gA,&g_gB,&g_gX,&g_gY,&g_gPlus,&g_gMinus,
-                         &g_gLeftRight,&g_gUpDown,&g_gL,&g_gR};
+                          &g_gLeftRight,&g_gUpDown,&g_gL,&g_gR,
+                          &g_gLayoutMove,&g_gLayoutResize};
   for(SDL_Texture **glyph:glyphs){
     if(*glyph) SDL_DestroyTexture(*glyph);
     *glyph=nullptr;
@@ -1595,6 +1671,8 @@ static void makeGlyphs(){
   g_gPlus=makeGlyph("+",false); g_gMinus=makeGlyph("−",false);
   g_gLeftRight=makeGlyph("‹ ›",true);g_gUpDown=makeGlyph("↕",true);
   g_gL=makeGlyph("L",true); g_gR=makeGlyph("R",true);
+  g_gLayoutMove=makeLayoutControlGlyph(false);
+  g_gLayoutResize=makeLayoutControlGlyph(true);
 }
 static PlSharedFontType requestedUiFontType(){
   const std::string_view language=LauncherLocalization::CurrentLanguage();
@@ -1651,6 +1729,8 @@ static SDL_Texture *footerGlyph(const char *button){
   if(!strcmp(button,"Up / Down")) return g_gUpDown;
   if(!strcmp(button,"L")) return g_gL;
   if(!strcmp(button,"R")) return g_gR;
+  if(!strcmp(button,"Layout move")) return g_gLayoutMove;
+  if(!strcmp(button,"Layout resize")) return g_gLayoutResize;
   return nullptr;
 }
 static void footerButtonSize(const char *button,int &width,int &height){
@@ -4285,7 +4365,7 @@ static void optValue(const Opt &o, char *out, int n) {
       strftime(out,(size_t)n,"%Y-%m-%d  %H:%M",&value);
     else snprintf(out,n,"Set date and time");
   }
-  else if (o.type==OT_SUBMENU) snprintf(out,n,">");
+  else if (o.type==OT_SUBMENU || o.type==OT_ACTION) snprintf(out,n,">");
 }
 static void optAdjust(const Opt &o, int dir) {
   if (!optEnabled(o)) return;
@@ -4623,7 +4703,9 @@ static void showOptionHelp(const char *section,const Opt &option,
   SettingHelpInfo help=settingHelpFor(option);
   char value[256]={};
   const char *current=nullptr;
-  if(option.type!=OT_SUBMENU){ optValue(option,value,sizeof(value)); current=value; }
+  if(option.type!=OT_SUBMENU && option.type!=OT_ACTION){
+    optValue(option,value,sizeof(value)); current=value;
+  }
   showHelpCard(LauncherLocalization::Translate(section).data(),
                LauncherLocalization::Translate(option.label).data(),
                LauncherLocalization::Translate(help.kind).data(),
@@ -4802,6 +4884,285 @@ static void chooseCustomShader(const Opt &option) {
   iniSet("Wrapper/VideoFilter","custom");
 }
 
+struct LauncherLayoutRect {
+  float x, y, width, height;
+};
+
+static float layoutClamp(float value,float minimum,float maximum) {
+  return std::max(minimum,std::min(value,maximum));
+}
+
+static float layoutFloat(const char *key,float fallback) {
+  const char *text=iniGet(key,"");
+  char *end=nullptr;
+  float value=std::strtof(text?text:"",&end);
+  return end&&end!=text&&!*end&&std::isfinite(value)?value:fallback;
+}
+
+static void constrainLauncherLayoutRect(LauncherLayoutRect &rect) {
+  rect.width=layoutClamp(rect.width,0.08f,1.0f);
+  rect.height=layoutClamp(rect.height,0.08f,1.0f);
+  rect.x=layoutClamp(rect.x,0.0f,1.0f-rect.width);
+  rect.y=layoutClamp(rect.y,0.0f,1.0f-rect.height);
+}
+
+/* drivingAxis: 1 keeps width, 0 keeps height, -1 changes the closer side. */
+static void setLauncherLayoutAspect(LauncherLayoutRect &rect,
+                                    float physicalAspect,int drivingAxis,
+                                    bool preserveCenter) {
+  constexpr float GAME_WIDTH=1280.0f;
+  constexpr float GAME_HEIGHT=720.0f;
+  const float normalizedAspect=physicalAspect*GAME_HEIGHT/GAME_WIDTH;
+  const float centerX=rect.x+rect.width*0.5f;
+  const float centerY=rect.y+rect.height*0.5f;
+  const float fromWidth=rect.width/normalizedAspect;
+  if(drivingAxis<0){
+    const float widthCost=std::fabs(fromWidth-rect.height)*GAME_HEIGHT;
+    const float heightCost=
+        std::fabs(rect.height*normalizedAspect-rect.width)*GAME_WIDTH;
+    drivingAxis=widthCost<=heightCost?1:0;
+  }
+  float height=drivingAxis?fromWidth:rect.height;
+  const float minimumHeight=std::max(0.08f,0.08f/normalizedAspect);
+  const float maximumHeight=std::min(1.0f,1.0f/normalizedAspect);
+  height=layoutClamp(height,minimumHeight,maximumHeight);
+  rect.height=height;
+  rect.width=height*normalizedAspect;
+  if(preserveCenter){
+    rect.x=centerX-rect.width*0.5f;
+    rect.y=centerY-rect.height*0.5f;
+  }
+  rect.x=layoutClamp(rect.x,0.0f,1.0f-rect.width);
+  rect.y=layoutClamp(rect.y,0.0f,1.0f-rect.height);
+}
+
+static float launcherNativeAspect(int rotation) {
+  return rotation&1?3.0f/4.0f:4.0f/3.0f;
+}
+
+static void normalizeLauncherLayout(LauncherLayoutRect (&rects)[2],
+                                    int rotation) {
+  const float aspect=launcherNativeAspect(rotation);
+  for(LauncherLayoutRect &rect:rects)
+    setLauncherLayoutAspect(rect,aspect,-1,true);
+}
+
+static void resetLauncherLayout(LauncherLayoutRect (&rects)[2],int rotation) {
+  constexpr float GAME_WIDTH=1280.0f;
+  constexpr float GAME_HEIGHT=720.0f;
+  const float normalizedAspect=
+      launcherNativeAspect(rotation)*GAME_HEIGHT/GAME_WIDTH;
+  const float height=std::min(0.84f,0.44f/normalizedAspect);
+  const float width=height*normalizedAspect;
+  rects[0]={0.25f-width*0.5f,0.5f-height*0.5f,width,height};
+  rects[1]={0.75f-width*0.5f,0.5f-height*0.5f,width,height};
+}
+
+static void saveLauncherLayout(const LauncherLayoutRect (&rects)[2],
+                               bool aspectLock) {
+  static const char *keys[2][4]={
+    {"Wrapper/CustomTopX","Wrapper/CustomTopY",
+     "Wrapper/CustomTopW","Wrapper/CustomTopH"},
+    {"Wrapper/CustomBottomX","Wrapper/CustomBottomY",
+     "Wrapper/CustomBottomW","Wrapper/CustomBottomH"},
+  };
+  for(int screen=0;screen<2;screen++){
+    const float values[]={rects[screen].x,rects[screen].y,
+                          rects[screen].width,rects[screen].height};
+    for(int field=0;field<4;field++){
+      char text[24];
+      snprintf(text,sizeof(text),"%.8g",values[field]);
+      iniSet(keys[screen][field],text);
+    }
+  }
+  iniSet("Wrapper/CustomAspectLock",aspectLock?"true":"false");
+  iniSet("Wrapper/Layout","custom");
+}
+
+static float launcherLayoutAxis(SDL_GameController *pad,
+                                SDL_GameControllerAxis axis) {
+  if(!pad) return 0.0f;
+  const int value=SDL_GameControllerGetAxis(pad,axis);
+  if(std::abs(value)<6000) return 0.0f;
+  return layoutClamp((float)value/32767.0f,-1.0f,1.0f);
+}
+
+static void editCustomLayout(SDL_GameController *pad,const char *ctx) {
+  const std::string editorTitle=
+      std::string(LauncherLocalization::Translate("Custom screen layout"));
+  const std::string editorScope=std::string(LauncherLocalization::Translate(
+      ctx&&*ctx?"Per-game setting":"Global setting"));
+  const std::string topScreen=
+      std::string(LauncherLocalization::Translate("Top screen"));
+  const std::string touchScreen=
+      std::string(LauncherLocalization::Translate("Touch screen"));
+  LauncherLayoutRect rects[2]={
+    {layoutFloat("Wrapper/CustomTopX",0.03f),
+     layoutFloat("Wrapper/CustomTopY",0.20666667f),
+     layoutFloat("Wrapper/CustomTopW",0.44f),
+     layoutFloat("Wrapper/CustomTopH",0.58666667f)},
+    {layoutFloat("Wrapper/CustomBottomX",0.53f),
+     layoutFloat("Wrapper/CustomBottomY",0.20666667f),
+     layoutFloat("Wrapper/CustomBottomW",0.44f),
+     layoutFloat("Wrapper/CustomBottomH",0.58666667f)},
+  };
+  for(LauncherLayoutRect &rect:rects) constrainLauncherLayoutRect(rect);
+  const int rotation=std::max(0,std::min(atoi(iniGet("Wrapper/Rotation","0")),3));
+  bool aspectLock=!strcmp(iniGet("Wrapper/CustomAspectLock","true"),"true");
+  if(aspectLock) normalizeLauncherLayout(rects,rotation);
+  int selected=0;
+  beginScreenFx();
+
+  for(;;){
+    if(!beginUiFrame()) return;
+    float moveX=0.0f,moveY=0.0f,sizeX=0.0f,sizeY=0.0f;
+    SDL_Event event;
+    while(pollUiEvent(event)){
+      int touchX=0,touchY=0;
+      const TouchKind touch=touchFeed(event,&touchX,&touchY);
+      if(event.type==SDL_CONTROLLERBUTTONDOWN){
+        const bool resize=pad&&SDL_GameControllerGetAxis(
+            pad,SDL_CONTROLLER_AXIS_TRIGGERLEFT)>16000;
+        const bool coarse=pad&&SDL_GameControllerGetAxis(
+            pad,SDL_CONTROLLER_AXIS_TRIGGERRIGHT)>16000;
+        const float step=coarse?0.02f:0.006f;
+        if(event.cbutton.button==BTN_CONFIRM){
+          saveLauncherLayout(rects,aspectLock);
+          if(g_active==&g_global&&!storeSave(g_global,LAUNCHER_INI)){
+            modalMessage(editorTitle.c_str(),
+                         {"Could not save launcher.ini.",
+                          "The layout is still kept for this session."});
+          } else {
+            toast(g_active==&g_global?"Global custom layout saved":
+                  "Per-game custom layout saved",700);
+          }
+          return;
+        }
+        if(event.cbutton.button==BTN_CANCEL) return;
+        if(event.cbutton.button==BTN_SETTINGS) selected^=1;
+        else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_X)
+          resetLauncherLayout(rects,rotation);
+        else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_RIGHTSHOULDER){
+          aspectLock=!aspectLock;
+          if(aspectLock) normalizeLauncherLayout(rects,rotation);
+        } else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_LEFT)
+          (resize?sizeX:moveX)-=step;
+        else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_RIGHT)
+          (resize?sizeX:moveX)+=step;
+        else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP)
+          (resize?sizeY:moveY)-=step;
+        else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN)
+          (resize?sizeY:moveY)+=step;
+      }
+      if(touch==TOUCH_TAP){
+        const int margin=g_launcherPortrait?20:60;
+        const int areaTop=topBarH()+58,areaBottom=SH-76;
+        int canvasWidth=SW-margin*2;
+        int canvasHeight=(canvasWidth*9+8)/16;
+        const int maxHeight=std::max(1,areaBottom-areaTop);
+        if(canvasHeight>maxHeight){canvasHeight=maxHeight;canvasWidth=canvasHeight*16/9;}
+        const int canvasX=(SW-canvasWidth)/2;
+        const int canvasY=areaTop+(maxHeight-canvasHeight)/2;
+        for(int screen=1;screen>=0;screen--){
+          const int x=canvasX+(int)std::lround(rects[screen].x*canvasWidth);
+          const int y=canvasY+(int)std::lround(rects[screen].y*canvasHeight);
+          const int width=(int)std::lround(rects[screen].width*canvasWidth);
+          const int height=(int)std::lround(rects[screen].height*canvasHeight);
+          if(touchX>=x&&touchX<x+width&&touchY>=y&&touchY<y+height){
+            selected=screen;break;
+          }
+        }
+      }
+    }
+
+    moveX+=launcherLayoutAxis(pad,SDL_CONTROLLER_AXIS_LEFTX)*0.004f;
+    moveY+=launcherLayoutAxis(pad,SDL_CONTROLLER_AXIS_LEFTY)*0.004f;
+    sizeX+=launcherLayoutAxis(pad,SDL_CONTROLLER_AXIS_RIGHTX)*0.004f;
+    sizeY+=launcherLayoutAxis(pad,SDL_CONTROLLER_AXIS_RIGHTY)*0.004f;
+    LauncherLayoutRect &rect=rects[selected];
+    if(moveX||moveY||sizeX||sizeY){
+      rect.x+=moveX;
+      rect.y+=moveY;
+      rect.width+=sizeX;
+      rect.height+=sizeY;
+      if(aspectLock&&(sizeX||sizeY)){
+        const int widthDrives=std::fabs(sizeX*1280.0f)>=
+                              std::fabs(sizeY*720.0f);
+        setLauncherLayoutAspect(rect,launcherNativeAspect(rotation),
+                                widthDrives,false);
+      } else {
+        constrainLauncherLayoutRect(rect);
+      }
+    }
+
+    clearUiBackground();
+    drawHeader(editorTitle.c_str(),editorScope.c_str());
+    const int margin=g_launcherPortrait?20:60;
+    const int areaTop=topBarH()+58,areaBottom=SH-76;
+    int canvasWidth=SW-margin*2;
+    int canvasHeight=(canvasWidth*9+8)/16;
+    const int maxHeight=std::max(1,areaBottom-areaTop);
+    if(canvasHeight>maxHeight){canvasHeight=maxHeight;canvasWidth=canvasHeight*16/9;}
+    const int canvasX=(SW-canvasWidth)/2;
+    const int canvasY=areaTop+(maxHeight-canvasHeight)/2;
+    glassPanel(canvasX-8,canvasY-8,canvasWidth+16,canvasHeight+16);
+    fillRect(canvasX,canvasY,canvasWidth,canvasHeight,(SDL_Color){7,10,15,255});
+    border(canvasX,canvasY,canvasWidth,canvasHeight,2,(SDL_Color){75,88,105,255});
+
+    for(int pass=0;pass<2;pass++){
+      const int screen=pass==1?selected:1-selected;
+      const LauncherLayoutRect &shown=rects[screen];
+      const int x=canvasX+(int)std::lround(shown.x*canvasWidth);
+      const int y=canvasY+(int)std::lround(shown.y*canvasHeight);
+      const int width=std::max(1,(int)std::lround(shown.width*canvasWidth));
+      const int height=std::max(1,(int)std::lround(shown.height*canvasHeight));
+      const bool current=screen==selected;
+      const SDL_Color color=current?COL_SEL:(SDL_Color){190,202,216,255};
+      fillRect(x,y,width,height,current?(SDL_Color){33,126,158,105}:
+                                      (SDL_Color){95,104,116,70});
+      border(x,y,width,height,current?4:2,color);
+      const std::string &label=screen?touchScreen:topScreen;
+      if(width>textW(g_font_sm,label.c_str())+20&&
+         height>TTF_FontHeight(g_font_sm)+16){
+        fillRect(x+7,y+7,textW(g_font_sm,label.c_str())+14,
+                 TTF_FontHeight(g_font_sm)+8,(SDL_Color){8,14,21,220});
+        drawText(g_font_sm,x+14,y+11,label.c_str(),color);
+      }
+    }
+
+    const float ratio=rect.height>0.0f
+        ? rect.width*1280.0f/(rect.height*720.0f):0.0f;
+    const float nativeAspect=launcherNativeAspect(rotation);
+    const bool native=ratio>0.0f&&std::fabs(ratio/nativeAspect-1.0f)<=0.005f;
+    std::string ratioText;
+    if(native){
+      ratioText=LauncherLocalization::Translate(
+          rotation&1?"Native 3:4":"Native 4:3");
+    } else {
+      char numeric[24];snprintf(numeric,sizeof(numeric),"%.2f:1",ratio);
+      ratioText=std::string(LauncherLocalization::Translate("Current ratio"))+" "+numeric;
+    }
+    const int statusY=std::max(topBarH()+10,canvasY-36);
+    const std::string &screenName=selected?touchScreen:topScreen;
+    drawText(g_font_sm,canvasX,statusY,screenName.c_str(),COL_TXT);
+    drawText(g_font_sm,canvasX+textW(g_font_sm,screenName.c_str())+16,statusY,
+             ratioText.c_str(),native?(SDL_Color){105,225,145,255}:COL_VAL);
+    const std::string lockText=std::string(LauncherLocalization::Translate(
+        aspectLock?"Aspect lock: On":"Aspect lock: Off"));
+    drawTextR(g_font_sm,canvasX+canvasWidth,statusY,lockText.c_str(),
+              aspectLock?(SDL_Color){105,225,145,255}:COL_VAL);
+    const FootItem footer[]={
+      {"Layout move","Move",FA_NONE},{"Layout resize","Resize",FA_NONE},
+      {"X","Screen",FA_NONE},{"Y","Reset",FA_NONE},{"R","Lock",FA_NONE},
+      {"A","Save",FA_NONE},{"B","Cancel",FA_NONE},
+    };
+    drawFooterHints(footer,(int)(sizeof(footer)/sizeof(*footer)),SH-26);
+    drawFadeIn();
+    presentUi();
+    waitForNextUiFrame(true,SDL_GetTicks()+16);
+  }
+}
+
 static bool leapYear(int year) {
   return (year%4==0 && year%100!=0) || year%400==0;
 }
@@ -4967,6 +5328,11 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
         case BTN_CONFIRM: {
           const Opt &o=S.opts[sel];
           if(o.type==OT_SUBMENU){ runSettings(o.sub,pad,ctx); beginScreenFx(); }
+          else if(o.type==OT_ACTION && o.key &&
+                  !strcmp(o.key,"Wrapper/CustomLayoutEditor")){
+            editCustomLayout(pad,ctx);
+            beginScreenFx();
+          }
           else if(o.type==OT_SHADER){ chooseCustomShader(o); beginScreenFx(); }
           else if(o.type==OT_DATETIME){ editCustomClock(o); beginScreenFx(); }
           else if(o.type==OT_TEXT){

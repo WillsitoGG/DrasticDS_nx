@@ -82,6 +82,7 @@ struct DrasticIngameMenu {
   u64 analog_nav_last;
   OpenSLESMicrophoneStatus microphone_status;
   DrasticLayoutMode editor_old_layout;
+  int editor_old_aspect_lock;
   DrasticScreenRect editor_backup[2];
   int editor_screen;
 };
@@ -1038,6 +1039,73 @@ static void custom_rect_from_ui(const DrasticRuntimeConfig *config,
   rect->touch_target = touch_target;
 }
 
+static void constrain_custom_rect(DrasticScreenRect *rect) {
+  rect->width = clamp_float(rect->width, 0.08f, 1.0f);
+  rect->height = clamp_float(rect->height, 0.08f, 1.0f);
+  rect->x = clamp_float(rect->x, 0.0f, 1.0f - rect->width);
+  rect->y = clamp_float(rect->y, 0.0f, 1.0f - rect->height);
+}
+
+/* driving_axis: 1 keeps width, 0 keeps height, -1 changes the closer side. */
+static void set_custom_rect_aspect(DrasticScreenRect *rect,
+                                   float physical_aspect,
+                                   int canvas_width, int canvas_height,
+                                   int driving_axis, int preserve_center) {
+  if (!rect || canvas_width <= 0 || canvas_height <= 0) return;
+  const float normalized_aspect =
+      physical_aspect * (float)canvas_height / (float)canvas_width;
+  if (normalized_aspect <= 0.0f) return;
+  const float center_x = rect->x + rect->width * 0.5f;
+  const float center_y = rect->y + rect->height * 0.5f;
+  const float from_width = rect->width / normalized_aspect;
+  if (driving_axis < 0) {
+    const float width_cost = fabsf(from_width - rect->height) * canvas_height;
+    const float height_cost =
+        fabsf(rect->height * normalized_aspect - rect->width) * canvas_width;
+    driving_axis = width_cost <= height_cost ? 1 : 0;
+  }
+  float height = driving_axis ? from_width : rect->height;
+  const float minimum_height = fmaxf(0.08f, 0.08f / normalized_aspect);
+  const float maximum_height = fminf(1.0f, 1.0f / normalized_aspect);
+  height = clamp_float(height, minimum_height, maximum_height);
+  rect->height = height;
+  rect->width = height * normalized_aspect;
+  if (preserve_center) {
+    rect->x = center_x - rect->width * 0.5f;
+    rect->y = center_y - rect->height * 0.5f;
+  }
+  rect->x = clamp_float(rect->x, 0.0f, 1.0f - rect->width);
+  rect->y = clamp_float(rect->y, 0.0f, 1.0f - rect->height);
+}
+
+static float custom_native_aspect(const DrasticRuntimeConfig *config) {
+  return (config->rotation & 1) ? 3.0f / 4.0f : 4.0f / 3.0f;
+}
+
+static void normalize_custom_layout(DrasticRuntimeConfig *config,
+                                    int canvas_width, int canvas_height) {
+  const float aspect = custom_native_aspect(config);
+  for (int screen = 0; screen < 2; screen++)
+    set_custom_rect_aspect(&config->custom_screens[screen], aspect,
+                           canvas_width, canvas_height, -1, 1);
+}
+
+static void reset_custom_layout(DrasticRuntimeConfig *config) {
+  const float aspect = custom_native_aspect(config);
+  const float normalized_aspect =
+      aspect * (float)panel_height / (float)panel_width;
+  const float height = fminf(0.84f, 0.44f / normalized_aspect);
+  const float width = height * normalized_aspect;
+  config->custom_screens[0] = (DrasticScreenRect){
+    .x = 0.25f - width * 0.5f, .y = 0.5f - height * 0.5f,
+    .width = width, .height = height, .screen = 0,
+  };
+  config->custom_screens[1] = (DrasticScreenRect){
+    .x = 0.75f - width * 0.5f, .y = 0.5f - height * 0.5f,
+    .width = width, .height = height, .screen = 1, .touch_target = 1,
+  };
+}
+
 static void custom_rect_for_ui(const DrasticRuntimeConfig *config,
                                const DrasticScreenRect *rect,
                                int *x, int *y, int *width, int *height) {
@@ -1053,8 +1121,6 @@ static void render_layout_editor(DrasticIngameMenu *menu) {
   const int canvas_width = ui_width();
   const int canvas_height = ui_height();
   overlay_fill_rect(0, 0, canvas_width, canvas_height, 0x33000000u);
-  overlay_fill_rect(0, 0, canvas_width, 70, COLOR_PANEL);
-  overlay_draw_text_scaled(24, 16, 2, COLOR_TEXT, "Custom screen layout");
   for (int screen = 0; screen < 2; screen++) {
     const DrasticScreenRect *rect = &menu->config->custom_screens[screen];
     int x, y, width, height;
@@ -1067,13 +1133,37 @@ static void render_layout_editor(DrasticIngameMenu *menu) {
     overlay_draw_text(x + 16, y + 15, color,
                       screen ? "TOUCH" : "TOP");
   }
-  overlay_fill_rect(0, canvas_height - 88, canvas_width, 88, COLOR_PANEL);
-  overlay_draw_text_clipped(24, canvas_height - 72, canvas_width - 48,
+  overlay_fill_rect(0, 0, canvas_width, 102, COLOR_PANEL);
+  overlay_draw_text_scaled(24, 12, 2, COLOR_TEXT, "Custom screen layout");
+  const DrasticScreenRect *selected =
+      &menu->config->custom_screens[menu->editor_screen];
+  const float current_aspect = selected->height > 0.0f
+      ? selected->width * panel_width / (selected->height * panel_height)
+      : 0.0f;
+  const float native_aspect = custom_native_aspect(menu->config);
+  const int native = current_aspect > 0.0f &&
+      fabsf(current_aspect / native_aspect - 1.0f) <= 0.005f;
+  char aspect_text[48];
+  if (native)
+    snprintf(aspect_text, sizeof(aspect_text), "Native %s",
+             (menu->config->rotation & 1) ? "3:4" : "4:3");
+  else
+    snprintf(aspect_text, sizeof(aspect_text), "Current %.2f:1",
+             current_aspect);
+  overlay_draw_text(24, 72, native ? COLOR_GOOD : COLOR_WARN, aspect_text);
+  overlay_draw_text_right(canvas_width - 24, 72,
+      menu->config->custom_aspect_lock ? COLOR_GOOD : COLOR_WARN,
+      menu->config->custom_aspect_lock ? "Aspect lock: On" : "Aspect lock: Off");
+  overlay_fill_rect(0, canvas_height - 116, canvas_width, 116, COLOR_PANEL);
+  overlay_draw_text_clipped(24, canvas_height - 100, canvas_width - 48,
       COLOR_TEXT,
       "Left stick / D-Pad: move    Right stick / ZL+D-Pad: resize");
-  overlay_draw_text_clipped(24, canvas_height - 40, canvas_width - 48,
+  overlay_draw_text_clipped(24, canvas_height - 68, canvas_width - 48,
       COLOR_MUTED,
-      "X: select screen    Y: reset    A: save    B: cancel");
+      "X: select screen    Y: reset    R: toggle aspect lock");
+  overlay_draw_text_clipped(24, canvas_height - 36, canvas_width - 48,
+      COLOR_MUTED,
+      "A: save    B: cancel");
 }
 
 static void render_menu(DrasticIngameMenu *menu) {
@@ -1442,6 +1532,7 @@ static void update_display(DrasticIngameMenu *menu, u64 pressed) {
   }
   if (selection == 7 && (pressed & HidNpadButton_A)) {
     menu->editor_old_layout = menu->config->layout;
+    menu->editor_old_aspect_lock = menu->config->custom_aspect_lock;
     memcpy(menu->editor_backup, menu->config->custom_screens,
            sizeof(menu->editor_backup));
     menu->editor_screen = 0;
@@ -1636,24 +1727,6 @@ static void update_audio_input(DrasticIngameMenu *menu, u64 pressed) {
   menu->redraw = 1;
 }
 
-static void reset_custom_layout(DrasticRuntimeConfig *config) {
-  config->custom_screens[0] = (DrasticScreenRect){
-    .x = 0.30f, .y = 0.04f, .width = 0.40f, .height = 0.40f,
-    .screen = 0,
-  };
-  config->custom_screens[1] = (DrasticScreenRect){
-    .x = 0.30f, .y = 0.56f, .width = 0.40f, .height = 0.40f,
-    .screen = 1, .touch_target = 1,
-  };
-}
-
-static void constrain_custom_rect(DrasticScreenRect *rect) {
-  rect->width = clamp_float(rect->width, 0.08f, 1.0f);
-  rect->height = clamp_float(rect->height, 0.08f, 1.0f);
-  rect->x = clamp_float(rect->x, 0.0f, 1.0f - rect->width);
-  rect->y = clamp_float(rect->y, 0.0f, 1.0f - rect->height);
-}
-
 static void save_custom_layout(DrasticIngameMenu *menu) {
   static const char *keys[2][4] = {
     {"Wrapper/CustomTopX", "Wrapper/CustomTopY",
@@ -1668,6 +1741,8 @@ static void save_custom_layout(DrasticIngameMenu *menu) {
     save_float(keys[screen][2], rect->width);
     save_float(keys[screen][3], rect->height);
   }
+  save_bool("Wrapper/CustomAspectLock",
+            menu->config->custom_aspect_lock);
   save_string("Wrapper/Layout", "custom");
 }
 
@@ -1681,6 +1756,7 @@ static void update_layout_editor(DrasticIngameMenu *menu, u64 held,
                                  HidAnalogStickState right) {
   if (pressed & HidNpadButton_B) {
     menu->config->layout = menu->editor_old_layout;
+    menu->config->custom_aspect_lock = menu->editor_old_aspect_lock;
     memcpy(menu->config->custom_screens, menu->editor_backup,
            sizeof(menu->editor_backup));
     drastic_config_calculate_layout(menu->config, panel_width, panel_height);
@@ -1701,6 +1777,14 @@ static void update_layout_editor(DrasticIngameMenu *menu, u64 held,
   }
   if (pressed & HidNpadButton_Y) {
     reset_custom_layout(menu->config);
+    drastic_config_calculate_layout(menu->config, panel_width, panel_height);
+    menu->redraw = 1;
+  }
+  if (pressed & HidNpadButton_R) {
+    menu->config->custom_aspect_lock ^= 1;
+    if (menu->config->custom_aspect_lock)
+      normalize_custom_layout(menu->config, panel_width, panel_height);
+    drastic_config_calculate_layout(menu->config, panel_width, panel_height);
     menu->redraw = 1;
   }
   DrasticScreenRect *rect = &menu->config->custom_screens[menu->editor_screen];
@@ -1730,7 +1814,16 @@ static void update_layout_editor(DrasticIngameMenu *menu, u64 held,
     ui.y += move_y;
     ui.width += size_x;
     ui.height += size_y;
-    constrain_custom_rect(&ui);
+    if (menu->config->custom_aspect_lock && (size_x || size_y)) {
+      const int width_drives =
+          fabsf(size_x * overlay_width()) >=
+          fabsf(size_y * overlay_height());
+      set_custom_rect_aspect(&ui, 4.0f / 3.0f,
+                             overlay_width(), overlay_height(),
+                             width_drives, 0);
+    } else {
+      constrain_custom_rect(&ui);
+    }
     custom_rect_from_ui(menu->config, &ui, rect);
     constrain_custom_rect(rect);
     drastic_config_calculate_layout(menu->config, panel_width, panel_height);

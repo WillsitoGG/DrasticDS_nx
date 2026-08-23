@@ -114,14 +114,15 @@ static void seed_defaults(void) {
   seed("Wrapper/HotkeyReset", "L+R+Minus+A");
   seed("Wrapper/HotkeyQuit", "None");
   seed("Wrapper/StateSlot", "0");
-  seed("Wrapper/CustomTopX", "0.30");
-  seed("Wrapper/CustomTopY", "0.04");
-  seed("Wrapper/CustomTopW", "0.40");
-  seed("Wrapper/CustomTopH", "0.40");
-  seed("Wrapper/CustomBottomX", "0.30");
-  seed("Wrapper/CustomBottomY", "0.56");
-  seed("Wrapper/CustomBottomW", "0.40");
-  seed("Wrapper/CustomBottomH", "0.40");
+  seed("Wrapper/CustomTopX", "0.03");
+  seed("Wrapper/CustomTopY", "0.20666667");
+  seed("Wrapper/CustomTopW", "0.44");
+  seed("Wrapper/CustomTopH", "0.58666667");
+  seed("Wrapper/CustomBottomX", "0.53");
+  seed("Wrapper/CustomBottomY", "0.20666667");
+  seed("Wrapper/CustomBottomW", "0.44");
+  seed("Wrapper/CustomBottomH", "0.58666667");
+  seed("Wrapper/CustomAspectLock", "true");
 
   seed("Wrapper/Pad/A", "A");
   seed("Wrapper/Pad/B", "B");
