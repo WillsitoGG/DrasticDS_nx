@@ -533,7 +533,8 @@ static const Choice C_gridColumns[] = { {"3","3"}, {"4","4"}, {"5","5"}, {"6","6
 static const Choice C_gridRows[] = { {"1","1"}, {"2","2"}, {"3","3"} };
 static const Choice C_uiLanguage[] = { {"System","system"}, {"English","en"}, {"Français","fr"},
                                        {"Deutsch","de"}, {"Español","es"}, {"Italiano","it"},
-                                       {"Português","pt"} };
+                                       {"Português","pt"}, {"简体中文","zh-Hans"},
+                                       {"繁體中文","zh-Hant"} };
 
 enum { SCR_GRAPHICS, SCR_ENHANCE, SCR_FRAMEGEN, SCR_AUDIO, SCR_EMU,
        SCR_FRAMERATE, SCR_NETWORK, SCR_CONTROLLER, SCR_FIRMWARE, SCR_COUNT };
@@ -899,6 +900,7 @@ static void commitAll() {
 static SDL_Window   *g_win = nullptr;
 static SDL_Renderer *g_ren = nullptr;
 static TTF_Font     *g_font = nullptr, *g_font_sm = nullptr, *g_font_big = nullptr;
+static PlSharedFontType g_uiFontType = PlSharedFontType_Total;
 static SDL_Texture  *g_logo = nullptr;
 static int SW = 1280, SH = 720;
 static int g_outputW = 1280, g_outputH = 720;
@@ -1578,12 +1580,60 @@ static SDL_Texture *makeGlyph(const char *label, bool pill){
   SDL_SetRenderTarget(g_ren,previous);
   return t;
 }
+static void destroyGlyphs(){
+  SDL_Texture **glyphs[]={&g_gA,&g_gB,&g_gX,&g_gY,&g_gPlus,&g_gMinus,
+                         &g_gLeftRight,&g_gUpDown,&g_gL,&g_gR};
+  for(SDL_Texture **glyph:glyphs){
+    if(*glyph) SDL_DestroyTexture(*glyph);
+    *glyph=nullptr;
+  }
+}
 static void makeGlyphs(){
+  destroyGlyphs();
   g_gA=makeGlyph("A",false); g_gB=makeGlyph("B",false);
   g_gX=makeGlyph("X",false); g_gY=makeGlyph("Y",false);
   g_gPlus=makeGlyph("+",false); g_gMinus=makeGlyph("−",false);
   g_gLeftRight=makeGlyph("‹ ›",true);g_gUpDown=makeGlyph("↕",true);
   g_gL=makeGlyph("L",true); g_gR=makeGlyph("R",true);
+}
+static PlSharedFontType requestedUiFontType(){
+  const std::string_view language=LauncherLocalization::CurrentLanguage();
+  if(language=="zh-Hans") return PlSharedFontType_ChineseSimplified;
+  if(language=="zh-Hant") return PlSharedFontType_ChineseTraditional;
+  return PlSharedFontType_Standard;
+}
+static bool reloadUiFonts(){
+  const PlSharedFontType requested=requestedUiFontType();
+  if(g_font&&g_font_sm&&g_font_big&&g_uiFontType==requested) return true;
+  if(!g_plReady) return false;
+
+  PlFontData fontData{};
+  if(R_FAILED(plGetSharedFontByType(&fontData,requested))||
+     !fontData.address||!fontData.size||fontData.size>INT_MAX) return false;
+  const int scale=SH>=1080?1:0;
+  auto openFont=[&](int size)->TTF_Font*{
+    SDL_RWops *rw=SDL_RWFromConstMem(fontData.address,(int)fontData.size);
+    return rw?TTF_OpenFontRW(rw,1,size):nullptr;
+  };
+  TTF_Font *small=openFont(scale?26:20);
+  TTF_Font *normal=openFont(scale?32:26);
+  TTF_Font *big=openFont(scale?52:40);
+  if(!small||!normal||!big){
+    if(small) TTF_CloseFont(small);
+    if(normal) TTF_CloseFont(normal);
+    if(big) TTF_CloseFont(big);
+    return false;
+  }
+
+  clearTextCaches();
+  destroyGlyphs();
+  if(g_font) TTF_CloseFont(g_font);
+  if(g_font_sm) TTF_CloseFont(g_font_sm);
+  if(g_font_big) TTF_CloseFont(g_font_big);
+  g_font=normal; g_font_sm=small; g_font_big=big;
+  g_uiFontType=requested;
+  makeGlyphs();
+  return true;
 }
 
 enum FootAct { FA_NONE, FA_LAUNCH, FA_SORT, FA_OPTIONS, FA_SETTINGS, FA_FILTER, FA_PAGEL, FA_PAGER, FA_QUIT };
@@ -2516,7 +2566,7 @@ static void saveLibraryIdentities(){
 
 static bool identityPathExists(const LibraryIdentityRecord &record){struct stat info{};return !record.retired&&!record.currentPath.empty()&&stat(record.currentPath.c_str(),&info)==0&&S_ISREG(info.st_mode)&&canonicalGamePath(record.currentPath)==record.canonicalPath;}
 
-static void assignStableIdentity(Game &game){
+static void assignStableIdentity(Game &game,bool reuseMissingIdentity=true){
   game.canonicalPath=canonicalGamePath(game.path);game.baseIdentity=game.gameCode.size()==4?"nds:"+foldedKey(game.gameCode):"anonymous:"+hexFingerprint(game.fingerprint);
   const std::string fingerprint=hexFingerprint(game.fingerprint);auto compatible=[&](const LibraryIdentityRecord &record){return !record.baseIdentity.empty()?record.baseIdentity==game.baseIdentity:record.fingerprint==fingerprint;};
   LibraryIdentityRecord *match=nullptr;bool changed=false;
@@ -2525,7 +2575,7 @@ static void assignStableIdentity(Game &game){
     if(compatible(record)){match=&record;break;}
     game.allowLegacyMigration=false;rememberPreviousPath(record,record.currentPath);record.currentPath.clear();record.retired=true;g_reservedLibraryIds.erase(record.id);changed=true;
   }
-  if(!match){const std::string scope=identityScope(game.canonicalPath);for(auto &record:g_libraryIdentities){if(g_claimedLibraryIds.count(record.id)||scope.empty()||identityScope(record.canonicalPath)!=scope||record.fingerprint!=fingerprint||!compatible(record))continue;if(g_reservedLibraryIds.count(record.id)){if(identityPathExists(record))continue;g_reservedLibraryIds.erase(record.id);}match=&record;break;}}
+  if(!match&&reuseMissingIdentity){const std::string scope=identityScope(game.canonicalPath);for(auto &record:g_libraryIdentities){if(g_claimedLibraryIds.count(record.id)||scope.empty()||identityScope(record.canonicalPath)!=scope||record.fingerprint!=fingerprint||!compatible(record))continue;if(g_reservedLibraryIds.count(record.id)){if(identityPathExists(record))continue;g_reservedLibraryIds.erase(record.id);}match=&record;break;}}
   if(!match){
     std::string stem=stableGameKey(game.gameCode,game.fingerprint),id=stem;unsigned collision=1;
     auto exists=[&](const std::string &candidate){return std::any_of(g_libraryIdentities.begin(),g_libraryIdentities.end(),[&](const auto &record){return record.id==candidate;});};while(exists(id))id=stem+"-"+std::to_string(++collision);
@@ -3854,16 +3904,9 @@ static bool refreshConfiguredUsbSources(std::vector<std::string> &paths) {
 }
 
 static void renderUsbForwarderWait() {
-  clearUiBackground();
-  const int panelWidth=std::min(720,SW-64),panelHeight=220;
-  const int panelX=(SW-panelWidth)/2,panelY=(SH-panelHeight)/2;
-  glassPanel(panelX,panelY,panelWidth,panelHeight);
-  border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
-  drawTextC(g_font_big,SW/2,panelY+42,"Connecting USB storage",COL_SEL);
-  drawTextC(g_font,SW/2,panelY+108,"Waiting for the game drive...",COL_TXT);
-  drawTextC(g_font_sm,SW/2,panelY+146,"The game will start automatically",COL_DIM);
-  drawFooterText("B  Cancel",panelY+181);
-  presentUi();
+  SDL_SetRenderDrawColor(g_ren,0,0,0,255);
+  SDL_RenderClear(g_ren);
+  SDL_RenderPresent(g_ren);
 }
 
 static void ensureSavedPathMountedAtStartup(const std::string &path) {
@@ -4661,7 +4704,7 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
   int vis = (SH - 200) / rowH; if (vis < 1) vis = 1; if (vis > n) vis = n;
   beginScreenFx();
   for (;;) {
-    if(!beginUiFrame()) return cur;
+    if(!beginUiFrame()) return -1;
     SDL_Event e;
     navRepeat();
     while (pollUiEvent(e)) {
@@ -4676,7 +4719,7 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
         case SDL_CONTROLLER_BUTTON_DPAD_UP:   sel=(sel+n-1)%n; break;
         case SDL_CONTROLLER_BUTTON_DPAD_DOWN: sel=(sel+1)%n;   break;
         case BTN_CONFIRM: return sel;
-        case BTN_CANCEL:  return cur;
+        case BTN_CANCEL:  return -1;
       }
       if(sel<top) top=sel;
       if(sel>=top+vis) top=sel-vis+1;
@@ -5002,7 +5045,14 @@ static void launcherSettingsScreen() {
   const int updateRow=listCount,selectionCount=listCount+1;
   int sel=std::max(0,std::min(savedSelection,selectionCount-1)),top=0;
   auto applyChange=[&](){
+    const std::string previousLanguage(LauncherLocalization::Preference());
     LauncherLocalization::Initialize(storeGet(g_global,"Wrapper/Language","system"));
+    if(!reloadUiFonts()){
+      LauncherLocalization::Initialize(previousLanguage);
+      storeSet(g_global,"Wrapper/Language",previousLanguage.c_str());
+      (void)reloadUiFonts();
+      toast("Could not load the selected system font");
+    }
     applyLauncherAppearance();
     const int requested=atoi(storeGet(g_global,"Wrapper/LauncherRotation","0"));
     if(!configureLauncherOrientation(requested)){
@@ -6091,6 +6141,7 @@ static bool pickIcon(Game &g, char *outPath, size_t outSize) {
 
 static void forwarderWizard(Game &g) {
   char name[256]; snprintf(name,sizeof(name),"%s",g.title.c_str());
+  char author[128]; snprintf(author,sizeof(author),"%s","naga");
   char icon[300]={0};
   { struct stat st; std::string cp=existingCoverPath(g);
     if(stat(cp.c_str(),&st)==0) snprintf(icon,sizeof(icon),"%s",cp.c_str()); }
@@ -6102,7 +6153,8 @@ static void forwarderWizard(Game &g) {
   const int rx=g_launcherPortrait?56:ix+isz+70;
   const int rw=g_launcherPortrait?SW-112:SW-rx-90;
   const int nameY=g_launcherPortrait?iy+isz+62:196;
-  const int createY=g_launcherPortrait?nameY+116:350;
+  const int authY=g_launcherPortrait?nameY+94:290;
+  const int createY=g_launcherPortrait?authY+116:406;
   const int fieldH=64,createH=58;
   int sel=0; bool done=false; beginScreenFx();
 
@@ -6123,7 +6175,7 @@ static void forwarderWizard(Game &g) {
     appendLegacy(g.pathKey);if(g.legacyUnique)appendLegacy(g.legacyKey);
     // A short-lived 1.0.8 test build used the content fingerprint as identity.
     appendLegacy(stableGameKey(g.gameCode,g.fingerprint));
-    char err[256]={0}; bool ok=forwarder_create(shortcutKey,name,icon,legacyKeys,err,sizeof(err));
+    char err[256]={0}; bool ok=forwarder_create(shortcutKey,name,author,icon,legacyKeys,err,sizeof(err));
     appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
     if(ok){ toast("HOME shortcut installed",1800); done=true; }
     else modalMessage("Shortcut failed", { err[0]?err:"Unknown error" });
@@ -6132,6 +6184,7 @@ static void forwarderWizard(Game &g) {
   auto activate=[&](){
     if(sel==0){ char p[300]; if(pickIcon(g,p,sizeof(p))){ snprintf(icon,sizeof(icon),"%s",p); if(iconTex)SDL_DestroyTexture(iconTex); iconTex=loadScaledTexture(icon,isz,isz); } beginScreenFx(); }
     else if(sel==1) edit("Shortcut name", name, sizeof(name));
+    else if(sel==2) edit("Author", author, sizeof(author));
     else build();
   };
 
@@ -6144,7 +6197,8 @@ static void forwarderWizard(Game &g) {
         if(tk==TOUCH_TAP){
           if(tx>=ix&&tx<ix+isz&&ty>=iy&&ty<iy+isz){ sel=0; activate(); }
           else if(ty>=nameY-6&&ty<nameY+fieldH){ sel=1; activate(); }
-          else if(ty>=createY-6&&ty<createY+createH){ sel=2; activate(); }
+          else if(ty>=authY-6&&ty<authY+fieldH){ sel=2; activate(); }
+          else if(ty>=createY-6&&ty<createY+createH){ sel=3; activate(); }
           else if(ty>=SH-40) done=true;
           continue;
         }
@@ -6153,8 +6207,8 @@ static void forwarderWizard(Game &g) {
       switch(e.cbutton.button){
         case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  sel=0; break;
         case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: if(sel==0) sel=1; break;
-        case SDL_CONTROLLER_BUTTON_DPAD_UP:    sel=(sel==0)?2:(sel==1?2:sel-1); break;
-        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  sel=(sel==0)?1:(sel==2?1:sel+1); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_UP:    sel=(sel==0)?3:(sel==1?3:sel-1); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  sel=(sel==0)?1:(sel==3?1:sel+1); break;
         case BTN_CONFIRM: activate(); break;
         case BTN_CANCEL:  done=true; break;
       }
@@ -6171,7 +6225,8 @@ static void forwarderWizard(Game &g) {
       drawText(g_font_sm, rx, y, label, cur?COL_VAL:COL_DIM);
       drawScrollTextL(g_font,rx,y+26,rw-8,val,cur?COL_VAL:COL_TXT); };
     field(1,nameY,"Name",name);
-    { bool cur=sel==2;
+    field(2,authY,"Author",author);
+    { bool cur=sel==3;
       fillRect(rx-10,createY-6,rw+20,createH, cur?(SDL_Color){44,86,44,240}:(SDL_Color){30,46,32,200});
       if(cur) fillRect(rx-10,createY-6,5,createH,COL_SEL);
       drawTextC(g_font, rx+rw/2, createY+12, "Create shortcut", cur?COL_VAL:(SDL_Color){150,225,150,255}); }
@@ -6808,8 +6863,7 @@ static void cleanupLauncher() {
   for(auto &game:g_games){ if(game.cover) SDL_DestroyTexture(game.cover); game.cover=nullptr; }
   clearTextCaches();
   for(int index=1;index<4;index++){ if(g_flag[index]) SDL_DestroyTexture(g_flag[index]); g_flag[index]=nullptr; }
-  SDL_Texture **glyphs[]={&g_gA,&g_gB,&g_gX,&g_gY,&g_gPlus,&g_gMinus,&g_gLeftRight,&g_gUpDown,&g_gL,&g_gR};
-  for(SDL_Texture **glyph:glyphs){ if(*glyph) SDL_DestroyTexture(*glyph); *glyph=nullptr; }
+  destroyGlyphs();
   if(g_logo) SDL_DestroyTexture(g_logo);
   g_logo=nullptr;
   if(g_glowTexture) SDL_DestroyTexture(g_glowTexture);
@@ -6820,6 +6874,7 @@ static void cleanupLauncher() {
   if(g_font_sm) TTF_CloseFont(g_font_sm);
   if(g_font_big) TTF_CloseFont(g_font_big);
   g_font=g_font_sm=g_font_big=nullptr;
+  g_uiFontType=PlSharedFontType_Total;
   if(g_plReady) plExit();
   g_plReady=false;
   uiAudioShutdown();
@@ -6944,16 +6999,11 @@ int main(int argc, char **argv){
 
   if(R_FAILED(plInitialize(PlServiceType_User))) return startupFailure("System font service initialization failed.");
   g_plReady=true;
-  PlFontData fontData{};
-  if(R_FAILED(plGetSharedFontByType(&fontData,PlSharedFontType_Standard))||!fontData.address||!fontData.size||fontData.size>INT_MAX)
-    return startupFailure("Could not load the system font.");
-  int scale=SH>=1080?1:0;
-  auto openFont=[&](int size)->TTF_Font*{ SDL_RWops *rw=SDL_RWFromConstMem(fontData.address,(int)fontData.size); return rw?TTF_OpenFontRW(rw,1,size):nullptr; };
-  g_font_sm=openFont(scale?26:20);
-  g_font=openFont(scale?32:26);
-  g_font_big=openFont(scale?52:40);
-  if(!g_font_sm||!g_font||!g_font_big) return startupFailure("Could not open the system font.");
-  makeGlyphs();
+  if(!reloadUiFonts()){
+    LauncherLocalization::Initialize("en");
+    if(!reloadUiFonts())
+      return startupFailure("Could not load a usable system font.");
+  }
   if(isAppletMode()){
     (void)ensureDirectory("sdmc:/switch");(void)ensureDirectory(DATA_DIR);
     runAppletInstaller();cleanupLauncher();return 0;
@@ -7034,7 +7084,16 @@ int main(int argc, char **argv){
     if(rows<1||rows>3){ storeSet(g_global,"Wrapper/GridRows","2"); changed=true; }
     if(changed&&!storeSave(g_global,LAUNCHER_INI)) return startupFailure("Could not update launcher.ini.");
   }
+  const std::string fallbackLanguage(LauncherLocalization::Preference());
   LauncherLocalization::Initialize(storeGet(g_global,"Wrapper/Language","system"));
+  if(!reloadUiFonts()){
+    LauncherLocalization::Initialize(fallbackLanguage);
+    if(!reloadUiFonts())
+      return startupFailure("Could not load a usable system font.");
+    storeSet(g_global,"Wrapper/Language",fallbackLanguage.c_str());
+    if(!storeSave(g_global,LAUNCHER_INI))
+      return startupFailure("Could not save the launcher language fallback.");
+  }
   applyLauncherAppearance();
   const int launcherRotation=atoi(
       storeGet(g_global,"Wrapper/LauncherRotation","0"));
@@ -7051,17 +7110,31 @@ int main(int argc, char **argv){
   if(!ensureBundledShaders())
     return startupFailure("Could not install the bundled custom shaders.");
   startCoverDecodeWorker();
+
+  std::string positionalForwarderPath;
+  if(argc>=2&&argv[1]&&argv[1][0]&&argv[1][0]!='-'){
+    const std::string candidate=normalizeLocationPath(argv[1]);
+    if(!candidate.empty()&&hasGameExtension(candidate.c_str()))
+      positionalForwarderPath=candidate;
+  }
+  const bool silentDirectForwarder=!positionalForwarderPath.empty();
+
   std::vector<std::string> gamePaths=loadGameSources();
-  bool hasUsbSource=hasConfiguredUsbSource(gamePaths);
-  const bool startupHasUsbSource=hasUsbSource;
+  bool hasUsbSource=!silentDirectForwarder&&hasConfiguredUsbSource(gamePaths);
+  const bool directForwarderUsesUsb=silentDirectForwarder&&isUsbStoragePath(positionalForwarderPath);
+  const bool startupHasUsbSource=hasUsbSource||directForwarderUsesUsb;
   const std::vector<SwitchStorage::SmbShare> startupSmbShares=loadSmbSharesFromStore();
   std::atomic<bool> storageInitDone{false},storageInitCancel{false};
-  std::thread storageInitWorker([&,startupHasUsbSource,startupSmbShares]{
+  std::thread storageInitWorker([&,startupHasUsbSource,startupSmbShares,positionalForwarderPath]{
     SwitchStorage::SetUsbStatusCallback(usbStatusWake,nullptr);
     if(startupHasUsbSource&&!storageInitCancel.load())SwitchStorage::InitializeUsb();
     for(const auto &share:startupSmbShares){
       if(storageInitCancel.load())break;
-      if(share.autoMount){std::string error;SwitchStorage::MountSmb(share,&error,&storageInitCancel);}
+      const bool required=silentDirectForwarder&&
+        pathAtOrBelow(positionalForwarderPath,SwitchStorage::SmbRootPath(share.id));
+      if((!silentDirectForwarder&&share.autoMount)||required){
+        std::string error;SwitchStorage::MountSmb(share,&error,&storageInitCancel);
+      }
     }
     storageInitDone=true;wakeUiFromWorker(0x53544f52);
   });
@@ -7071,7 +7144,7 @@ int main(int argc, char **argv){
     if(!isUsbStoragePath(source)&&source.rfind(UNAVAILABLE_USB_PREFIX,0)!=0&&
        !isConfiguredSmbStoragePath(source,startupSmbShares))
       initialGamePaths.push_back(source);
-  startGameScan(std::move(initialGamePaths),true);
+  if(!silentDirectForwarder) startGameScan(std::move(initialGamePaths),true);
 
   int sel=0,top=0,rows=1;
   bool running=true,launch=false,userExit=false;
@@ -7093,9 +7166,58 @@ int main(int argc, char **argv){
     userExit=true;running=false;return true;
   };
 
-  bool forwarderRequested=false,forwarderMatched=false;
-  std::string forwarderKey;
-  for(int argument=1;argument+1<argc;argument++) if(!strcmp(argv[argument],"-g")){
+  if(silentDirectForwarder){
+    g_reservedLibraryIds.clear();
+    for(const auto &record:g_libraryIdentities) if(!record.retired)
+      g_reservedLibraryIds.insert(record.id);
+    g_claimedLibraryIds.clear();
+  }
+  auto prepareDirectForwarderGame=[&](const std::string &directPath)->bool{
+    struct stat info{};
+    if(stat(directPath.c_str(),&info)!=0||!S_ISREG(info.st_mode)) return false;
+
+    Game game;
+    game.path=directPath;
+    const size_t slash=directPath.find_last_of("/\\");
+    game.file=slash==std::string::npos?directPath:directPath.substr(slash+1);
+    game.legacyKey=sanitize(game.file);
+    readNdsMetadata(directPath,game.headerTitle,game.gameCode);
+    game.pathKey=makeGameKey(game.file,directPath,game.gameCode);
+    game.added=(long long)info.st_mtime;
+    game.modified=game.added;
+    game.fileSize=(long long)info.st_size;
+
+    const char *cached=storeGet(g_metadata,game.pathKey.c_str(),"");
+    long long cachedSize=0,cachedTime=0;
+    unsigned long long cachedFingerprint=0;
+    int consumed=0;
+    if(sscanf(cached,"%lld,%lld,%llx%n",&cachedSize,&cachedTime,
+              &cachedFingerprint,&consumed)==3&&cached[consumed]==0&&
+       cachedSize==game.fileSize&&cachedTime==game.modified)
+      game.fingerprint=(uint64_t)cachedFingerprint;
+    if(!game.fingerprint) game.fingerprint=fingerprintGameFile(directPath,info);
+    if(!game.fingerprint) return false;
+
+    char metadata[96];
+    snprintf(metadata,sizeof(metadata),"%lld,%lld,%016llx",game.fileSize,game.modified,
+             (unsigned long long)game.fingerprint);
+    storeSet(g_metadata,game.pathKey.c_str(),metadata);
+    assignStableIdentity(game,false);
+    game.legacyUnique=false;
+    migrateGameIdentity(game);
+    game.played=atoll(gameStoreGet(g_recent,game,"0"));
+    game.hasCfg=gameFileExists(GAMECFG_DIR,game,".ini");
+    storeSave(g_metadata,METADATA_INI);
+    storeSave(g_titles,TITLES_INI);
+    selectGame(game);
+    return true;
+  };
+
+  bool forwarderRequested=silentDirectForwarder,forwarderMatched=false;
+  bool forwarderDirectPath=silentDirectForwarder;
+  std::string forwarderKey=positionalForwarderPath;
+  if(forwarderDirectPath) forwarderMatched=prepareDirectForwarderGame(forwarderKey);
+  if(!forwarderRequested) for(int argument=1;argument+1<argc;argument++) if(!strcmp(argv[argument],"-g")){
     forwarderRequested=true;
     forwarderKey=argv[argument+1];
     if(Game *game=findGameByKey(forwarderKey)){ selectGame(*game); forwarderMatched=true; }
@@ -7111,17 +7233,25 @@ int main(int argc, char **argv){
 
   while(running&&beginUiFrame()){
     pumpGameScan();
-    if(!g_libraryScan&&!pendingMountedSources.empty()){startGameScan(std::move(pendingMountedSources),false);pendingMountedSources.clear();}
+    if(!silentDirectForwarder&&!g_libraryScan&&!pendingMountedSources.empty()){
+      startGameScan(std::move(pendingMountedSources),false);pendingMountedSources.clear();
+    }
     if(sel>=(int)g_libraryView.size())sel=std::max(0,(int)g_libraryView.size()-1);
     if(storageInitDone.load()&&!storageIntegrated){
       if(storageInitWorker.joinable())storageInitWorker.join();
       storageIntegrated=true;
       usbGeneration=SwitchStorage::UsbStatusGeneration();gamePaths=loadGameSources();refreshConfiguredUsbSources(gamePaths);
-      for(const std::string &source:gamePaths)
-        if(isUsbStoragePath(source)||isConfiguredSmbStoragePath(source,startupSmbShares))
-          pendingMountedSources.push_back(source);
+      if(!silentDirectForwarder) for(const std::string &source:gamePaths)
+          if(isUsbStoragePath(source)||isConfiguredSmbStoragePath(source,startupSmbShares))
+            pendingMountedSources.push_back(source);
     }
-    if(forwarderPending)if(Game *game=findGameByKey(forwarderKey)){selectGame(*game);forwarderPending=false;}
+    if(forwarderPending){
+      if(forwarderDirectPath){
+        if(prepareDirectForwarderGame(forwarderKey)) forwarderPending=false;
+      }else if(Game *game=findGameByKey(forwarderKey)){
+        selectGame(*game);forwarderPending=false;
+      }
+    }
     if(!running)break;
     pollUpdateNotification();
     if(hasUsbSource&&storageIntegrated){
@@ -7144,9 +7274,13 @@ int main(int argc, char **argv){
         sel=0;
         if(!selected.empty()) for(size_t index=0;index<g_libraryView.size();index++) if(g_libraryView[index]->key==selected){ sel=(int)index; break; }
         top=0;
-        if(forwarderPending) if(Game *game=findGameByKey(forwarderKey)){
-          selectGame(*game);
-          forwarderPending=false;
+        if(forwarderPending){
+          if(forwarderDirectPath){
+            if(prepareDirectForwarderGame(forwarderKey)) forwarderPending=false;
+          }else if(Game *game=findGameByKey(forwarderKey)){
+            selectGame(*game);
+            forwarderPending=false;
+          }
         }
       }
       if(!running) break;
@@ -7164,7 +7298,7 @@ int main(int argc, char **argv){
         }
       }
       if(!running) break;
-      renderUsbForwarderWait();
+      if(!forwarderDirectPath) renderUsbForwarderWait();
     Uint32 nextDeadline=forwarderDeadline;
     if(usbRefreshAt&&(!nextDeadline||SDL_TICKS_PASSED(nextDeadline,usbRefreshAt)))nextDeadline=usbRefreshAt;
     waitForNextUiFrame(true,nextDeadline);

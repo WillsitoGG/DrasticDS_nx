@@ -636,12 +636,16 @@ bool patch_npdm(std::vector<u8> &npdm, u64 tid)
     return true;
 }
 
-void patch_nacp(NacpStruct &nacp, const std::string &name, u64 tid)
+void patch_nacp(NacpStruct &nacp, const std::string &name, const std::string &author, u64 tid)
 {
     for (auto &lang : nacp.lang) {
         if (!name.empty()) {
             std::memset(lang.name, 0, sizeof(lang.name));
             std::strncpy(lang.name, name.c_str(), sizeof(lang.name) - 1);
+        }
+        if (!author.empty()) {
+            std::memset(lang.author, 0, sizeof(lang.author));
+            std::strncpy(lang.author, author.c_str(), sizeof(lang.author) - 1);
         }
     }
     nacp.startup_user_account = 0x00;
@@ -1231,6 +1235,7 @@ void removeLegacyForwarder(NcmStorageId storageId,u64 currentTid,
 }
 
 Result install_forwarder(const std::string &gameKey, const std::string &name,
+                         const std::string &author,
                          const std::vector<u8> &nsoData, std::vector<u8> npdmData, NacpStruct nacp,
                          const std::vector<u8> &iconJpeg,
                          const std::vector<std::string> &legacyGameKeys,
@@ -1272,7 +1277,7 @@ Result install_forwarder(const std::string &gameKey, const std::string &name,
         ncaEntries.emplace_back(create_program_nca(tid, headerKey, exefs));
     }
     {
-        patch_nacp(nacp, name, tid);
+        patch_nacp(nacp, name, author, tid);
         FileEntries romfs;
         add_file_entry(romfs, "/control.nacp", &nacp, sizeof(nacp));
         add_file_entry(romfs, "/icon_AmericanEnglish.dat", iconJpeg.data(), iconJpeg.size());
@@ -1388,7 +1393,7 @@ std::string launcherNroPath()
 }
 
 bool forwarder_create(const std::string &gameKey, const std::string &name,
-                      const std::string &iconImgPath,
+                      const std::string &author, const std::string &iconImgPath,
                       const std::vector<std::string> &legacyGameKeys,
                       char *err, std::size_t errSize)
 {
@@ -1435,7 +1440,7 @@ bool forwarder_create(const std::string &gameKey, const std::string &name,
     if (R_SUCCEEDED(rc)) {
         nsInitialized = true;
         try {
-            rc = install_forwarder(gameKey, name.empty() ? "Drastic DS" : name,
+            rc = install_forwarder(gameKey, name.empty() ? "Drastic DS" : name, author,
                                    nso, npdm, nacp, iconJpeg, legacyGameKeys, stage);
         } catch (...) {
             rc = kForwarderIoError;
@@ -1475,7 +1480,7 @@ bool forwarder_create_launcher(char *err,std::size_t errSize)
     ForwarderStage stage=ForwarderStage::CryptoService;Result rc=splCryptoInitialize();
     if(R_SUCCEEDED(rc)){cryptoInitialized=true;stage=ForwarderStage::ContentService;rc=ncmInitialize();}
     if(R_SUCCEEDED(rc)){ncmInitialized=true;stage=ForwarderStage::ApplicationService;rc=ns_app_init();}
-    if(R_SUCCEEDED(rc)){nsInitialized=true;try{rc=install_forwarder({},"Drastic DS",nso,npdm,nacp,iconJpeg,{},stage);}catch(...){rc=kForwarderIoError;}}
+    if(R_SUCCEEDED(rc)){nsInitialized=true;try{rc=install_forwarder({},"Drastic DS",{},nso,npdm,nacp,iconJpeg,{},stage);}catch(...){rc=kForwarderIoError;}}
     if(nsInitialized)ns_app_exit();
     if(ncmInitialized)ncmExit();
     if(cryptoInitialized)splCryptoExit();

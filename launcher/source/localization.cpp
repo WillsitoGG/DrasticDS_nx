@@ -1,4 +1,5 @@
 #include "localization.h"
+#include "localization_zh.h"
 
 #include <switch.h>
 
@@ -13,7 +14,9 @@ namespace
 std::string s_preference="system";
 std::string s_language="en";
 std::unordered_map<std::string,std::string> s_translations;
-const std::vector<Language> s_languages={{"system","System"},{"en","English"},{"fr","Français"},{"de","Deutsch"},{"es","Español"},{"it","Italiano"},{"pt","Português"}};
+const std::vector<Language> s_languages={{"system","System"},{"en","English"},
+ {"fr","Français"},{"de","Deutsch"},{"es","Español"},{"it","Italiano"},
+ {"pt","Português"},{"zh-Hans","简体中文"},{"zh-Hant","繁體中文"}};
 
 struct Entry { const char* en; const char* fr; const char* de; const char* es; const char* it; const char* pt; };
 constexpr Entry ENTRIES[]={
@@ -355,7 +358,16 @@ std::string systemLanguage()
  if(R_SUCCEEDED(result)) result=setMakeLanguage(code,&language);
  setExit();
  if(R_FAILED(result)) return "en";
- switch(language){case SetLanguage_FR:case SetLanguage_FRCA:return "fr";case SetLanguage_DE:return "de";case SetLanguage_ES:case SetLanguage_ES419:return "es";case SetLanguage_IT:return "it";case SetLanguage_PT:case SetLanguage_PTBR:return "pt";default:return "en";}
+ switch(language){
+  case SetLanguage_FR: case SetLanguage_FRCA: return "fr";
+  case SetLanguage_DE: return "de";
+  case SetLanguage_ES: case SetLanguage_ES419: return "es";
+  case SetLanguage_IT: return "it";
+  case SetLanguage_PT: case SetLanguage_PTBR: return "pt";
+  case SetLanguage_ZHCN: case SetLanguage_ZHHANS: return "zh-Hans";
+  case SetLanguage_ZHTW: case SetLanguage_ZHHANT: return "zh-Hant";
+  default: return "en";
+ }
 }
 }
 
@@ -364,6 +376,12 @@ void Initialize(std::string_view preference)
  s_preference=preference.empty()?"system":std::string(preference); s_language=s_preference=="system"?systemLanguage():s_preference;
  if(FindLanguage(s_language)<1) s_language="en";
  s_translations.clear();
+ if(s_language=="zh-Hans"||s_language=="zh-Hant"){
+  const bool traditional=s_language=="zh-Hant";
+  for(const ChineseEntry& entry:CHINESE_ENTRIES)
+   s_translations.emplace(entry.en,traditional?entry.zhHant:entry.zhHans);
+  return;
+ }
  const int column=s_language=="fr"?1:s_language=="de"?2:s_language=="es"?3:s_language=="it"?4:s_language=="pt"?5:0;
  if(!column) return;
  for(const Entry& entry:ENTRIES){const char* values[]={entry.en,entry.fr,entry.de,entry.es,entry.it,entry.pt};s_translations.emplace(entry.en,values[column]);}
@@ -371,6 +389,7 @@ void Initialize(std::string_view preference)
 }
 std::string_view Translate(std::string_view source){const auto it=s_translations.find(std::string(source));return it==s_translations.end()?source:std::string_view(it->second);}
 std::string_view Preference(){return s_preference;}
+std::string_view CurrentLanguage(){return s_language;}
 std::string DisplayName(){for(const auto& language:s_languages)if(language.code==s_preference)return language.name;return "English";}
 const std::vector<Language>& Languages(){return s_languages;}
 int FindLanguage(std::string_view code){for(size_t i=0;i<s_languages.size();i++)if(code==s_languages[i].code)return static_cast<int>(i);return -1;}
